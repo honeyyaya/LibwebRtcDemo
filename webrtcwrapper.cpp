@@ -50,10 +50,14 @@ void WebRTCWrapper::cleanup()
         return;
 
     m_factory = nullptr;
+#ifdef Q_OS_ANDROID
+    // Android 上 Terminate() 与 worker_thread 存在竞态，导致 webrtc_voice_engine Check failed: adm_
+    appendLog("WebRTC cleanup (Android: skip Terminate to avoid adm_ race)");
+#else
     libwebrtc::LibWebRTC::Terminate();
-
-    m_initialized = false;
     appendLog("WebRTC terminated");
+#endif
+    m_initialized = false;
     Q_EMIT initializedChanged();
 }
 

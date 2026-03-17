@@ -1,129 +1,229 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import LibwebRtcDemo 1.0
 
 Window {
-    width: 400
-    height: 600
+    id: root
+    width: 420
+    height: 560
     visible: true
     title: qsTr("LibWebRTC Demo")
     color: "#1A1A2E"
+    minimumWidth: 360
+    minimumHeight: 480
 
-    ColumnLayout {
+    property string receiverStatus: "未连接"
+    // 方向3: 启动后延迟 1.5 秒再允许连接，确保 Activity 完全就绪后再初始化 ADM
+    property bool connectReady: false
+    // 信令地址：与 receiver.html 部署地址对应，http://192.168.3.176:3000/receiver.html → ws://192.168.3.176:3000
+    property string signalingUrl: "ws://192.168.3.176:3000/socket.io/?EIO=4&transport=websocket"
+
+    Component.onCompleted: {
+        receiverStatus = "方向3 验证: 等待 Activity 就绪 (1.5s)..."
+        connectReadyTimer.start()
+    }
+    Timer {
+        id: connectReadyTimer
+        interval: 1500
+        repeat: false
+        onTriggered: {
+            connectReady = true
+            receiverStatus = "未连接"
+        }
+    }
+
+    Connections {
+        target: receiverClient
+        function onStatusChanged(status) {
+            receiverStatus = status
+        }
+    }
+
+    ScrollView {
+        id: scrollView
         anchors.fill: parent
-        anchors.margins: 24
-        spacing: 16
+        anchors.margins: 20
+        clip: true
+        ScrollBar.vertical.policy: ScrollBar.AsNeeded
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        contentWidth: availableWidth
+        contentHeight: contentLayout.implicitHeight
 
-        Text {
-            text: "LibWebRTC Demo"
-            font.pixelSize: 28
-            font.bold: true
-            color: "#E94560"
-            Layout.alignment: Qt.AlignHCenter
-        }
+        ColumnLayout {
+            id: contentLayout
+            width: scrollView.availableWidth
+            spacing: 16
 
-        Text {
-            text: webrtc.version
-            font.pixelSize: 14
-            color: "#8888AA"
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            height: 60
-            radius: 12
-            color: webrtc.initialized ? "#2E7D32" : "#16213E"
-            border.color: webrtc.initialized ? "#4CAF50" : "#0F3460"
-            border.width: 2
-
-            Text {
-                anchors.centerIn: parent
-                text: webrtc.initialized ? "INITIALIZED" : "NOT INITIALIZED"
-                font.pixelSize: 18
-                font.bold: true
-                color: webrtc.initialized ? "#C8E6C9" : "#8888AA"
-            }
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 12
-
-            Button {
-                text: "Initialize"
+            // ---------- 标题区 ----------
+            Item {
                 Layout.fillWidth: true
-                enabled: !webrtc.initialized
-                onClicked: webrtc.initialize()
-
-                background: Rectangle {
-                    radius: 8
-                    color: parent.enabled ? (parent.pressed ? "#C62828" : "#E94560") : "#444"
-                }
-                contentItem: Text {
-                    text: parent.text
-                    color: "white"
-                    font.pixelSize: 15
-                    font.bold: true
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-            }
-
-            Button {
-                text: "Cleanup"
-                Layout.fillWidth: true
-                enabled: webrtc.initialized
-                onClicked: webrtc.cleanup()
-
-                background: Rectangle {
-                    radius: 8
-                    color: parent.enabled ? (parent.pressed ? "#0D47A1" : "#0F3460") : "#444"
-                }
-                contentItem: Text {
-                    text: parent.text
-                    color: "white"
-                    font.pixelSize: 15
-                    font.bold: true
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
-            }
-        }
-
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            radius: 12
-            color: "#16213E"
-            border.color: "#0F3460"
-            border.width: 1
-
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 12
-                spacing: 4
+                Layout.preferredHeight: 48
 
                 Text {
-                    text: "LOG"
-                    font.pixelSize: 12
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "LibWebRTC Demo"
+                    font.pixelSize: 22
                     font.bold: true
-                    color: "#8888AA"
+                    color: "#E94560"
                 }
 
-                ScrollView {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    clip: true
+                Text {
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "接收端"
+                    font.pixelSize: 12
+                    color: "#6B7280"
+                }
+            }
 
-                    TextArea {
-                        readOnly: true
-                        text: webrtc.statusLog
-                        color: "#C0C0D0"
-                        font.family: "monospace"
-                        font.pixelSize: 13
-                        wrapMode: Text.Wrap
-                        background: null
+            // ---------- 视频预览区（WebRTC 渲染器）----------
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 240
+                Layout.minimumHeight: 160
+                radius: 12
+                color: "#0F1629"
+                border.color: "#0F3460"
+                border.width: 1
+                clip: true
+
+                WebRTCVideoRenderer {
+                    id: videoRenderer
+                    anchors.fill: parent
+                    anchors.margins: 2
+
+                    Component.onCompleted: {
+                        receiverClient.setVideoRenderer(videoRenderer)
+                    }
+                }
+
+                Text {
+                    anchors.centerIn: parent
+                    text: videoRenderer.hasVideo ? "" : "视频将在此显示"
+                    font.pixelSize: 14
+                    color: "#4B5563"
+                    visible: !videoRenderer.hasVideo
+                }
+            }
+
+            // ---------- 控制区 ----------
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 180
+                radius: 12
+                color: "#16213E"
+                border.color: "#0F3460"
+                border.width: 1
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 12
+
+                    // 状态行
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+
+                        Rectangle {
+                            width: 8
+                            height: 8
+                            radius: 4
+                            color: receiverStatus.indexOf("已连接") >= 0 ? "#22C55E" : "#6B7280"
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: receiverStatus
+                            font.pixelSize: 13
+                            color: "#E5E7EB"
+                            wrapMode: Text.WordWrap
+                            elide: Text.ElideRight
+                            maximumLineCount: 2
+                        }
+                    }
+
+                    // 信令服务器地址（可编辑，连接时使用 urlField.text）
+                    TextField {
+                        id: urlField
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 36
+                        placeholderText: "ws://host:port/socket.io/?EIO=4&transport=websocket"
+                        text: root.signalingUrl
+                        font.pixelSize: 11
+                        color: "#E5E7EB"
+                        background: Rectangle {
+                            color: "#0F1629"
+                            border.color: "#0F3460"
+                            radius: 6
+                        }
+                    }
+
+                    // 四项验证诊断：运行后 logcat 过滤 VERIFY 查看 1 权限 2 ADM 3 禁用音频 4 系统兼容
+                    Button {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 32
+                        text: "验证诊断 (输出到 logcat)"
+                        onClicked: receiverClient.runVerificationDiagnostic()
+                        background: Rectangle {
+                            radius: 6
+                            color: parent.pressed ? "#4B5563" : "#374151"
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: "#9CA3AF"
+                            font.pixelSize: 12
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+
+                    // 按钮区
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+
+                        Button {
+                            text: "连接接收"
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 44
+                            enabled: root.connectReady
+                            onClicked: receiverClient.requestPermissionAndConnect(urlField.text)
+
+                            background: Rectangle {
+                                radius: 8
+                                color: parent.enabled ? (parent.pressed ? "#16A34A" : "#22C55E") : "#374151"
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: "white"
+                                font.pixelSize: 15
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                        }
+
+                        Button {
+                            text: "断开"
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 44
+                            onClicked: receiverClient.disconnect()
+
+                            background: Rectangle {
+                                radius: 8
+                                color: parent.enabled ? (parent.pressed ? "#B91C1C" : "#EF4444") : "#374151"
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: "white"
+                                font.pixelSize: 15
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                        }
                     }
                 }
             }

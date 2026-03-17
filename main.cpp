@@ -1,17 +1,25 @@
-#include <QGuiApplication>
+ #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QtQml>
 
 #include "webrtcwrapper.h"
+#include "webrtc_receiver_client.h"
+#include "webrtc_video_renderer.h"
 
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
 
+    // 手动注册 WebRTCVideoRenderer，确保 QML 可正常 import LibwebRtcDemo 1.0
+    qmlRegisterType<WebRTCVideoRenderer>("LibwebRtcDemo", 1, 0, "WebRTCVideoRenderer");
+
     WebRTCWrapper webrtc;
+    WebRTCReceiverClient receiverClient;
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("webrtc", &webrtc);
+    engine.rootContext()->setContextProperty("receiverClient", &receiverClient);
 
     const QUrl url(QStringLiteral("qrc:/LibwebRtcDemo/main.qml"));
     QObject::connect(
@@ -27,3 +35,6 @@ int main(int argc, char *argv[])
 
     return app.exec();
 }
+
+
+
