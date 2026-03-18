@@ -20,7 +20,7 @@ player = None
 def get_camera():
     """获取摄像头（Windows DirectShow）"""
     camera_names = [
-        'USB Camera',      
+        'KS2A418-2.0',      
         'Integrated Webcam',
         'Integrated Camera',
         'HD Webcam',

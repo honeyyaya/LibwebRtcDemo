@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC 信令流程时序图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({ startOnLoad: true, theme: 'default' });</script>
+    <style>
+        body { font-family: "Microsoft YaHei", sans-serif; padding: 24px; background: #f5f5f5; }
+        h1 { color: #333; }
+        .mermaid { background: white; padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <h1>WebRTC 信令流程时序图</h1>
+    <p>发送端、接收端通过信令服务器交换 SDP 和 ICE Candidate，建立 P2P 连接后音视频数据直接传输。</p>
+    <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant 发送端 as 发送端 (Offerer)
+    participant 信令服务器 as 信令服务器
+    participant 接收端 as 接收端 (Answerer)
+
+    Note over 接收端,信令服务器: 1. 连接与加入房间
+    接收端->>+信令服务器: connect
+    接收端->>信令服务器: join("video-room")
+    发送端->>+信令服务器: connect
+    发送端->>信令服务器: join("video-room")
+    信令服务器->>-发送端: peer-joined(id)
+
+    Note over 发送端,接收端: 2. SDP Offer/Answer 交换
+    发送端->>信令服务器: offer {room, sdp}
+    信令服务器->>接收端: offer {sdp, from}
+    接收端->>信令服务器: answer {room, sdp}
+    信令服务器->>发送端: answer {sdp, from}
+
+    Note over 发送端,接收端: 3. ICE Candidate 交换（双向，可能多次）
+    发送端->>信令服务器: ice-candidate {room, candidate}
+    信令服务器->>接收端: ice-candidate {candidate, from}
+    接收端->>信令服务器: ice-candidate {room, candidate}
+    信令服务器->>发送端: ice-candidate {candidate, from}
+
+    Note over 发送端,接收端: 4. P2P WebRTC 连接建立
+    rect rgb(240, 248, 255)
+        Note over 发送端,接收端: 音视频数据直接 P2P 传输，不经过信令服务器
+        发送端-->>接收端: 音视频流 (P2P)
+    end
+    </div>
+</body>
+</html>
