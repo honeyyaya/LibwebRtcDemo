@@ -8,7 +8,7 @@ Receiver.html 原理 :
 
 ![img](https://pic2.zhimg.com/v2-84e5bf7a5487db5eedf5656d5b271fad_1440w.jpg)
 
-
+![img](https://i-blog.csdnimg.cn/blog_migrate/055aaf8b95417d0df7ae23b2398a9bb3.png)
 
 详细解释如下:
 
@@ -332,6 +332,14 @@ Offer : 指的就是信令 主要发送的就是SDP
 > 同一网段：直接连，不走路由，不用穿透，裸连。
 >
 > 不同网段 / 公网：必须走路由，要穿透，要 STUN。
+
+
+
+#### P2P 连接
+
+:-1: error: adb.exe: failed to install D:/Mirror/Projects/LibwebRtcDemo/build/Qt_6_8_3_for_Android_arm64_v8a-Debug/android-build-appLibwebRtcDemo//build/outputs/apk/debug/android-build-appLibwebRtcDemo-debug.apk: Failure [INSTALL_FAILED_OLDER_SDK: Failed parse during installPackageLI: /data/app/vmdl1062194407.tmp/base.apk (at Binary XML file line #9): Requires newer sdk version #28 (current version is #25)]
+
+
 
 
 

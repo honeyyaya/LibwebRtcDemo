@@ -20,6 +20,8 @@ qt_add_executable(appLibwebRtcDemo
     webrtc_receiver_client.cpp
     webrtc_video_renderer.h
     webrtc_video_renderer.cpp
+    signaling_client.h
+    signaling_client.cpp
 )
 
 qt_add_qml_module(appLibwebRtcDemo

@@ -16,8 +16,8 @@ Window {
     property string receiverStatus: "未连接"
     // 方向3: 启动后延迟 1.5 秒再允许连接，确保 Activity 完全就绪后再初始化 ADM
     property bool connectReady: false
-    // 信令地址：与 receiver.html 部署地址对应，http://192.168.3.176:3000/receiver.html → ws://192.168.3.176:3000
-    property string signalingUrl: "ws://192.168.3.176:3000/socket.io/?EIO=4&transport=websocket"
+    // 信令地址：TCP 直连信令服务器（JSON-per-line 协议）
+    property string signalingUrl: "192.168.3.20:8765"
 
     Component.onCompleted: {
         receiverStatus = "方向3 验证: 等待 Activity 就绪 (1.5s)..."
@@ -149,7 +149,7 @@ Window {
                         id: urlField
                         Layout.fillWidth: true
                         Layout.preferredHeight: 36
-                        placeholderText: "ws://host:port/socket.io/?EIO=4&transport=websocket"
+                        placeholderText: "host:port (如 192.168.3.20:8765)"
                         text: root.signalingUrl
                         font.pixelSize: 11
                         color: "#E5E7EB"
@@ -179,24 +179,24 @@ Window {
                         }
                     }
 
-                    // 编解码器信息打印：输出到 logcat，过滤 CODEC 查看
-                    Button {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 32
-                        text: "打印编解码器信息"
-                        onClicked: codecPrinter.printAllCodecs()
-                        background: Rectangle {
-                            radius: 6
-                            color: parent.pressed ? "#4B5563" : "#374151"
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "#9CA3AF"
-                            font.pixelSize: 12
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                    }
+                    // // 编解码器信息打印：输出到 logcat，过滤 CODEC 查看
+                    // Button {
+                    //     Layout.fillWidth: true
+                    //     Layout.preferredHeight: 32
+                    //     text: "打印编解码器信息"
+                    //     onClicked: codecPrinter.printAllCodecs()
+                    //     background: Rectangle {
+                    //         radius: 6
+                    //         color: parent.pressed ? "#4B5563" : "#374151"
+                    //     }
+                    //     contentItem: Text {
+                    //         text: parent.text
+                    //         color: "#9CA3AF"
+                    //         font.pixelSize: 12
+                    //         horizontalAlignment: Text.AlignHCenter
+                    //         verticalAlignment: Text.AlignVCenter
+                    //     }
+                    // }
 
                     // 按钮区
                     RowLayout {
