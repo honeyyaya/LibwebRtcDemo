@@ -59,6 +59,15 @@ private:
 
     bool m_webrtcInitialized = false;
     QObject *m_videoRenderer = nullptr;
+
+    // GetStats 定时采集
+    QTimer *m_statsTimer = nullptr;
+    void startStatsTimer();
+    void stopStatsTimer();
+    uint32_t m_prevFramesDecoded = 0;
+    double   m_prevTotalDecodeTime = 0.0;
+    uint32_t m_prevFramesReceived = 0;
+    uint32_t m_prevFramesDropped = 0;
 };
 
 #endif // WEBRTC_RECEIVER_CLIENT_H

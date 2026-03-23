@@ -36,44 +36,10 @@ void WebRTCVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame)
     }, Qt::QueuedConnection);
 }
 
-// I420 (YUV) 转 BGRA 的 BT.601 公式
-static void i420ToBgra(int w, int h,
-                       const uint8_t *y, int strideY,
-                       const uint8_t *u, int strideU,
-                       const uint8_t *v, int strideV,
-                       uint8_t *bgra, int strideBgra)
-{
-    for (int row = 0; row < h; ++row) {
-        for (int col = 0; col < w; ++col) {
-            int yVal = y[row * strideY + col];
-            int uVal = u[(row / 2) * strideU + (col / 2)];
-            int vVal = v[(row / 2) * strideV + (col / 2)];
-
-            int c = yVal - 16;
-            int d = uVal - 128;
-            int e = vVal - 128;
-            int r = (298 * c + 409 * e + 128) >> 8;
-            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-            int b = (298 * c + 516 * d + 128) >> 8;
-
-            r = qBound(0, r, 255);
-            g = qBound(0, g, 255);
-            b = qBound(0, b, 255);
-
-            uint8_t *px = bgra + row * strideBgra + col * 4;
-            px[0] = static_cast<uint8_t>(b);
-            px[1] = static_cast<uint8_t>(g);
-            px[2] = static_cast<uint8_t>(r);
-            px[3] = 255;
-        }
-    }
-}
-
 void WebRTCVideoRenderer::updateFrameImage(scoped_refptr<RTCVideoFrame> frame, qint64 tDecodeIntervalUs)
 {
     if (!frame)
         return;
-    // 线程队列：从 OnFrame 到主线程执行 updateFrameImage 的延迟
     qint64 tThreadQueueUs = m_receiveTimer.nsecsElapsed() / 1000;
     QElapsedTimer localTimer;
     localTimer.start();
@@ -83,27 +49,22 @@ void WebRTCVideoRenderer::updateFrameImage(scoped_refptr<RTCVideoFrame> frame, q
     if (w <= 0 || h <= 0)
         return;
 
-    const uint8_t *y = frame->DataY();
-    const uint8_t *u = frame->DataU();
-    const uint8_t *v = frame->DataV();
-    if (!y || !u || !v) {
-        qWarning() << "[VideoRenderer] I420 data planes null, skip frame";
-        return;
-    }
-
     QImage img(w, h, QImage::Format_ARGB32);
     if (img.isNull())
         return;
 
-    i420ToBgra(w, h,
-               y, frame->StrideY(),
-               u, frame->StrideU(),
-               v, frame->StrideV(),
-               img.bits(), img.bytesPerLine());
+    // 使用 libwebrtc 内置的 ConvertToARGB（底层 libyuv，带 NEON/SSE SIMD 加速）
+    int ret = frame->ConvertToARGB(RTCVideoFrame::Type::kARGB,
+                                   img.bits(), img.bytesPerLine(),
+                                   w, h);
+    if (ret < 0) {
+        qWarning() << "[VideoRenderer] ConvertToARGB failed, ret=" << ret;
+        return;
+    }
     qint64 tConvertUs = localTimer.nsecsElapsed() / 1000;
 
     QMutexLocker lock(&m_imageMutex);
-    m_image = img.copy();
+    m_image = std::move(img);
     qint64 tCopyUs = localTimer.nsecsElapsed() / 1000 - tConvertUs;
     if (!m_hasVideo) {
         m_hasVideo = true;

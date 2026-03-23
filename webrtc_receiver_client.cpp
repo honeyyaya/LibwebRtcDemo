@@ -33,6 +33,13 @@ public:
         if (state == libwebrtc::RTCPeerConnectionStateConnected) {
             QMetaObject::invokeMethod(m_client, [this]() {
                 Q_EMIT m_client->statusChanged("WebRTC 已连接，正在接收视频");
+                m_client->startStatsTimer();
+            }, Qt::QueuedConnection);
+        } else if (state == libwebrtc::RTCPeerConnectionStateFailed ||
+                   state == libwebrtc::RTCPeerConnectionStateDisconnected ||
+                   state == libwebrtc::RTCPeerConnectionStateClosed) {
+            QMetaObject::invokeMethod(m_client, [this]() {
+                m_client->stopStatsTimer();
             }, Qt::QueuedConnection);
         }
     }
@@ -404,6 +411,7 @@ void WebRTCReceiverClient::connectToSignaling(const QString &addr)
 
 void WebRTCReceiverClient::disconnect()
 {
+    stopStatsTimer();
     if (m_videoRenderer) {
         auto *r = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer);
         if (r) r->clearVideoTrack();
@@ -524,4 +532,124 @@ void WebRTCReceiverClient::handleRemoteIceCandidate(const std::string &mid, int 
     if (!m_peerConnection) return;
     m_peerConnection->AddCandidate(libwebrtc::string(mid.c_str()), mline_index,
                                    libwebrtc::string(candidate.c_str()));
+}
+
+// =============================================================================
+// GetStats 定时采集：每 3 秒打印一次解码/网络关键指标
+// =============================================================================
+
+void WebRTCReceiverClient::startStatsTimer()
+{
+    if (m_statsTimer)
+        return;
+    m_prevFramesDecoded = 0;
+    m_prevTotalDecodeTime = 0.0;
+    m_prevFramesReceived = 0;
+    m_prevFramesDropped = 0;
+
+    m_statsTimer = new QTimer(this);
+    m_statsTimer->setInterval(3000);
+    connect(m_statsTimer, &QTimer::timeout, this, [this]() {
+        if (!m_peerConnection)
+            return;
+        m_peerConnection->GetStats(
+            [this](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>> reports) {
+                for (const auto &stat : reports.std_vector()) {
+                    std::string type = stat->type().std_string();
+                    if (type != "inbound-rtp")
+                        continue;
+
+                    bool isVideo = false;
+                    uint32_t framesDecoded = 0;
+                    double totalDecodeTime = 0.0;
+                    double fps = 0.0;
+                    uint32_t framesReceived = 0;
+                    uint32_t framesDropped = 0;
+                    double jitterBufferDelay = 0.0;
+                    uint64_t jitterBufferEmitted = 0;
+                    int frameWidth = 0, frameHeight = 0;
+                    uint64_t bytesReceived = 0;
+                    std::string decoderImpl;
+
+                    for (const auto &m : stat->Members().std_vector()) {
+                        if (!m->IsDefined())
+                            continue;
+                        std::string name = m->GetName().std_string();
+                        if (name == "kind" || name == "mediaType") {
+                            if (m->ValueString().std_string() == "video")
+                                isVideo = true;
+                        } else if (name == "framesDecoded") {
+                            framesDecoded = m->ValueUint32();
+                        } else if (name == "totalDecodeTime") {
+                            totalDecodeTime = m->ValueDouble();
+                        } else if (name == "framesPerSecond") {
+                            fps = m->ValueDouble();
+                        } else if (name == "framesReceived") {
+                            framesReceived = m->ValueUint32();
+                        } else if (name == "framesDropped") {
+                            framesDropped = m->ValueUint32();
+                        } else if (name == "jitterBufferDelay") {
+                            jitterBufferDelay = m->ValueDouble();
+                        } else if (name == "jitterBufferEmittedCount") {
+                            jitterBufferEmitted = m->ValueUint64();
+                        } else if (name == "frameWidth") {
+                            frameWidth = static_cast<int>(m->ValueUint32());
+                        } else if (name == "frameHeight") {
+                            frameHeight = static_cast<int>(m->ValueUint32());
+                        } else if (name == "bytesReceived") {
+                            bytesReceived = m->ValueUint64();
+                        } else if (name == "decoderImplementation") {
+                            decoderImpl = m->ValueString().std_string();
+                        }
+                    }
+
+                    if (!isVideo)
+                        continue;
+
+                    uint32_t deltaFrames = framesDecoded - m_prevFramesDecoded;
+                    double deltaTime = totalDecodeTime - m_prevTotalDecodeTime;
+                    double avgDecodeMs = (deltaFrames > 0) ? (deltaTime / deltaFrames * 1000.0) : 0.0;
+                    uint32_t deltaDropped = framesDropped - m_prevFramesDropped;
+                    double avgJitterMs = (jitterBufferEmitted > 0)
+                        ? (jitterBufferDelay / jitterBufferEmitted * 1000.0) : 0.0;
+
+                    QMetaObject::invokeMethod(this, [=]() {
+                        qDebug().noquote() << QString(
+                            "[DecodeStats] %1x%2 | 解码器: %3 | fps: %4 | "
+                            "解码帧: +%5 (总%6) | 平均解码: %7 ms/帧 | "
+                            "丢帧: +%8 (总%9) | 抖动缓冲: %10 ms | "
+                            "接收: %11 KB")
+                            .arg(frameWidth).arg(frameHeight)
+                            .arg(QString::fromStdString(decoderImpl))
+                            .arg(fps, 0, 'f', 1)
+                            .arg(deltaFrames).arg(framesDecoded)
+                            .arg(avgDecodeMs, 0, 'f', 2)
+                            .arg(deltaDropped).arg(framesDropped)
+                            .arg(avgJitterMs, 0, 'f', 1)
+                            .arg(bytesReceived / 1024);
+                    }, Qt::QueuedConnection);
+
+                    m_prevFramesDecoded = framesDecoded;
+                    m_prevTotalDecodeTime = totalDecodeTime;
+                    m_prevFramesReceived = framesReceived;
+                    m_prevFramesDropped = framesDropped;
+                    break;
+                }
+            },
+            [](const char *error) {
+                qWarning() << "[DecodeStats] GetStats failed:" << error;
+            });
+    });
+    m_statsTimer->start();
+    qDebug() << "[DecodeStats] 统计定时器已启动 (每 3s)";
+}
+
+void WebRTCReceiverClient::stopStatsTimer()
+{
+    if (m_statsTimer) {
+        m_statsTimer->stop();
+        m_statsTimer->deleteLater();
+        m_statsTimer = nullptr;
+        qDebug() << "[DecodeStats] 统计定时器已停止";
+    }
 }
