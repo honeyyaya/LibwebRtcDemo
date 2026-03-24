@@ -343,6 +343,18 @@ Offer : 指的就是信令 主要发送的就是SDP
 
 
 
+[排查] SDP 协商的 1、服务端抓tcpdum  2、wireshark 解析 [ip.src==192.168.3.20 and !ssh] 
+
+3、
+
+ip.src==192.168.3.20 and !ssh
+
+> ![image-20260324152154218](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260324152154218.png)
+
+
+
+
+
 
 
 

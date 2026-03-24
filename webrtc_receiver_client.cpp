@@ -546,6 +546,8 @@ void WebRTCReceiverClient::startStatsTimer()
     m_prevTotalDecodeTime = 0.0;
     m_prevFramesReceived = 0;
     m_prevFramesDropped = 0;
+    m_prevJitterBufferDelay = 0.0;
+    m_prevJitterBufferEmitted = 0;
 
     m_statsTimer = new QTimer(this);
     m_statsTimer->setInterval(3000);
@@ -554,9 +556,61 @@ void WebRTCReceiverClient::startStatsTimer()
             return;
         m_peerConnection->GetStats(
             [this](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>> reports) {
+
+                // 类型安全读取：libwebrtc 不同版本对同一字段可能用不同存储类型
+                auto safeInt64 = [](const libwebrtc::scoped_refptr<libwebrtc::RTCStatsMember> &m) -> int64_t {
+                    switch (m->GetType()) {
+                    case libwebrtc::RTCStatsMember::kInt32:  return m->ValueInt32();
+                    case libwebrtc::RTCStatsMember::kUint32: return m->ValueUint32();
+                    case libwebrtc::RTCStatsMember::kInt64:  return m->ValueInt64();
+                    case libwebrtc::RTCStatsMember::kUint64: return static_cast<int64_t>(m->ValueUint64());
+                    case libwebrtc::RTCStatsMember::kDouble: return static_cast<int64_t>(m->ValueDouble());
+                    default: return 0;
+                    }
+                };
+                auto safeDouble = [](const libwebrtc::scoped_refptr<libwebrtc::RTCStatsMember> &m) -> double {
+                    switch (m->GetType()) {
+                    case libwebrtc::RTCStatsMember::kDouble: return m->ValueDouble();
+                    case libwebrtc::RTCStatsMember::kInt32:  return m->ValueInt32();
+                    case libwebrtc::RTCStatsMember::kUint32: return m->ValueUint32();
+                    case libwebrtc::RTCStatsMember::kInt64:  return static_cast<double>(m->ValueInt64());
+                    case libwebrtc::RTCStatsMember::kUint64: return static_cast<double>(m->ValueUint64());
+                    default: return 0.0;
+                    }
+                };
+
+                // ---- candidate-pair: 网络 RTT ----
+                double currentRtt = 0.0;
+                double totalRtt = 0.0;
+                int64_t responsesReceived = 0;
+                bool foundNominated = false;
+
                 for (const auto &stat : reports.std_vector()) {
-                    std::string type = stat->type().std_string();
-                    if (type != "inbound-rtp")
+                    if (stat->type().std_string() != "candidate-pair")
+                        continue;
+                    bool nominated = false;
+                    double curRtt = 0.0, totRtt = 0.0;
+                    int64_t respRecv = 0;
+                    for (const auto &m : stat->Members().std_vector()) {
+                        if (!m->IsDefined()) continue;
+                        std::string name = m->GetName().std_string();
+                        if (name == "nominated") nominated = m->ValueBool();
+                        else if (name == "currentRoundTripTime") curRtt = safeDouble(m);
+                        else if (name == "totalRoundTripTime") totRtt = safeDouble(m);
+                        else if (name == "responsesReceived") respRecv = safeInt64(m);
+                    }
+                    if (nominated) {
+                        currentRtt = curRtt;
+                        totalRtt = totRtt;
+                        responsesReceived = respRecv;
+                        foundNominated = true;
+                        break;
+                    }
+                }
+
+                // ---- inbound-rtp (video): 解码 + 网络质量 ----
+                for (const auto &stat : reports.std_vector()) {
+                    if (stat->type().std_string() != "inbound-rtp")
                         continue;
 
                     bool isVideo = false;
@@ -570,6 +624,12 @@ void WebRTCReceiverClient::startStatsTimer()
                     int frameWidth = 0, frameHeight = 0;
                     uint64_t bytesReceived = 0;
                     std::string decoderImpl;
+                    double jitter = 0.0;
+                    int64_t packetsLost = 0;
+                    int64_t packetsReceived = 0;
+                    int64_t nackCount = 0;
+                    int64_t pliCount = 0;
+                    int64_t firCount = 0;
 
                     for (const auto &m : stat->Members().std_vector()) {
                         if (!m->IsDefined())
@@ -600,6 +660,18 @@ void WebRTCReceiverClient::startStatsTimer()
                             bytesReceived = m->ValueUint64();
                         } else if (name == "decoderImplementation") {
                             decoderImpl = m->ValueString().std_string();
+                        } else if (name == "jitter") {
+                            jitter = safeDouble(m);
+                        } else if (name == "packetsLost") {
+                            packetsLost = safeInt64(m);
+                        } else if (name == "packetsReceived") {
+                            packetsReceived = safeInt64(m);
+                        } else if (name == "nackCount") {
+                            nackCount = safeInt64(m);
+                        } else if (name == "pliCount") {
+                            pliCount = safeInt64(m);
+                        } else if (name == "firCount") {
+                            firCount = safeInt64(m);
                         }
                     }
 
@@ -610,8 +682,16 @@ void WebRTCReceiverClient::startStatsTimer()
                     double deltaTime = totalDecodeTime - m_prevTotalDecodeTime;
                     double avgDecodeMs = (deltaFrames > 0) ? (deltaTime / deltaFrames * 1000.0) : 0.0;
                     uint32_t deltaDropped = framesDropped - m_prevFramesDropped;
-                    double avgJitterMs = (jitterBufferEmitted > 0)
-                        ? (jitterBufferDelay / jitterBufferEmitted * 1000.0) : 0.0;
+
+                    uint64_t deltaJbEmitted = jitterBufferEmitted - m_prevJitterBufferEmitted;
+                    double deltaJbDelay = jitterBufferDelay - m_prevJitterBufferDelay;
+                    double avgJitterMs = (deltaJbEmitted > 0)
+                        ? (deltaJbDelay / deltaJbEmitted * 1000.0) : 0.0;
+
+                    double lossRate = (packetsLost + (int64_t)packetsReceived > 0)
+                        ? (packetsLost * 100.0 / (packetsLost + (int64_t)packetsReceived)) : 0.0;
+                    double avgRttMs = (responsesReceived > 0)
+                        ? (totalRtt / responsesReceived * 1000.0) : 0.0;
 
                     QMetaObject::invokeMethod(this, [=]() {
                         qDebug().noquote() << QString(
@@ -627,12 +707,28 @@ void WebRTCReceiverClient::startStatsTimer()
                             .arg(deltaDropped).arg(framesDropped)
                             .arg(avgJitterMs, 0, 'f', 1)
                             .arg(bytesReceived / 1024);
+
+                        qDebug().noquote() << QString(
+                            "[NetStats] RTT: %1 ms (平均 %2 ms) | "
+                            "抖动: %3 ms | 丢包率: %4% (%5/%6) | "
+                            "NACK: %7 | PLI: %8 | FIR: %9")
+                            .arg(currentRtt * 1000.0, 0, 'f', 1)
+                            .arg(avgRttMs, 0, 'f', 1)
+                            .arg(jitter * 1000.0, 0, 'f', 1)
+                            .arg(lossRate, 0, 'f', 2)
+                            .arg(packetsLost)
+                            .arg(packetsReceived)
+                            .arg(nackCount)
+                            .arg(pliCount)
+                            .arg(firCount);
                     }, Qt::QueuedConnection);
 
                     m_prevFramesDecoded = framesDecoded;
                     m_prevTotalDecodeTime = totalDecodeTime;
                     m_prevFramesReceived = framesReceived;
                     m_prevFramesDropped = framesDropped;
+                    m_prevJitterBufferDelay = jitterBufferDelay;
+                    m_prevJitterBufferEmitted = jitterBufferEmitted;
                     break;
                 }
             },

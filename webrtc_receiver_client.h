@@ -68,6 +68,8 @@ private:
     double   m_prevTotalDecodeTime = 0.0;
     uint32_t m_prevFramesReceived = 0;
     uint32_t m_prevFramesDropped = 0;
+    double   m_prevJitterBufferDelay = 0.0;
+    uint64_t m_prevJitterBufferEmitted = 0;
 };
 
 #endif // WEBRTC_RECEIVER_CLIENT_H
