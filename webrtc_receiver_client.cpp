@@ -439,6 +439,8 @@ void WebRTCReceiverClient::setVideoRenderer(QObject *renderer)
 
 void WebRTCReceiverClient::initWebRTC()
 {
+    qDebug() << "[Thread] initWebRTC running on thread:" << QThread::currentThreadId();
+
     if (m_webrtcInitialized) {
         VERIFY_LOG("2", "WebRTC 已初始化，跳过");
         return;

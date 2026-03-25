@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Qt6 6.2 COMPONENTS Quick WebSockets Widgets Network REQUIRED)
+find_package(Qt6 6.2 COMPONENTS Quick WebSockets Widgets Network OpenGL REQUIRED)
 
 set(WEBRTC_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
 set(WEBRTC_LIB_DIR ${CMAKE_SOURCE_DIR}/lib/arm64-v8a)
@@ -65,6 +65,7 @@ target_link_libraries(appLibwebRtcDemo
         Qt6::WebSockets
         Qt6::Widgets
         Qt6::Network
+        Qt6::OpenGL
         webrtc
 )
 

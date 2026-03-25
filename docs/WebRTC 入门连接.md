@@ -353,9 +353,114 @@ ip.src==192.168.3.20 and !ssh
 
 
 
+【优化】视频渲染优化
 
+优化方法：
 
+> ## WebRTC 渲染优化记录
+>
+> ### 一、改造前
+>
+> | 项目       | 详情                                             |
+> | :--------- | :----------------------------------------------- |
+> | 渲染方案   | `QQuickPaintedItem` + `QPainter::drawImage()`    |
+> | YUV→RGB    | CPU 软编（libyuv `ConvertToARGB`）               |
+> | 数据传递   | `QImage` → `QueuedConnection` → 主线程 `paint()` |
+> | 主线程占用 | 约 4~8 ms/帧                                     |
+>
+> ------
+>
+> ### 二、改造后
+>
+> | 项目       | 详情                                                         |
+> | :--------- | :----------------------------------------------------------- |
+> | 渲染方案   | `QQuickFramebufferObject` + OpenGL Fragment Shader           |
+> | YUV→RGB    | GPU Shader 完成（全并行，无 CPU 参与）                       |
+> | 数据传递   | `YuvFrameData`（QByteArray Y/U/V） → `synchronize()` → `glTexImage2D` |
+> | 主线程占用 | ~0 ms（GL 命令提交在渲染线程）                               |
+>
+> ------
+>
+> ### 三、核心改动
+>
+> 1. 头文件 `webrtc_video_renderer.h`
+>
+> - 基类从 `QQuickPaintedItem` → `QQuickFramebufferObject`
+> - 新增 `YuvFrameData` 结构体（Y/U/V 三通道原始数据）
+> - 新增 `takeFrame()`、`timerEvent()`、`createRenderer()`
+> - 移除 `QImage`、`paint()` 声明
+> - 实现文件 `webrtc_video_renderer.cpp`
+>
+> - 新增内部类 `WebRTCGLRenderer`（继承 `QQuickFramebufferObject::Renderer`）
+> - Fragment Shader 实现 YUV→RGB（BT.601 公式，GPU 并行）
+> - `OnFrame()`：只做 YUV plane 拷贝（~1.2ms），不进行 CPU 色彩转换
+> - `synchronize()`：调用 `glTexImage2D × 3` 上传纹理（~3ms）
+> - `render()`：Shader 绘制 + 统计（~0.3ms）
+> - CMakeLists.txt
+>
+> - `find_package` 加 `OpenGL`
+> - `target_link_libraries` 加 `Qt6::OpenGL`
+>
+> ------
+>
+> ### 四、统计数据对比
+>
+> | 指标            | 改造前           | 改造后          |
+> | :-------------- | :--------------- | :-------------- |
+> | YUV→ARGB（CPU） | 1~3 ms/帧        | 0（消除）       |
+> | YUV 拷贝        | —                | ~1.2 ms/帧      |
+> | 纹理上传        | —                | ~3 ms/帧        |
+> | GPU 渲染        | ~1 ms/帧         | ~0.3 ms/帧      |
+> | 主线程占用      | 4~8 ms/帧        | ≈ 0 ms          |
+> | 数据上传量      | ARGB: ~3.7 MB/帧 | YUV: ~1.4 MB/帧 |
+>
+> ------
+>
+> ### 五、关键注意事项
+>
+> 1. Qt 6 兼容
+>
+> `QQuickWindow::resetOpenGLState()` 在 Qt 6 中已移除（Scene Graph 自动管理），所有调用处删除。
+>
+> 2. stride 处理
+>
+> `RTCVideoFrame` 的 `StrideY()` 可能不等于 `width()`（行对齐 padding），需逐行拷贝：
+>
+> if (strideY == w) {
+>
+> ​    yuvFrame.y = QByteArray(frame->DataY(), w * h);
+>
+> } else {
+>
+> ​    yuvFrame.y.resize(w * h);
+>
+> ​    for (int row = 0; row < h; ++row)
+>
+> ​        std::memcpy(yuvFrame.y.data() + row * w, frame->DataY() + row * strideY, w);
+>
+> }
+>
+> 3. `setMirrorVertically(true)`
+>
+> `QQuickFramebufferObject` 默认 Y 轴翻转，需加此设置或自行翻转纹理坐标。
+>
+> 4. `timerEvent` 驱动刷新
+>
+> `startTimer(1000 / 60)` 替代 `OnFrame → update()` 驱动刷新，避免无帧时不刷新、有帧时频繁刷新的问题。
 
+【优化】硬解码优化
+
+优化方法：
+
+| 多功能终端 | 未优化       | 渲染优化后1.0(优化渲染层) | 渲染优化后1.0(优化解码层) |
+| ---------- | ------------ | ------------------------- | ------------------------- |
+| 抖动缓冲   | 97.8 ms      | ~212.2 ms                 |                           |
+| 解码       | 3.65 ms/帧   | ~17.53 ms                 |                           |
+| 线程队列   | 13.549 ms/帧 | ~0ms                      |                           |
+| YUV转换    | 3.149 ms/帧  | ~1.2 ms（子线程）         |                           |
+| 缓冲拷贝   | 0.01 ms/帧   | ~0.3 ms（子线程）         |                           |
+| 帧间隔     | 28.153 ms/帧 | ~67.87 ms                 |                           |
+| 渲染       | 12.967 ms/帧 | ~3 ms（子线程）           |                           |
 
 
 
