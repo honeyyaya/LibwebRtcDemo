@@ -14,7 +14,7 @@ Window {
     minimumHeight: 480
 
     property string receiverStatus: "未连接"
-    // 方向3: 启动后延迟 1.5 秒再允许连接，确保 Activity 完全就绪后再初始化 ADM
+    // 方向3: 启动后延迟 1.5 秒再允许连接，确保 Activity/JNI 就绪后再连信令
     property bool connectReady: false
     // 信令地址：TCP 直连信令服务器（JSON-per-line 协议）
     property string signalingUrl: "192.168.3.20:8765"
@@ -160,7 +160,7 @@ Window {
                         }
                     }
 
-                    // 四项验证诊断：运行后 logcat 过滤 VERIFY 查看 1 权限 2 ADM 3 禁用音频 4 系统兼容
+                    // 验证诊断：logcat 过滤 VERIFY（含延迟初始化、纯视频无录音权限、ABI 等）
                     Button {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 32

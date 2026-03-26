@@ -6,10 +6,10 @@
 #include <QMutex>
 #include <QElapsedTimer>
 
-#include "libwebrtc.h"
-#include "rtc_video_track.h"
-#include "rtc_video_frame.h"
-#include "rtc_video_renderer.h"
+#include "api/media_stream_interface.h"
+#include "api/scoped_refptr.h"
+#include "api/video/video_frame.h"
+#include "api/video/video_sink_interface.h"
 
 struct YuvFrameData {
     QByteArray y, u, v;
@@ -18,9 +18,8 @@ struct YuvFrameData {
     bool valid = false;
 };
 
-class WebRTCVideoRenderer
-    : public QQuickFramebufferObject
-    , public libwebrtc::RTCVideoRenderer<libwebrtc::scoped_refptr<libwebrtc::RTCVideoFrame>>
+class WebRTCVideoRenderer : public QQuickFramebufferObject,
+                            public webrtc::VideoSinkInterface<webrtc::VideoFrame>
 {
     Q_OBJECT
     Q_PROPERTY(bool hasVideo READ hasVideo NOTIFY hasVideoChanged)
@@ -30,9 +29,9 @@ public:
     explicit WebRTCVideoRenderer(QQuickItem *parent = nullptr);
     ~WebRTCVideoRenderer() override;
 
-    void OnFrame(libwebrtc::scoped_refptr<libwebrtc::RTCVideoFrame> frame) override;
+    void OnFrame(const webrtc::VideoFrame &frame) override;
 
-    Q_INVOKABLE void setVideoTrack(libwebrtc::scoped_refptr<libwebrtc::RTCVideoTrack> track);
+    Q_INVOKABLE void setVideoTrack(webrtc::scoped_refptr<webrtc::VideoTrackInterface> track);
     Q_INVOKABLE void clearVideoTrack();
 
     bool hasVideo() const { return m_hasVideo; }
@@ -46,7 +45,7 @@ protected:
     void timerEvent(QTimerEvent *event) override;
 
 private:
-    libwebrtc::scoped_refptr<libwebrtc::RTCVideoTrack> m_track;
+    webrtc::scoped_refptr<webrtc::VideoTrackInterface> m_track;
     bool m_hasVideo = false;
 
     QMutex m_frameMutex;
@@ -56,4 +55,4 @@ private:
     QElapsedTimer m_decodeIntervalTimer;
 };
 
-#endif // WEBRTC_VIDEO_RENDERER_H
+#endif

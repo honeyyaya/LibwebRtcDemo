@@ -7,9 +7,7 @@
     android:versionCode="-- %%INSERT_VERSION_CODE%% --"
     android:versionName="-- %%INSERT_VERSION_NAME%% --">
     <!-- %%INSERT_PERMISSIONS -->
-    <!-- WebRTC ADM(语音引擎)需要，否则 webrtc_voice_engine.cc Check failed: adm_ -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- 纯视频接收：不声明录音/音频设置权限 -->
     <!-- %%INSERT_FEATURES -->
     <supports-screens
         android:anyDensity="true"

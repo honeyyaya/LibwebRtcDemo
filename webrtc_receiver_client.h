@@ -4,21 +4,16 @@
 #include <QObject>
 #include <QTimer>
 #include <memory>
-#include <functional>
+#include <string>
+#include <vector>
 
 #include "signaling_client.h"
 
-// libwebrtc 头文件
-#include "libwebrtc.h"
-#include "rtc_peerconnection.h"
-#include "rtc_peerconnection_factory.h"
-#include "rtc_session_description.h"
-#include "rtc_ice_candidate.h"
-#include "rtc_mediaconstraints.h"
-#include "rtc_types.h"
-#include "rtc_rtp_transceiver.h"
-#include "rtc_media_stream.h"
-#include "rtc_video_track.h"
+#include "api/jsep.h"
+#include "api/media_stream_interface.h"
+#include "api/peer_connection_interface.h"
+#include "api/scoped_refptr.h"
+#include "api/set_remote_description_observer_interface.h"
 
 class WebRTCReceiverClient : public QObject
 {
@@ -35,41 +30,55 @@ public:
 
 Q_SIGNALS:
     void statusChanged(const QString &status);
-    void remoteVideoTrackReady(libwebrtc::scoped_refptr<libwebrtc::RTCVideoTrack> track);
+    void remoteVideoTrackReady(webrtc::scoped_refptr<webrtc::VideoTrackInterface> track);
 
 private:
-    // ========== WebRTC 层 ==========
+    class PeerConnectionObserverImpl;
+    friend class PeerConnectionObserverImpl;
+
     void initWebRTC();
     void createPeerConnection();
     void handleOffer(const std::string &type, const std::string &sdp);
     void handleRemoteIceCandidate(const std::string &mid, int mline_index,
                                   const std::string &candidate);
+    void addRemoteIceCandidateNow(const std::string &mid, int mline_index,
+                                  const std::string &candidate);
+    void flushPendingRemoteIceCandidates();
+    void doCreateAnswerAfterSetRemote();
 
-    // ========== RTCPeerConnectionObserver 实现 ==========
-    class PeerConnectionObserver;
-    std::unique_ptr<PeerConnectionObserver> m_observer;
+    std::unique_ptr<PeerConnectionObserverImpl> m_observer;
 
-    // ========== 信令层 (TCP + JSON-per-line) ==========
     std::unique_ptr<webrtc_demo::SignalingClient> m_signaling;
 
-    // ========== libwebrtc 核心对象 ==========
-    libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnectionFactory> m_factory;
-    libwebrtc::scoped_refptr<libwebrtc::RTCPeerConnection> m_peerConnection;
-    libwebrtc::scoped_refptr<libwebrtc::RTCMediaConstraints> m_constraints;
+    webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> m_factory;
+    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> m_peerConnection;
+
+    // SetRemoteDescription 异步完成前 AddIceCandidate 常失败；先排队，就绪后一次性加入。
+    struct PendingRemoteIce {
+        std::string mid;
+        int mline_index = 0;
+        std::string candidate;
+    };
+    std::vector<PendingRemoteIce> m_pendingRemoteIce;
+    bool m_remoteDescriptionApplied = false;
+
+    // SetRemote / CreateAnswer / SetLocal：异步完成前用成员持有 scoped_refptr，避免只剩栈上引用被析构导致回调不来。
+    webrtc::scoped_refptr<webrtc::SetRemoteDescriptionObserverInterface> m_pendingSetRemoteObserver;
+    webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver> m_pendingCreateAnswerObserver;
+    webrtc::scoped_refptr<webrtc::SetSessionDescriptionObserver> m_pendingSetLocalObserver;
 
     bool m_webrtcInitialized = false;
     QObject *m_videoRenderer = nullptr;
 
-    // GetStats 定时采集
     QTimer *m_statsTimer = nullptr;
     void startStatsTimer();
     void stopStatsTimer();
     uint32_t m_prevFramesDecoded = 0;
-    double   m_prevTotalDecodeTime = 0.0;
+    double m_prevTotalDecodeTime = 0.0;
     uint32_t m_prevFramesReceived = 0;
     uint32_t m_prevFramesDropped = 0;
-    double   m_prevJitterBufferDelay = 0.0;
+    double m_prevJitterBufferDelay = 0.0;
     uint64_t m_prevJitterBufferEmitted = 0;
 };
 
-#endif // WEBRTC_RECEIVER_CLIENT_H
+#endif

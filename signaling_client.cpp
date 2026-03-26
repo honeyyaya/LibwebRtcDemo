@@ -1,4 +1,8 @@
 #include "signaling_client.h"
+
+#include <QDebug>
+#include <QString>
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -128,11 +132,15 @@ void SignalingClient::SendAnswer(const std::string& sdp) {
         else oss << c;
     }
     oss << "\"}";
+    std::cout << "[Signaling] SendAnswer 连接成功" << std::endl;
     SendLine(oss.str());
 }
 
 void SignalingClient::SendIceCandidate(const std::string& mid, int mline_index,
                                        const std::string& candidate) {
+    qDebug().noquote() << "[Signaling] 发出 ICE mid=" << QString::fromStdString(mid)
+                       << " mline=" << mline_index
+                       << " len=" << static_cast<int>(candidate.size());
     std::ostringstream oss;
     oss << "{\"type\":\"ice\",\"mid\":\"" << mid << "\",\"mlineIndex\":" << mline_index
        << ",\"candidate\":\"";
@@ -207,6 +215,8 @@ void SignalingClient::ParseAndDispatch(const std::string& line) {
                 } else if (line[i] == '"') break;
                 else sdp += line[i];
             }
+            qDebug().noquote() << "[Signaling] 收到 offer, sdp 长度=" << static_cast<int>(sdp.size());
+            qDebug().noquote() << QString::fromStdString(sdp);
             if (on_offer_) on_offer_("offer", sdp);
         }
         return;
@@ -215,14 +225,16 @@ void SignalingClient::ParseAndDispatch(const std::string& line) {
         line.find("\"type\": \"ice\"") != std::string::npos) {
         std::string mid, candidate;
         int mline = 0;
+        // "\"mid\":\"" 共 7 个字符，原先 p+=6 会把 mid 解成空串，导致远端 ICE 加不进去
         size_t p = line.find("\"mid\":\"");
         if (p != std::string::npos) {
-            p += 6;
+            p += 7;
             size_t end = line.find('"', p);
             if (end != std::string::npos) mid = line.substr(p, end - p);
         }
         p = line.find("\"mlineIndex\":");
-        if (p != std::string::npos) mline = std::atoi(line.c_str() + p + 12);
+        if (p != std::string::npos)
+            mline = std::atoi(line.c_str() + p + 13);
         p = line.find("\"candidate\":\"");
         if (p != std::string::npos) {
             p += 13;
@@ -233,6 +245,15 @@ void SignalingClient::ParseAndDispatch(const std::string& line) {
                 } else if (line[i] == '"') break;
                 else candidate += line[i];
             }
+        }
+        qDebug().noquote() << "[Signaling] 收到 ICE mid=" << QString::fromStdString(mid)
+                           << "mline=" << mline << "candidate 长度=" << static_cast<int>(candidate.size());
+        if (candidate.empty()) {
+            qWarning().noquote() << "[Signaling] ICE candidate 解析为空，原始 JSON 前 240 字符:"
+                                 << QString::fromStdString(
+                                        line.size() > 240 ? line.substr(0, 240) + "..." : line);
+        } else {
+            qDebug().noquote() << QString::fromStdString(candidate);
         }
         if (on_ice_ && !candidate.empty()) on_ice_(mid, mline, candidate);
     }

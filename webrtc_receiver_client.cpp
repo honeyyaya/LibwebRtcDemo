@@ -1,12 +1,29 @@
 #include "webrtc_receiver_client.h"
+#include "webrtc_factory_helper.h"
 #include "webrtc_video_renderer.h"
+
+#include <algorithm>
 #include <iostream>
 #include <memory>
+#include <utility>
+
 #include <QDebug>
+#include <QMetaObject>
+#include <QPointer>
 #include <QThread>
+
+#include "api/jsep.h"
+#include "api/make_ref_counted.h"
+#include "api/media_types.h"
+#include "api/rtc_error.h"
+#include "api/rtp_transceiver_interface.h"
+#include "api/set_remote_description_observer_interface.h"
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtc_stats_report.h"
+#include "api/stats/rtcstats_objects.h"
+
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
-#include <QJniEnvironment>
 #endif
 
 #ifndef DEFAULT_SIGNALING_ADDR
@@ -15,739 +32,689 @@
 
 #define VERIFY_LOG(tag, msg) qDebug() << "[VERIFY-" tag "]" << msg
 
-// =============================================================================
-// PeerConnectionObserver：实现 libwebrtc 的回调接口
-// =============================================================================
-class WebRTCReceiverClient::PeerConnectionObserver
-    : public libwebrtc::RTCPeerConnectionObserver
-{
-public:
-    explicit PeerConnectionObserver(WebRTCReceiverClient *client)
-        : m_client(client) {}
+namespace {
 
-    void OnSignalingState(libwebrtc::RTCSignalingState state) override {
-        (void)state;
-    }
+webrtc::SdpType SdpTypeFromOfferAnswerString(const std::string &t) {
+  auto opt = webrtc::SdpTypeFromString(t);
+  if (opt)
+    return *opt;
+  if (t == "offer")
+    return webrtc::SdpType::kOffer;
+  if (t == "answer")
+    return webrtc::SdpType::kAnswer;
+  if (t == "pranswer")
+    return webrtc::SdpType::kPrAnswer;
+  return webrtc::SdpType::kOffer;
+}
 
-    void OnPeerConnectionState(libwebrtc::RTCPeerConnectionState state) override {
-        if (state == libwebrtc::RTCPeerConnectionStateConnected) {
-            QMetaObject::invokeMethod(m_client, [this]() {
-                Q_EMIT m_client->statusChanged("WebRTC 已连接，正在接收视频");
-                m_client->startStatsTimer();
-            }, Qt::QueuedConnection);
-        } else if (state == libwebrtc::RTCPeerConnectionStateFailed ||
-                   state == libwebrtc::RTCPeerConnectionStateDisconnected ||
-                   state == libwebrtc::RTCPeerConnectionStateClosed) {
-            QMetaObject::invokeMethod(m_client, [this]() {
-                m_client->stopStatsTimer();
-            }, Qt::QueuedConnection);
-        }
-    }
+class SetRemoteDescObserver : public webrtc::SetRemoteDescriptionObserverInterface {
+ public:
+  explicit SetRemoteDescObserver(std::function<void(webrtc::RTCError)> on_done)
+      : on_done_(std::move(on_done)) {}
 
-    void OnIceGatheringState(libwebrtc::RTCIceGatheringState state) override {
-        if (state == libwebrtc::RTCIceGatheringStateComplete) {
-            qDebug() << "[Signaling] ICE 收集完成";
-        }
-    }
+  void OnSetRemoteDescriptionComplete(webrtc::RTCError error) override {
+    if (on_done_)
+      on_done_(std::move(error));
+  }
 
-    // trickle ICE：每收集到一个本地候选就立即通过信令发送给对端
-    void OnIceCandidate(libwebrtc::scoped_refptr<libwebrtc::RTCIceCandidate> candidate) override {
-        if (!candidate) return;
-        std::string mid = candidate->sdp_mid().std_string();
-        int mline_index = candidate->sdp_mline_index();
-        std::string sdp = candidate->candidate().std_string();
-        QMetaObject::invokeMethod(m_client, [this, mid, mline_index, sdp]() {
-            if (m_client->m_signaling) {
-                m_client->m_signaling->SendIceCandidate(mid, mline_index, sdp);
-            }
-        }, Qt::QueuedConnection);
-    }
+ private:
+  std::function<void(webrtc::RTCError)> on_done_;
+};
 
-    void OnTrack(libwebrtc::scoped_refptr<libwebrtc::RTCRtpTransceiver> transceiver) override {
-        if (transceiver->media_type() != libwebrtc::RTCMediaType::VIDEO)
-            return;
-        auto receiver = transceiver->receiver();
-        if (!receiver) return;
+class CreateAnswerObserver : public webrtc::CreateSessionDescriptionObserver {
+ public:
+  CreateAnswerObserver(std::function<void(webrtc::RTCError, std::unique_ptr<webrtc::SessionDescriptionInterface>)> cb,
+                       std::function<void(webrtc::RTCError)> fail)
+      : cb_(std::move(cb)), fail_(std::move(fail)) {}
 
-        //receiver->SetJitterBufferMinimumDelay(0.02);
+  void OnSuccess(webrtc::SessionDescriptionInterface *desc) override {
+    if (cb_)
+      cb_(webrtc::RTCError::OK(), std::unique_ptr<webrtc::SessionDescriptionInterface>(desc));
+  }
 
-        auto track = receiver->track();
-        if (!track || track->kind().std_string() != "video") return;
+  void OnFailure(webrtc::RTCError error) override {
+    if (fail_)
+      fail_(std::move(error));
+  }
 
-        auto *videoTrackPtr = static_cast<libwebrtc::RTCVideoTrack*>(track.get());
-        libwebrtc::scoped_refptr<libwebrtc::RTCVideoTrack> videoTrack(videoTrackPtr);
+ private:
+  std::function<void(webrtc::RTCError, std::unique_ptr<webrtc::SessionDescriptionInterface>)> cb_;
+  std::function<void(webrtc::RTCError)> fail_;
+};
 
-        QMetaObject::invokeMethod(m_client, [this, videoTrack]() {
-            Q_EMIT m_client->remoteVideoTrackReady(videoTrack);
-        }, Qt::QueuedConnection);
-    }
+class SetLocalDescObserver : public webrtc::SetSessionDescriptionObserver {
+ public:
+  SetLocalDescObserver(std::function<void()> ok, std::function<void(webrtc::RTCError)> fail)
+      : ok_(std::move(ok)), fail_(std::move(fail)) {}
 
-    void OnAddStream(libwebrtc::scoped_refptr<libwebrtc::RTCMediaStream> stream) override {
-        (void)stream;
-    }
-    void OnRemoveStream(libwebrtc::scoped_refptr<libwebrtc::RTCMediaStream> stream) override {
-        (void)stream;
-    }
-    void OnDataChannel(libwebrtc::scoped_refptr<libwebrtc::RTCDataChannel> dc) override {
-        (void)dc;
-    }
-    void OnRenegotiationNeeded() override {}
-    void OnAddTrack(libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::RTCMediaStream>> streams,
-                    libwebrtc::scoped_refptr<libwebrtc::RTCRtpReceiver> receiver) override {
-        (void)streams;
-        (void)receiver;
-    }
-    void OnRemoveTrack(libwebrtc::scoped_refptr<libwebrtc::RTCRtpReceiver> receiver) override {
-        (void)receiver;
-    }
-    void OnIceConnectionState(libwebrtc::RTCIceConnectionState state) override {
-        if (state == libwebrtc::RTCIceConnectionStateFailed) {
-            QMetaObject::invokeMethod(m_client, [this]() {
-                Q_EMIT m_client->statusChanged("ICE 连接失败");
-            }, Qt::QueuedConnection);
-        }
-    }
+  void OnSuccess() override {
+    if (ok_)
+      ok_();
+  }
 
-private:
-    WebRTCReceiverClient *m_client;
+  void OnFailure(webrtc::RTCError error) override {
+    if (fail_)
+      fail_(std::move(error));
+  }
+
+ private:
+  std::function<void()> ok_;
+  std::function<void(webrtc::RTCError)> fail_;
+};
+
+class StatsCallback : public webrtc::RTCStatsCollectorCallback {
+ public:
+  explicit StatsCallback(std::function<void(const webrtc::scoped_refptr<const webrtc::RTCStatsReport> &)> fn)
+      : fn_(std::move(fn)) {}
+
+  void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport> &report) override {
+    if (fn_)
+      fn_(report);
+  }
+
+ private:
+  std::function<void(const webrtc::scoped_refptr<const webrtc::RTCStatsReport> &)> fn_;
+};
+
+}  // namespace
+
+class WebRTCReceiverClient::PeerConnectionObserverImpl : public webrtc::PeerConnectionObserver {
+ public:
+  explicit PeerConnectionObserverImpl(WebRTCReceiverClient *client) : m_client(client) {}
+
+  void OnSignalingChange(webrtc::PeerConnectionInterface::SignalingState new_state) override {
+    (void)new_state;
+  }
+
+  void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {
+    (void)data_channel;
+  }
+
+  void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState new_state) override {
+    const char *name = "?";
+    switch (new_state) {
+      case webrtc::PeerConnectionInterface::kIceGatheringNew:
+        name = "New";
+        break;
+      case webrtc::PeerConnectionInterface::kIceGatheringGathering:
+        name = "Gathering";
+        break;
+      case webrtc::PeerConnectionInterface::kIceGatheringComplete:
+        name = "Complete";
+        break;
+    }
+    qDebug() << "[ICE] IceGatheringState =" << name << "(" << static_cast<int>(new_state) << ")";
+  }
+
+  void OnIceCandidate(const webrtc::IceCandidateInterface *candidate) override {
+    if (!candidate) {
+      qWarning() << "[ICE] OnIceCandidate: candidate 为空";
+      return;
+    }
+    if (!m_client->m_signaling) {
+      qWarning() << "[ICE] OnIceCandidate: 信令未连接，无法发出候选";
+      return;
+    }
+    std::string sdp;
+    if (!candidate->ToString(&sdp)) {
+      qWarning() << "[ICE] OnIceCandidate: ToString 失败";
+      return;
+    }
+    std::string mid = candidate->sdp_mid();
+    int mline = candidate->sdp_mline_index();
+    qDebug() << "[ICE] 本地候选(将经信令发出) mid=" << QString::fromStdString(mid) << "mline=" << mline
+              << "sdp前48字=" << QString::fromStdString(sdp.substr(0, std::min(sdp.size(), size_t(48))));
+    QMetaObject::invokeMethod(
+        m_client,
+        [this, mid, mline, sdp]() {
+          if (m_client->m_signaling)
+            m_client->m_signaling->SendIceCandidate(mid, mline, sdp);
+        },
+        Qt::QueuedConnection);
+  }
+
+  void OnConnectionChange(webrtc::PeerConnectionInterface::PeerConnectionState new_state) override {
+    using PCS = webrtc::PeerConnectionInterface::PeerConnectionState;
+    if (new_state == PCS::kConnected) {
+      QMetaObject::invokeMethod(
+          m_client,
+          [this]() {
+            Q_EMIT m_client->statusChanged("WebRTC 已连接，正在接收视频");
+            m_client->startStatsTimer();
+          },
+          Qt::QueuedConnection);
+    } else if (new_state == PCS::kFailed || new_state == PCS::kDisconnected ||
+               new_state == PCS::kClosed) {
+      QMetaObject::invokeMethod(
+          m_client,
+          [this]() { m_client->stopStatsTimer(); },
+          Qt::QueuedConnection);
+    }
+  }
+
+  void OnIceConnectionChange(webrtc::PeerConnectionInterface::IceConnectionState new_state) override {
+    if (new_state == webrtc::PeerConnectionInterface::kIceConnectionFailed) {
+      QMetaObject::invokeMethod(
+          m_client,
+          [this]() { Q_EMIT m_client->statusChanged("ICE 连接失败"); },
+          Qt::QueuedConnection);
+    }
+  }
+
+  void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override {
+    if (!transceiver || transceiver->media_type() != webrtc::MediaType::VIDEO)
+      return;
+    auto receiver = transceiver->receiver();
+    if (!receiver)
+      return;
+    auto track = receiver->track();
+    if (!track || track->kind() != std::string(webrtc::MediaStreamTrackInterface::kVideoKind))
+      return;
+    auto *video = static_cast<webrtc::VideoTrackInterface *>(track.get());
+    webrtc::scoped_refptr<webrtc::VideoTrackInterface> v(video);
+    QMetaObject::invokeMethod(
+        m_client,
+        [this, v]() { Q_EMIT m_client->remoteVideoTrackReady(v); },
+        Qt::QueuedConnection);
+  }
+
+ private:
+  WebRTCReceiverClient *m_client;
 };
 
 // =============================================================================
-// WebRTCReceiverClient 实现
-// =============================================================================
-
 WebRTCReceiverClient::WebRTCReceiverClient(QObject *parent)
     : QObject(parent)
 {
-    m_observer = std::make_unique<PeerConnectionObserver>(this);
-    connect(this, &WebRTCReceiverClient::remoteVideoTrackReady, this, [this](libwebrtc::scoped_refptr<libwebrtc::RTCVideoTrack> track) {
-        if (m_videoRenderer) {
-            auto *r = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer);
-            if (r) r->setVideoTrack(track);
-        }
-    });
+  m_observer = std::make_unique<WebRTCReceiverClient::PeerConnectionObserverImpl>(this);
+  connect(this, &WebRTCReceiverClient::remoteVideoTrackReady, this,
+          [this](webrtc::scoped_refptr<webrtc::VideoTrackInterface> track) {
+            if (m_videoRenderer) {
+              auto *r = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer);
+              if (r)
+                r->setVideoTrack(track);
+            }
+          });
 #ifdef Q_OS_ANDROID
-    int sdkInt = QJniObject::getStaticField<jint>("android/os/Build$VERSION", "SDK_INT");
-    QJniObject releaseObj = QJniObject::getStaticObjectField("android/os/Build$VERSION", "RELEASE", "Ljava/lang/String;");
-    QString release = releaseObj.isValid() ? releaseObj.toString() : "unknown";
-    QJniObject abiObj = QJniObject::getStaticObjectField("android/os/Build", "CPU_ABI", "Ljava/lang/String;");
-    QString abi = abiObj.isValid() ? abiObj.toString() : "unknown";
-    VERIFY_LOG("4", QString("系统信息: Android %1, API %2, ABI %3").arg(release).arg(sdkInt).arg(abi));
-    runVerificationDiagnostic();
+  int sdkInt = QJniObject::getStaticField<jint>("android/os/Build$VERSION", "SDK_INT");
+  QJniObject releaseObj =
+      QJniObject::getStaticObjectField("android/os/Build$VERSION", "RELEASE", "Ljava/lang/String;");
+  QString release = releaseObj.isValid() ? releaseObj.toString() : "unknown";
+  QJniObject abiObj =
+      QJniObject::getStaticObjectField("android/os/Build", "CPU_ABI", "Ljava/lang/String;");
+  QString abi = abiObj.isValid() ? abiObj.toString() : "unknown";
+  VERIFY_LOG("4", QString("系统信息: Android %1, API %2, ABI %3").arg(release).arg(sdkInt).arg(abi));
+  runVerificationDiagnostic();
 #endif
 }
 
 WebRTCReceiverClient::~WebRTCReceiverClient()
 {
-    VERIFY_LOG("5", "析构开始，执行安全关闭顺序");
-    disconnect();
-    if (m_peerConnection) {
-        VERIFY_LOG("5", "关闭 PeerConnection 并取消观察者");
-        m_peerConnection->Close();
-        m_peerConnection->DeRegisterRTCPeerConnectionObserver();
-        m_peerConnection = nullptr;
-    }
-    m_constraints = nullptr;
-    VERIFY_LOG("5", "等待 WebRTC worker_thread 停止(约 800ms)...");
-    QThread::msleep(800);
-    VERIFY_LOG("5", "释放 PeerConnectionFactory...");
-    m_factory = nullptr;
-    QThread::msleep(500);
-#ifdef Q_OS_ANDROID
-    if (m_webrtcInitialized) {
-        VERIFY_LOG("5", "[Android] 跳过 LibWebRTC::Terminate() 以避免 adm_ 竞态崩溃");
-        m_webrtcInitialized = false;
-    }
-#else
-    if (m_webrtcInitialized) {
-        VERIFY_LOG("5", "调用 LibWebRTC::Terminate()");
-        libwebrtc::LibWebRTC::Terminate();
-        m_webrtcInitialized = false;
-    }
-#endif
-    VERIFY_LOG("5", "析构完成");
+  VERIFY_LOG("5", "析构开始，执行安全关闭顺序");
+  disconnect();
+  if (m_peerConnection) {
+    VERIFY_LOG("5", "关闭 PeerConnection");
+    m_peerConnection->Close();
+    m_peerConnection = nullptr;
+  }
+  VERIFY_LOG("5", "等待 WebRTC worker_thread 停止(约 800ms)...");
+  QThread::msleep(800);
+  VERIFY_LOG("5", "释放 PeerConnectionFactory...");
+  m_factory = nullptr;
+  QThread::msleep(200);
+  m_webrtcInitialized = false;
+  VERIFY_LOG("5", "析构完成");
 }
 
 void WebRTCReceiverClient::runVerificationDiagnostic()
 {
-    VERIFY_LOG("DIAG", "========== 逐项验证诊断开始 (排除方向5) ==========");
+  VERIFY_LOG("DIAG", "========== 逐项验证诊断开始 (排除方向5) ==========");
 #ifdef Q_OS_ANDROID
-    VERIFY_LOG("1", "--- 方向1: 权限 (连接前必须 RECORD_AUDIO=0) ---");
-    VERIFY_LOG("1", "WebRTC ADM 需要 RECORD_AUDIO，否则 CreateADM 可能失败或析构时 Check failed: adm_");
-    QJniObject activity = QJniObject::callStaticObjectMethod(
-        "org/qtproject/qt/android/QtNative", "activity", "()Landroid/app/Activity;");
-    if (!activity.isValid()) {
-        VERIFY_LOG("1", "Activity 无效，无法校验权限 [可能导致后续 ADM 失败]");
-    } else {
-        QJniObject permObj = QJniObject::getStaticObjectField("android/Manifest$permission",
-            "RECORD_AUDIO", "Ljava/lang/String;");
-        int result = activity.callMethod<jint>("checkSelfPermission", "(Ljava/lang/String;)I",
-            permObj.object<jstring>());
-        VERIFY_LOG("1", QString("RECORD_AUDIO=%1 (0=已授权, -1=未授权, 其他=异常)").arg(result));
-        if (result != 0) {
-            VERIFY_LOG("1", ">>> 验证失败: 无录音权限，请点击「连接接收」先请求权限 <<<");
-        } else {
-            VERIFY_LOG("1", ">>> 方向1 通过: 权限已授予 <<<");
-        }
-    }
+  VERIFY_LOG("1", "--- 方向1: 权限 --- 纯视频接收，不检查/不请求 RECORD_AUDIO");
 
-    VERIFY_LOG("2", "--- 方向2: 延迟初始化 (不在应用启动时 Initialize) ---");
-    VERIFY_LOG("2", QString("当前 m_webrtcInitialized=%1").arg(m_webrtcInitialized ? "true" : "false"));
-    VERIFY_LOG("2", "WebRTC 仅在【收到 Offer】时 initWebRTC，不在构造/启动时调用");
-    if (m_webrtcInitialized) {
-        VERIFY_LOG("2", ">>> 方向2 已通过: WebRTC/ADM 已初始化 <<<");
-    } else {
-        VERIFY_LOG("2", "尚未初始化，首次收到 Offer 时会调用 LibWebRTC::Initialize()");
-        VERIFY_LOG("2", "若 Initialize/CreateFactory 失败，logcat 会看到 VERIFY-2 失败或 audio_device_impl Failed to create...");
-    }
-
-    VERIFY_LOG("3", "--- 方向3: 初始化时机 (Activity 就绪后再连接) ---");
-    VERIFY_LOG("3", "主界面 Component.onCompleted 后延迟 1.5s 才允许点击「连接接收」，确保 Activity 完全就绪");
-    VERIFY_LOG("3", ">>> 方向3 已实现: 启动后按钮禁用 1.5s，状态显示「等待 Activity 就绪」<<<");
-
-    VERIFY_LOG("4", "--- 方向4: NDK/API 与系统兼容性 ---");
-    int sdkInt = QJniObject::getStaticField<jint>("android/os/Build$VERSION", "SDK_INT");
-    QJniObject releaseObj = QJniObject::getStaticObjectField("android/os/Build$VERSION", "RELEASE", "Ljava/lang/String;");
-    QString release = releaseObj.isValid() ? releaseObj.toString() : "unknown";
-    QJniObject abiObj = QJniObject::getStaticObjectField("android/os/Build", "CPU_ABI", "Ljava/lang/String;");
-    QString abi = abiObj.isValid() ? abiObj.toString() : "unknown";
-    VERIFY_LOG("4", QString("设备: Android %1, API %2, ABI %3").arg(release).arg(sdkInt).arg(abi));
-    VERIFY_LOG("4", "确认 libwebrtc 编译目标 ABI 与设备一致 (如 lib/arm64-v8a 对应 arm64)");
-    if (abi.contains("arm64") || abi.contains("aarch64")) {
-        VERIFY_LOG("4", ">>> 方向4 ABI 匹配 arm64，若 ADM 仍失败可查 libwebrtc 的 NDK/API 版本 <<<");
-    } else if (abi.contains("arm") || abi.contains("x86")) {
-        VERIFY_LOG("4", QString(">>> 方向4 ABI %1，确认 libwebrtc 编译目标一致 <<<").arg(abi));
-    } else {
-        VERIFY_LOG("4", QString(">>> 方向4 未知 ABI %1 <<<").arg(abi));
-    }
-
-    VERIFY_LOG("6", "--- 方向6: 设备/ROM 兼容 ---");
-    VERIFY_LOG("6", "若方向1~4 均通过仍出现 Failed to create platform specific ADM:");
-    VERIFY_LOG("6", ">>> 尝试换一台设备或官方模拟器，部分定制ROM对 OpenSL/AAudio 支持不完整 <<<");
-
-    VERIFY_LOG("AUDIO", "--- 系统是否支持 Audio Capture (麦克风采集) ---");
-    {
-        QJniObject act = QJniObject::callStaticObjectMethod(
-            "org/qtproject/qt/android/QtNative", "activity", "()Landroid/app/Activity;");
-        if (act.isValid()) {
-            QJniObject ctx = act.callObjectMethod("getApplicationContext", "()Landroid/content/Context;");
-            if (ctx.isValid()) {
-                QJniObject pm = ctx.callObjectMethod("getPackageManager", "()Landroid/content/pm/PackageManager;");
-                if (pm.isValid()) {
-                    bool hasMic = pm.callMethod<jboolean>("hasSystemFeature", "(Ljava/lang/String;)Z",
-                        QJniObject::getStaticObjectField("android/content/pm/PackageManager",
-                            "FEATURE_MICROPHONE", "Ljava/lang/String;").object<jstring>());
-                    VERIFY_LOG("AUDIO", QString("【Audio Capture】硬件麦克风(FEATURE_MICROPHONE): %1")
-                        .arg(hasMic ? "支持" : "不支持"));
-                }
-            }
-        }
-    }
-
-    VERIFY_LOG("AUDIO", "--- 扬声器(输出) vs WebRTC 采集格式 ---");
-    QJniObject actForAudio = QJniObject::callStaticObjectMethod(
-        "org/qtproject/qt/android/QtNative", "activity", "()Landroid/app/Activity;");
-    if (actForAudio.isValid()) {
-        QJniObject context = actForAudio.callObjectMethod("getApplicationContext", "()Landroid/content/Context;");
-        if (context.isValid()) {
-            QJniObject pm = context.callObjectMethod("getPackageManager", "()Landroid/content/pm/PackageManager;");
-            if (pm.isValid()) {
-                QJniObject micFeature = QJniObject::getStaticObjectField("android/content/pm/PackageManager",
-                    "FEATURE_MICROPHONE", "Ljava/lang/String;");
-                bool hasMic = pm.callMethod<jboolean>("hasSystemFeature", "(Ljava/lang/String;)Z",
-                    micFeature.isValid() ? micFeature.object<jstring>() : nullptr);
-                VERIFY_LOG("AUDIO", QString("【Audio Capture 支持】android.hardware.microphone=%1 (系统声明麦克风硬件)").arg(hasMic ? "是" : "否"));
-            }
-            QJniObject audioServiceStr = QJniObject::getStaticObjectField("android/content/Context",
-                "AUDIO_SERVICE", "Ljava/lang/String;");
-            QJniObject audioManager = context.callObjectMethod("getSystemService",
-                "(Ljava/lang/String;)Ljava/lang/Object;", audioServiceStr.object<jstring>());
-            if (audioManager.isValid()) {
-                QJniObject outRateProp = QJniObject::getStaticObjectField("android/media/AudioManager",
-                    "PROPERTY_OUTPUT_SAMPLE_RATE", "Ljava/lang/String;");
-                QJniObject outRateVal = audioManager.callObjectMethod("getProperty",
-                    "(Ljava/lang/String;)Ljava/lang/String;", outRateProp.object<jstring>());
-                QString speakerRate = outRateVal.isValid() ? outRateVal.toString() : "null";
-                VERIFY_LOG("AUDIO", QString("【Android 扬声器】采样率: %1 Hz (OUTPUT_SAMPLE_RATE)").arg(speakerRate));
-
-                QJniObject outBufProp = QJniObject::getStaticObjectField("android/media/AudioManager",
-                    "PROPERTY_OUTPUT_FRAMES_PER_BUFFER", "Ljava/lang/String;");
-                QJniObject outBufVal = audioManager.callObjectMethod("getProperty",
-                    "(Ljava/lang/String;)Ljava/lang/String;", outBufProp.object<jstring>());
-                QString speakerBuf = outBufVal.isValid() ? outBufVal.toString() : "null";
-                VERIFY_LOG("AUDIO", QString("【Android 扬声器】帧缓冲: %1 frames").arg(speakerBuf));
-
-                jclass audioRecordClass = QJniEnvironment().findClass("android/media/AudioRecord");
-                if (audioRecordClass) {
-                    int enc = 2;
-                    int chIn = 16;
-                    int buf48 = QJniObject::callStaticMethod<jint>("android/media/AudioRecord", "getMinBufferSize",
-                        "(III)I", 48000, chIn, enc);
-                    int buf16 = QJniObject::callStaticMethod<jint>("android/media/AudioRecord", "getMinBufferSize",
-                        "(III)I", 16000, chIn, enc);
-                    VERIFY_LOG("AUDIO", QString("【Android 采集】48kHz mono 16bit 支持: minBuf=%1 (>0=支持)").arg(buf48));
-                    VERIFY_LOG("AUDIO", QString("【Android 采集】16kHz mono 16bit 支持: minBuf=%1 (>0=支持)").arg(buf16));
-                }
-            } else {
-                VERIFY_LOG("AUDIO", "无法获取 AudioManager");
-            }
-        } else {
-            VERIFY_LOG("AUDIO", "无法获取 Context");
-        }
-    } else {
-        VERIFY_LOG("AUDIO", "Activity 无效，无法查询音频格式");
-    }
-    VERIFY_LOG("AUDIO", "【WebRTC 采集】常见格式: 48kHz 或 16kHz, 16-bit PCM, 1ch(mono)");
-    VERIFY_LOG("AUDIO", "【WebRTC 播放】常见格式: 48kHz, 16-bit PCM, 2ch(stereo)");
-    VERIFY_LOG("AUDIO", ">>> 若 Android 扬声器 != 48kHz/44.1kHz 或采集 minBuf<=0，可能与 WebRTC 默认格式冲突 <<<");
+  VERIFY_LOG("2", "--- 方向2: 延迟初始化 (不在应用启动时 Initialize) ---");
+  VERIFY_LOG("2", QString("当前 m_webrtcInitialized=%1").arg(m_webrtcInitialized ? "true" : "false"));
+  VERIFY_LOG("2", "WebRTC 仅在【收到 Offer】时 initWebRTC，不在构造/启动时调用");
+  VERIFY_LOG("4", "--- 方向4: NDK/API 与系统兼容性 ---");
+  int sdkInt = QJniObject::getStaticField<jint>("android/os/Build$VERSION", "SDK_INT");
+  QJniObject releaseObj =
+      QJniObject::getStaticObjectField("android/os/Build$VERSION", "RELEASE", "Ljava/lang/String;");
+  QString release = releaseObj.isValid() ? releaseObj.toString() : "unknown";
+  QJniObject abiObj =
+      QJniObject::getStaticObjectField("android/os/Build", "CPU_ABI", "Ljava/lang/String;");
+  QString abi = abiObj.isValid() ? abiObj.toString() : "unknown";
+  VERIFY_LOG("4", QString("设备: Android %1, API %2, ABI %3").arg(release).arg(sdkInt).arg(abi));
+  VERIFY_LOG("4", "确认预编译 WebRTC 与设备 ABI 一致 (如 lib/arm64-v8a 对应 arm64)");
 #else
-    VERIFY_LOG("1", "--- 方向1: 权限 --- 非 Android，跳过");
-    VERIFY_LOG("2", "--- 方向2: 延迟初始化 --- m_webrtcInitialized=" + QString(m_webrtcInitialized ? "true" : "false"));
-    VERIFY_LOG("3", "--- 方向3: 禁用音频 --- 同上，需编译 null ADM");
-    VERIFY_LOG("4", "--- 方向4: NDK/API --- 非 Android，跳过");
-    VERIFY_LOG("6", "--- 方向6: 设备兼容 --- 非 Android，跳过");
+  VERIFY_LOG("1", "--- 方向1: 权限 --- 非 Android，跳过");
+  VERIFY_LOG("4", "--- 方向4: NDK/API --- 非 Android，跳过");
 #endif
-    VERIFY_LOG("DIAG", "========== 逐项验证诊断结束 (logcat 过滤 VERIFY 可只看验证日志) ==========");
+  VERIFY_LOG("DIAG", "========== 逐项验证诊断结束 ==========");
 }
 
 void WebRTCReceiverClient::requestPermissionAndConnect(const QString &addr)
 {
-#ifdef Q_OS_ANDROID
-    VERIFY_LOG("1", "检查 RECORD_AUDIO 权限...");
-    QJniObject activity = QJniObject::callStaticObjectMethod(
-        "org/qtproject/qt/android/QtNative", "activity", "()Landroid/app/Activity;");
-    if (!activity.isValid()) {
-        VERIFY_LOG("1", "Activity 无效，跳过权限检查直接连接(可能导致后续 ADM 失败)");
-        connectToSignaling(addr);
-        return;
-    }
-    QJniObject permObj = QJniObject::getStaticObjectField("android/Manifest$permission",
-        "RECORD_AUDIO", "Ljava/lang/String;");
-    const int granted = 0;
-    int result = activity.callMethod<jint>("checkSelfPermission", "(Ljava/lang/String;)I",
-        permObj.object<jstring>());
-    VERIFY_LOG("1", QString("RECORD_AUDIO 权限: result=%1 (0=已授权)").arg(result));
-    if (result == granted) {
-        VERIFY_LOG("1", "权限已授权，继续连接");
-        connectToSignaling(addr);
-        return;
-    }
-    QJniEnvironment env;
-    jclass stringClass = env.findClass("java/lang/String");
-    jobjectArray permissions = env->NewObjectArray(1, stringClass, nullptr);
-    env->SetObjectArrayElement(permissions, 0, permObj.object<jstring>());
-    VERIFY_LOG("1", "请求 RECORD_AUDIO 权限，等待用户授权...");
-    activity.callMethod<void>("requestPermissions", "([Ljava/lang/String;I)V", permissions, 10001);
-    env->DeleteLocalRef(permissions);
-    auto *checkTimer = new QTimer(this);
-    QObject::connect(checkTimer, &QTimer::timeout, this, [this, checkTimer, addr, permObj, activity]() {
-        int r = activity.callMethod<jint>("checkSelfPermission", "(Ljava/lang/String;)I",
-            permObj.object<jstring>());
-        if (r == 0) {
-            VERIFY_LOG("1", "用户已授权 RECORD_AUDIO，继续连接");
-            checkTimer->stop();
-            checkTimer->deleteLater();
-            connectToSignaling(addr);
-        }
-    });
-    checkTimer->start(500);
-    QTimer::singleShot(30000, this, [checkTimer]() {
-        if (checkTimer->isActive()) {
-            checkTimer->stop();
-            checkTimer->deleteLater();
-        }
-    });
-#else
-    connectToSignaling(addr);
-#endif
+  connectToSignaling(addr);
 }
-
-// =============================================================================
-// 信令层：使用 TCP + JSON-per-line 协议（对应 signaling_client.cpp）
-// =============================================================================
 
 void WebRTCReceiverClient::connectToSignaling(const QString &addr)
 {
-    if (m_signaling) {
-        m_signaling->Stop();
-        m_signaling.reset();
-    }
+  if (m_signaling) {
+    m_signaling->Stop();
+    m_signaling.reset();
+  }
 
-    std::string serverAddr = addr.isEmpty()
-        ? DEFAULT_SIGNALING_ADDR
-        : addr.toStdString();
+  std::string serverAddr = addr.isEmpty() ? DEFAULT_SIGNALING_ADDR : addr.toStdString();
 
-    m_signaling = std::make_unique<webrtc_demo::SignalingClient>(serverAddr, "subscriber");
+  m_signaling = std::make_unique<webrtc_demo::SignalingClient>(serverAddr, "subscriber");
 
-    m_signaling->SetOnOffer([this](const std::string &type, const std::string &sdp) {
-        QMetaObject::invokeMethod(this, [this, type, sdp]() {
-            handleOffer(type, sdp);
-        }, Qt::QueuedConnection);
-    });
+  m_signaling->SetOnOffer([this](const std::string &type, const std::string &sdp) {
+    QMetaObject::invokeMethod(this, [this, type, sdp]() { handleOffer(type, sdp); }, Qt::QueuedConnection);
+  });
 
-    m_signaling->SetOnIce([this](const std::string &mid, int mline_index, const std::string &candidate) {
-        QMetaObject::invokeMethod(this, [this, mid, mline_index, candidate]() {
-            handleRemoteIceCandidate(mid, mline_index, candidate);
-        }, Qt::QueuedConnection);
-    });
+  m_signaling->SetOnIce([this](const std::string &mid, int mline_index, const std::string &candidate) {
+    QMetaObject::invokeMethod(
+        this,
+        [this, mid, mline_index, candidate]() { handleRemoteIceCandidate(mid, mline_index, candidate); },
+        Qt::QueuedConnection);
+  });
 
-    m_signaling->SetOnError([this](const std::string &err) {
-        QString msg = QString::fromStdString(err);
-        QMetaObject::invokeMethod(this, [this, msg]() {
-            Q_EMIT statusChanged(QString("信令错误: %1").arg(msg));
-        }, Qt::QueuedConnection);
-    });
+  m_signaling->SetOnError([this](const std::string &err) {
+    QString msg = QString::fromStdString(err);
+    QMetaObject::invokeMethod(
+        this,
+        [this, msg]() { Q_EMIT statusChanged(QString("信令错误: %1").arg(msg)); },
+        Qt::QueuedConnection);
+  });
 
-    Q_EMIT statusChanged("正在连接信令服务器...");
+  Q_EMIT statusChanged("正在连接信令服务器...");
 
-    if (!m_signaling->Start()) {
-        Q_EMIT statusChanged("连接信令服务器失败");
-        m_signaling.reset();
-        return;
-    }
+  if (!m_signaling->Start()) {
+    Q_EMIT statusChanged("连接信令服务器失败");
+    m_signaling.reset();
+    return;
+  }
 
-    Q_EMIT statusChanged("已连接信令服务器 (role=receiver)，等待 Offer...");
+  Q_EMIT statusChanged("已连接信令服务器 (role=receiver)，等待 Offer...");
 }
 
 void WebRTCReceiverClient::disconnect()
 {
-    stopStatsTimer();
-    if (m_videoRenderer) {
-        auto *r = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer);
-        if (r) r->clearVideoTrack();
-    }
-    if (m_signaling) {
-        m_signaling->Stop();
-        m_signaling.reset();
-    }
+  stopStatsTimer();
+  m_pendingRemoteIce.clear();
+  m_remoteDescriptionApplied = false;
+  m_pendingSetRemoteObserver = nullptr;
+  m_pendingCreateAnswerObserver = nullptr;
+  m_pendingSetLocalObserver = nullptr;
+  if (m_videoRenderer) {
+    auto *r = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer);
+    if (r)
+      r->clearVideoTrack();
+  }
+  if (m_signaling) {
+    m_signaling->Stop();
+    m_signaling.reset();
+  }
+  if (m_peerConnection) {
+    m_peerConnection->Close();
+    m_peerConnection = nullptr;
+  }
 }
 
 void WebRTCReceiverClient::setVideoRenderer(QObject *renderer)
 {
-    if (m_videoRenderer == renderer)
-        return;
-    if (m_videoRenderer) {
-        auto *r = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer);
-        if (r) r->clearVideoTrack();
-    }
-    m_videoRenderer = renderer;
+  if (m_videoRenderer == renderer)
+    return;
+  if (m_videoRenderer) {
+    auto *r = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer);
+    if (r)
+      r->clearVideoTrack();
+  }
+  m_videoRenderer = renderer;
 }
-
-// =============================================================================
-// WebRTC 层
-// =============================================================================
 
 void WebRTCReceiverClient::initWebRTC()
 {
-    qDebug() << "[Thread] initWebRTC running on thread:" << QThread::currentThreadId();
-
-    if (m_webrtcInitialized) {
-        VERIFY_LOG("2", "WebRTC 已初始化，跳过");
-        return;
-    }
-#ifdef Q_OS_ANDROID
-    VERIFY_LOG("2", "方向2- init 前检查 RECORD_AUDIO (方向1 关联)...");
-    QJniObject activity = QJniObject::callStaticObjectMethod(
-        "org/qtproject/qt/android/QtNative", "activity", "()Landroid/app/Activity;");
-    if (activity.isValid()) {
-        QJniObject permObj = QJniObject::getStaticObjectField("android/Manifest$permission",
-            "RECORD_AUDIO", "Ljava/lang/String;");
-        int perm = activity.callMethod<jint>("checkSelfPermission", "(Ljava/lang/String;)I",
-            permObj.object<jstring>());
-        VERIFY_LOG("2", QString("RECORD_AUDIO=%1 (0=有权限，否则 ADM 可能失败)").arg(perm));
-        if (perm != 0) {
-            VERIFY_LOG("2", ">>> 方向1/2: 无权限时 Initialize 可能成功但 ADM 异常，析构时 Check failed: adm_ <<<");
-        }
-    }
-#endif
-    VERIFY_LOG("2", "调用 LibWebRTC::Initialize()...");
-    if (!libwebrtc::LibWebRTC::Initialize()) {
-        VERIFY_LOG("2", ">>> LibWebRTC::Initialize 失败 (方向2) 可能原因: 权限/ADM/系统不兼容 <<<");
-        Q_EMIT statusChanged("WebRTC 初始化失败");
-        return;
-    }
-    VERIFY_LOG("2", "LibWebRTC::Initialize 成功，创建 PeerConnectionFactory(含 VoiceEngine/ADM)...");
-    m_factory = libwebrtc::LibWebRTC::CreateRTCPeerConnectionFactory();
-    if (!m_factory) {
-        VERIFY_LOG("2", ">>> CreateRTCPeerConnectionFactory 失败 (方向2) <<<");
-        libwebrtc::LibWebRTC::Terminate();
-        Q_EMIT statusChanged("创建 PeerConnectionFactory 失败");
-        return;
-    }
-    VERIFY_LOG("2", "PeerConnectionFactory 创建成功，调用 factory->Initialize()");
-    m_factory->Initialize();
-    m_constraints = libwebrtc::RTCMediaConstraints::Create();
-    m_webrtcInitialized = true;
-    VERIFY_LOG("2", ">>> 方向2 通过: WebRTC/ADM 已初始化 <<<");
+  if (m_webrtcInitialized) {
+    VERIFY_LOG("2", "WebRTC 已初始化，跳过");
+    return;
+  }
+  VERIFY_LOG("2", "创建 PeerConnectionFactory (官方 API)...");
+  m_factory = webrtc_demo::CreatePeerConnectionFactory();
+  if (!m_factory) {
+    Q_EMIT statusChanged("创建 PeerConnectionFactory 失败");
+    return;
+  }
+  m_webrtcInitialized = true;
+  VERIFY_LOG("2", "PeerConnectionFactory 就绪");
 }
 
 void WebRTCReceiverClient::createPeerConnection()
 {
-    if (m_peerConnection) {
-        m_peerConnection->Close();
-        m_peerConnection->DeRegisterRTCPeerConnectionObserver();
-    }
+  if (m_peerConnection) {
+    m_peerConnection->Close();
+    m_peerConnection = nullptr;
+  }
 
-    libwebrtc::RTCConfiguration config;
-    config.ice_servers[0].uri = libwebrtc::string("stun:stun.l.google.com:19302");
+  webrtc::PeerConnectionInterface::RTCConfiguration config;
+  config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  webrtc::PeerConnectionInterface::IceServer ice_server;
+  ice_server.urls.push_back("stun:stun.l.google.com:19302");
+  config.servers.push_back(ice_server);
 
-    m_peerConnection = m_factory->Create(config, m_constraints);
-    m_peerConnection->RegisterRTCPeerConnectionObserver(m_observer.get());
+  webrtc::PeerConnectionDependencies deps(m_observer.get());
+  auto result = m_factory->CreatePeerConnectionOrError(config, std::move(deps));
+  if (!result.ok()) {
+    Q_EMIT statusChanged(QString("CreatePeerConnection 失败: %1")
+                             .arg(result.error().message()));
+    return;
+  }
+  m_peerConnection = result.MoveValue();
 }
 
 void WebRTCReceiverClient::handleOffer(const std::string &type, const std::string &sdp)
 {
-    Q_EMIT statusChanged("收到 Offer，正在创建 Answer...");
+  Q_EMIT statusChanged("收到 Offer，正在创建 Answer...");
 
-    initWebRTC();
-    createPeerConnection();
+  m_pendingRemoteIce.clear();
+  m_remoteDescriptionApplied = false;
+  m_pendingSetRemoteObserver = nullptr;
+  m_pendingCreateAnswerObserver = nullptr;
+  m_pendingSetLocalObserver = nullptr;
 
-    m_peerConnection->SetRemoteDescription(
-        libwebrtc::string(sdp.c_str()), libwebrtc::string(type.c_str()),
-        [this]() {
-            qDebug() << "[P2pPlayer] SetRemoteDescription OK, CreateAnswer";
-            m_peerConnection->CreateAnswer(
-                [this](const libwebrtc::string &sdp, const libwebrtc::string &type) {
-                    m_peerConnection->SetLocalDescription(
-                        sdp, type,
-                        [this, sdp]() {
-                            m_signaling->SendAnswer(sdp.std_string());
-                            Q_EMIT statusChanged("Answer 已发送，ICE 候选交换中...");
-                        },
-                        [this](const char *err) {
-                            Q_EMIT statusChanged(QString("SetLocalDescription 失败: %1").arg(err));
-                        });
-                },
-                [this](const char *err) {
-                    Q_EMIT statusChanged(QString("CreateAnswer 失败: %1").arg(err));
-                },
-                libwebrtc::RTCMediaConstraints::Create());
-        },
-        [this](const char *err) {
-            Q_EMIT statusChanged(QString("SetRemoteDescription 失败: %1").arg(err));
-        });
+  initWebRTC();
+  createPeerConnection();
+  if (!m_peerConnection) {
+    return;
+  }
+
+  webrtc::SdpParseError err;
+  webrtc::SdpType sdp_type = SdpTypeFromOfferAnswerString(type);
+  auto remote = webrtc::CreateSessionDescription(sdp_type, sdp, &err);
+  if (!remote) {
+    Q_EMIT statusChanged(QString("解析远端 SDP 失败: %1").arg(QString::fromStdString(err.description)));
+    return;
+  }
+
+  m_pendingSetRemoteObserver = webrtc::make_ref_counted<SetRemoteDescObserver>(
+      [this](webrtc::RTCError error) {
+        m_pendingSetRemoteObserver = nullptr;
+        qDebug() << "[P2pPlayer] SetRemoteDescription 回调进入 ok=" << error.ok();
+        if (!error.ok()) {
+          m_remoteDescriptionApplied = false;
+          m_pendingRemoteIce.clear();
+          Q_EMIT statusChanged(
+              QString("SetRemoteDescription 失败: %1").arg(QString::fromStdString(error.message())));
+          return;
+        }
+        m_remoteDescriptionApplied = true;
+        flushPendingRemoteIceCandidates();
+        // 若在 WebRTC 完成回调所在线程里直接 CreateAnswer，会卡在 CreateAnswer() 内（observer 永不回调）。
+        // PostTask 到 network 线程仍会阻塞同一套操作链；改投递到 Qt 线程（与 handleOffer 同源），由 PC 代理再转内部线程。
+        qDebug() << "[P2pPlayer] SetRemote 成功, QueuedConnection -> Qt 线程执行 CreateAnswer";
+        QPointer<WebRTCReceiverClient> self(this);
+        QMetaObject::invokeMethod(
+            this,
+            [self]() {
+              if (!self)
+                return;
+              self->doCreateAnswerAfterSetRemote();
+            },
+            Qt::QueuedConnection);
+      });
+
+  qDebug() << "[P2pPlayer] 即将 SetRemoteDescription(异步), 已挂 m_pendingSetRemoteObserver";
+  m_peerConnection->SetRemoteDescription(std::move(remote), m_pendingSetRemoteObserver);
+  qDebug() << "[P2pPlayer] SetRemoteDescription 调用已返回(结果在回调, 勿与成功混淆)";
+
+}
+
+void WebRTCReceiverClient::doCreateAnswerAfterSetRemote()
+{
+  qDebug() << "[P2pPlayer] doCreateAnswerAfterSetRemote 进入 pc=" << (m_peerConnection ? "有" : "无");
+  if (!m_peerConnection)
+    return;
+
+  m_pendingCreateAnswerObserver = webrtc::make_ref_counted<CreateAnswerObserver>(
+      [this](webrtc::RTCError e, std::unique_ptr<webrtc::SessionDescriptionInterface> desc) {
+        m_pendingCreateAnswerObserver = nullptr;
+        qDebug() << "[P2pPlayer] CreateAnswer 回调进入 ok=" << e.ok() << " desc=" << (desc ? "非空" : "空");
+        if (!e.ok()) {
+          Q_EMIT statusChanged(
+              QString("CreateAnswer 失败: %1").arg(QString::fromStdString(e.message())));
+          return;
+        }
+        if (!desc) {
+          qDebug() << "[P2pPlayer] CreateAnswer 成功但 desc 为空, 中止";
+          Q_EMIT statusChanged("CreateAnswer 成功但未返回 SDP 对象");
+          return;
+        }
+        std::string answer_sdp;
+        if (!desc->ToString(&answer_sdp) || answer_sdp.empty()) {
+          qDebug() << "[P2pPlayer] CreateAnswer ToString 失败或 sdp 空";
+          Q_EMIT statusChanged("CreateAnswer SDP ToString 失败或为空");
+          return;
+        }
+        qDebug() << "[P2pPlayer] CreateAnswer OK, sdp 字节=" << static_cast<int>(answer_sdp.size());
+
+        m_pendingSetLocalObserver = webrtc::make_ref_counted<SetLocalDescObserver>(
+            [this, answer_sdp]() {
+              m_pendingSetLocalObserver = nullptr;
+              qDebug() << "[P2pPlayer] SetLocalDescription OnSuccess 进入, sdp 字节="
+                       << static_cast<int>(answer_sdp.size())
+                       << " signaling=" << (m_signaling ? "非空" : "空");
+              if (!m_signaling) {
+                Q_EMIT statusChanged("SetLocal OK 但信令已断开，Answer 未发出");
+                qWarning() << "[P2pPlayer] SendAnswer 跳过: m_signaling 为空";
+                return;
+              }
+              m_signaling->SendAnswer(answer_sdp);
+              qDebug() << "[P2pPlayer] SendAnswer 已调用 (字节" << answer_sdp.size() << ")";
+              Q_EMIT statusChanged("Answer 已发送，ICE 候选交换中...");
+            },
+            [this](webrtc::RTCError er) {
+              m_pendingSetLocalObserver = nullptr;
+              qWarning() << "[P2pPlayer] SetLocalDescription OnFailure:"
+                         << QString::fromStdString(er.message());
+              Q_EMIT statusChanged(QString("SetLocalDescription 失败: %1")
+                                       .arg(QString::fromStdString(er.message())));
+            });
+        qDebug() << "[P2pPlayer] 即将 SetLocalDescription(异步), observer 已挂成员";
+        m_peerConnection->SetLocalDescription(m_pendingSetLocalObserver.get(), desc.release());
+        qDebug() << "[P2pPlayer] SetLocalDescription 调用已返回(结果在回调)";
+      },
+      [this](webrtc::RTCError e) {
+        m_pendingCreateAnswerObserver = nullptr;
+        qWarning() << "[P2pPlayer] CreateAnswer OnFailure:"
+                   << QString::fromStdString(e.message());
+        Q_EMIT statusChanged(
+            QString("CreateAnswer 失败: %1").arg(QString::fromStdString(e.message())));
+      });
+  qDebug() << "[P2pPlayer] 即将调用 CreateAnswer(异步)";
+  m_peerConnection->CreateAnswer(m_pendingCreateAnswerObserver.get(),
+                                   webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
+  qDebug() << "[P2pPlayer] CreateAnswer 调用已返回(结果在回调)";
+}
+
+void WebRTCReceiverClient::addRemoteIceCandidateNow(const std::string &mid, int mline_index,
+                                                      const std::string &candidate)
+{
+  if (!m_peerConnection)
+    return;
+  webrtc::SdpParseError err;
+  webrtc::IceCandidateInterface *cand =
+      webrtc::CreateIceCandidate(mid, mline_index, candidate, &err);
+  if (!cand) {
+    qWarning() << "CreateIceCandidate failed:" << QString::fromStdString(err.description)
+               << "mid=" << QString::fromStdString(mid) << "mline=" << mline_index;
+    return;
+  }
+  bool ok = m_peerConnection->AddIceCandidate(cand);
+  delete cand;
+  if (!ok)
+    qWarning() << "AddIceCandidate returned false mid=" << QString::fromStdString(mid)
+               << "mline=" << mline_index;
+}
+
+void WebRTCReceiverClient::flushPendingRemoteIceCandidates()
+{
+  if (m_pendingRemoteIce.empty())
+    return;
+  qDebug() << "[ICE] 应用暂存的远端候选，数量:" << static_cast<int>(m_pendingRemoteIce.size());
+  for (const auto &p : m_pendingRemoteIce)
+    addRemoteIceCandidateNow(p.mid, p.mline_index, p.candidate);
+  m_pendingRemoteIce.clear();
 }
 
 void WebRTCReceiverClient::handleRemoteIceCandidate(const std::string &mid, int mline_index,
-                                                     const std::string &candidate)
+                                                    const std::string &candidate)
 {
-    if (!m_peerConnection) return;
-    m_peerConnection->AddCandidate(libwebrtc::string(mid.c_str()), mline_index,
-                                   libwebrtc::string(candidate.c_str()));
+  if (!m_peerConnection) {
+    m_pendingRemoteIce.push_back(PendingRemoteIce{mid, mline_index, candidate});
+    qDebug() << "[ICE] 远端候选先入队(尚无 PeerConnection)，当前队列"
+             << static_cast<int>(m_pendingRemoteIce.size());
+    return;
+  }
+  if (!m_remoteDescriptionApplied) {
+    m_pendingRemoteIce.push_back(PendingRemoteIce{mid, mline_index, candidate});
+    qDebug() << "[ICE] 远端候选先入队(等待 SetRemoteDescription 完成)，当前队列"
+             << static_cast<int>(m_pendingRemoteIce.size());
+    return;
+  }
+  addRemoteIceCandidateNow(mid, mline_index, candidate);
 }
-
-// =============================================================================
-// GetStats 定时采集：每 3 秒打印一次解码/网络关键指标
-// =============================================================================
 
 void WebRTCReceiverClient::startStatsTimer()
 {
-    if (m_statsTimer)
-        return;
-    m_prevFramesDecoded = 0;
-    m_prevTotalDecodeTime = 0.0;
-    m_prevFramesReceived = 0;
-    m_prevFramesDropped = 0;
-    m_prevJitterBufferDelay = 0.0;
-    m_prevJitterBufferEmitted = 0;
+  if (m_statsTimer)
+    return;
+  m_prevFramesDecoded = 0;
+  m_prevTotalDecodeTime = 0.0;
+  m_prevFramesReceived = 0;
+  m_prevFramesDropped = 0;
+  m_prevJitterBufferDelay = 0.0;
+  m_prevJitterBufferEmitted = 0;
 
-    m_statsTimer = new QTimer(this);
-    m_statsTimer->setInterval(3000);
-    connect(m_statsTimer, &QTimer::timeout, this, [this]() {
-        if (!m_peerConnection)
-            return;
-        m_peerConnection->GetStats(
-            [this](const libwebrtc::vector<libwebrtc::scoped_refptr<libwebrtc::MediaRTCStats>> reports) {
+  m_statsTimer = new QTimer(this);
+  m_statsTimer->setInterval(3000);
+  connect(m_statsTimer, &QTimer::timeout, this, [this]() {
+    if (!m_peerConnection)
+      return;
+    auto cb = webrtc::make_ref_counted<StatsCallback>(
+        [this](const webrtc::scoped_refptr<const webrtc::RTCStatsReport> &report) {
+          double currentRtt = 0.0;
+          double totalRtt = 0.0;
+          int64_t responsesReceived = 0;
+          bool foundNominated = false;
+          for (const auto *pair : report->GetStatsOfType<webrtc::RTCIceCandidatePairStats>()) {
+            if (pair->nominated && *pair->nominated) {
+              if (pair->current_round_trip_time)
+                currentRtt = *pair->current_round_trip_time;
+              if (pair->total_round_trip_time)
+                totalRtt = *pair->total_round_trip_time;
+              if (pair->responses_received)
+                responsesReceived = static_cast<int64_t>(*pair->responses_received);
+              foundNominated = true;
+              break;
+            }
+          }
+          (void)foundNominated;
 
-                // 类型安全读取：libwebrtc 不同版本对同一字段可能用不同存储类型
-                auto safeInt64 = [](const libwebrtc::scoped_refptr<libwebrtc::RTCStatsMember> &m) -> int64_t {
-                    switch (m->GetType()) {
-                    case libwebrtc::RTCStatsMember::kInt32:  return m->ValueInt32();
-                    case libwebrtc::RTCStatsMember::kUint32: return m->ValueUint32();
-                    case libwebrtc::RTCStatsMember::kInt64:  return m->ValueInt64();
-                    case libwebrtc::RTCStatsMember::kUint64: return static_cast<int64_t>(m->ValueUint64());
-                    case libwebrtc::RTCStatsMember::kDouble: return static_cast<int64_t>(m->ValueDouble());
-                    default: return 0;
-                    }
-                };
-                auto safeDouble = [](const libwebrtc::scoped_refptr<libwebrtc::RTCStatsMember> &m) -> double {
-                    switch (m->GetType()) {
-                    case libwebrtc::RTCStatsMember::kDouble: return m->ValueDouble();
-                    case libwebrtc::RTCStatsMember::kInt32:  return m->ValueInt32();
-                    case libwebrtc::RTCStatsMember::kUint32: return m->ValueUint32();
-                    case libwebrtc::RTCStatsMember::kInt64:  return static_cast<double>(m->ValueInt64());
-                    case libwebrtc::RTCStatsMember::kUint64: return static_cast<double>(m->ValueUint64());
-                    default: return 0.0;
-                    }
-                };
+          for (const auto *inb : report->GetStatsOfType<webrtc::RTCInboundRtpStreamStats>()) {
+            if (!inb->kind || *inb->kind != "video")
+              continue;
 
-                // ---- candidate-pair: 网络 RTT ----
-                double currentRtt = 0.0;
-                double totalRtt = 0.0;
-                int64_t responsesReceived = 0;
-                bool foundNominated = false;
+            uint32_t framesDecoded = inb->frames_decoded.value_or(0);
+            double totalDecodeTime = inb->total_decode_time.value_or(0.0);
+            double fps = inb->frames_per_second.value_or(0.0);
+            uint32_t framesReceived = inb->frames_received.value_or(0);
+            uint32_t framesDropped = inb->frames_dropped.value_or(0);
+            double jitterBufferDelay = inb->jitter_buffer_delay.value_or(0.0);
+            uint64_t jitterBufferEmitted = inb->jitter_buffer_emitted_count.value_or(0);
+            int frameWidth = static_cast<int>(inb->frame_width.value_or(0));
+            int frameHeight = static_cast<int>(inb->frame_height.value_or(0));
+            uint64_t bytesReceived = inb->bytes_received.value_or(0);
+            std::string decoderImpl = inb->decoder_implementation.value_or("");
+            double jitter = inb->jitter.value_or(0.0);
+            int64_t packetsLost = inb->packets_lost.value_or(0);
+            int64_t packetsReceived = static_cast<int64_t>(inb->packets_received.value_or(0));
+            int64_t nackCount = inb->nack_count.value_or(0);
+            int64_t pliCount = inb->pli_count.value_or(0);
+            int64_t firCount = inb->fir_count.value_or(0);
 
-                for (const auto &stat : reports.std_vector()) {
-                    if (stat->type().std_string() != "candidate-pair")
-                        continue;
-                    bool nominated = false;
-                    double curRtt = 0.0, totRtt = 0.0;
-                    int64_t respRecv = 0;
-                    for (const auto &m : stat->Members().std_vector()) {
-                        if (!m->IsDefined()) continue;
-                        std::string name = m->GetName().std_string();
-                        if (name == "nominated") nominated = m->ValueBool();
-                        else if (name == "currentRoundTripTime") curRtt = safeDouble(m);
-                        else if (name == "totalRoundTripTime") totRtt = safeDouble(m);
-                        else if (name == "responsesReceived") respRecv = safeInt64(m);
-                    }
-                    if (nominated) {
-                        currentRtt = curRtt;
-                        totalRtt = totRtt;
-                        responsesReceived = respRecv;
-                        foundNominated = true;
-                        break;
-                    }
-                }
+            uint32_t deltaFrames = framesDecoded - m_prevFramesDecoded;
+            double deltaTime = totalDecodeTime - m_prevTotalDecodeTime;
+            double avgDecodeMs = (deltaFrames > 0) ? (deltaTime / deltaFrames * 1000.0) : 0.0;
+            uint32_t deltaDropped = framesDropped - m_prevFramesDropped;
 
-                // ---- inbound-rtp (video): 解码 + 网络质量 ----
-                for (const auto &stat : reports.std_vector()) {
-                    if (stat->type().std_string() != "inbound-rtp")
-                        continue;
+            uint64_t deltaJbEmitted = jitterBufferEmitted - m_prevJitterBufferEmitted;
+            double deltaJbDelay = jitterBufferDelay - m_prevJitterBufferDelay;
+            double avgJitterMs =
+                (deltaJbEmitted > 0) ? (deltaJbDelay / deltaJbEmitted * 1000.0) : 0.0;
 
-                    bool isVideo = false;
-                    uint32_t framesDecoded = 0;
-                    double totalDecodeTime = 0.0;
-                    double fps = 0.0;
-                    uint32_t framesReceived = 0;
-                    uint32_t framesDropped = 0;
-                    double jitterBufferDelay = 0.0;
-                    uint64_t jitterBufferEmitted = 0;
-                    int frameWidth = 0, frameHeight = 0;
-                    uint64_t bytesReceived = 0;
-                    std::string decoderImpl;
-                    double jitter = 0.0;
-                    int64_t packetsLost = 0;
-                    int64_t packetsReceived = 0;
-                    int64_t nackCount = 0;
-                    int64_t pliCount = 0;
-                    int64_t firCount = 0;
+            double lossRate = (packetsLost + packetsReceived > 0)
+                ? (packetsLost * 100.0 / (packetsLost + packetsReceived))
+                : 0.0;
+            double avgRttMs =
+                (responsesReceived > 0) ? (totalRtt / responsesReceived * 1000.0) : 0.0;
 
-                    for (const auto &m : stat->Members().std_vector()) {
-                        if (!m->IsDefined())
-                            continue;
-                        std::string name = m->GetName().std_string();
-                        if (name == "kind" || name == "mediaType") {
-                            if (m->ValueString().std_string() == "video")
-                                isVideo = true;
-                        } else if (name == "framesDecoded") {
-                            framesDecoded = m->ValueUint32();
-                        } else if (name == "totalDecodeTime") {
-                            totalDecodeTime = m->ValueDouble();
-                        } else if (name == "framesPerSecond") {
-                            fps = m->ValueDouble();
-                        } else if (name == "framesReceived") {
-                            framesReceived = m->ValueUint32();
-                        } else if (name == "framesDropped") {
-                            framesDropped = m->ValueUint32();
-                        } else if (name == "jitterBufferDelay") {
-                            jitterBufferDelay = m->ValueDouble();
-                        } else if (name == "jitterBufferEmittedCount") {
-                            jitterBufferEmitted = m->ValueUint64();
-                        } else if (name == "frameWidth") {
-                            frameWidth = static_cast<int>(m->ValueUint32());
-                        } else if (name == "frameHeight") {
-                            frameHeight = static_cast<int>(m->ValueUint32());
-                        } else if (name == "bytesReceived") {
-                            bytesReceived = m->ValueUint64();
-                        } else if (name == "decoderImplementation") {
-                            decoderImpl = m->ValueString().std_string();
-                        } else if (name == "jitter") {
-                            jitter = safeDouble(m);
-                        } else if (name == "packetsLost") {
-                            packetsLost = safeInt64(m);
-                        } else if (name == "packetsReceived") {
-                            packetsReceived = safeInt64(m);
-                        } else if (name == "nackCount") {
-                            nackCount = safeInt64(m);
-                        } else if (name == "pliCount") {
-                            pliCount = safeInt64(m);
-                        } else if (name == "firCount") {
-                            firCount = safeInt64(m);
-                        }
-                    }
+            QMetaObject::invokeMethod(
+                this,
+                [=]() {
+                  qDebug().noquote() << QString(
+                      "[DecodeStats] %1x%2 | 解码器: %3 | fps: %4 | "
+                      "解码帧: +%5 (总%6) | 平均解码: %7 ms/帧 | "
+                      "丢帧: +%8 (总%9) | 抖动缓冲: %10 ms | "
+                      "接收: %11 KB")
+                      .arg(frameWidth)
+                      .arg(frameHeight)
+                      .arg(QString::fromStdString(decoderImpl))
+                      .arg(fps, 0, 'f', 1)
+                      .arg(deltaFrames)
+                      .arg(framesDecoded)
+                      .arg(avgDecodeMs, 0, 'f', 2)
+                      .arg(deltaDropped)
+                      .arg(framesDropped)
+                      .arg(avgJitterMs, 0, 'f', 1)
+                      .arg(bytesReceived / 1024);
 
-                    if (!isVideo)
-                        continue;
+                  qDebug().noquote() << QString(
+                      "[NetStats] RTT: %1 ms (平均 %2 ms) | "
+                      "抖动: %3 ms | 丢包率: %4% (%5/%6) | "
+                      "NACK: %7 | PLI: %8 | FIR: %9")
+                      .arg(currentRtt * 1000.0, 0, 'f', 1)
+                      .arg(avgRttMs, 0, 'f', 1)
+                      .arg(jitter * 1000.0, 0, 'f', 1)
+                      .arg(lossRate, 0, 'f', 2)
+                      .arg(packetsLost)
+                      .arg(packetsReceived)
+                      .arg(nackCount)
+                      .arg(pliCount)
+                      .arg(firCount);
+                },
+                Qt::QueuedConnection);
 
-                    uint32_t deltaFrames = framesDecoded - m_prevFramesDecoded;
-                    double deltaTime = totalDecodeTime - m_prevTotalDecodeTime;
-                    double avgDecodeMs = (deltaFrames > 0) ? (deltaTime / deltaFrames * 1000.0) : 0.0;
-                    uint32_t deltaDropped = framesDropped - m_prevFramesDropped;
-
-                    uint64_t deltaJbEmitted = jitterBufferEmitted - m_prevJitterBufferEmitted;
-                    double deltaJbDelay = jitterBufferDelay - m_prevJitterBufferDelay;
-                    double avgJitterMs = (deltaJbEmitted > 0)
-                        ? (deltaJbDelay / deltaJbEmitted * 1000.0) : 0.0;
-
-                    double lossRate = (packetsLost + (int64_t)packetsReceived > 0)
-                        ? (packetsLost * 100.0 / (packetsLost + (int64_t)packetsReceived)) : 0.0;
-                    double avgRttMs = (responsesReceived > 0)
-                        ? (totalRtt / responsesReceived * 1000.0) : 0.0;
-
-                    QMetaObject::invokeMethod(this, [=]() {
-                        qDebug().noquote() << QString(
-                            "[DecodeStats] %1x%2 | 解码器: %3 | fps: %4 | "
-                            "解码帧: +%5 (总%6) | 平均解码: %7 ms/帧 | "
-                            "丢帧: +%8 (总%9) | 抖动缓冲: %10 ms | "
-                            "接收: %11 KB")
-                            .arg(frameWidth).arg(frameHeight)
-                            .arg(QString::fromStdString(decoderImpl))
-                            .arg(fps, 0, 'f', 1)
-                            .arg(deltaFrames).arg(framesDecoded)
-                            .arg(avgDecodeMs, 0, 'f', 2)
-                            .arg(deltaDropped).arg(framesDropped)
-                            .arg(avgJitterMs, 0, 'f', 1)
-                            .arg(bytesReceived / 1024);
-
-                        qDebug().noquote() << QString(
-                            "[NetStats] RTT: %1 ms (平均 %2 ms) | "
-                            "抖动: %3 ms | 丢包率: %4% (%5/%6) | "
-                            "NACK: %7 | PLI: %8 | FIR: %9")
-                            .arg(currentRtt * 1000.0, 0, 'f', 1)
-                            .arg(avgRttMs, 0, 'f', 1)
-                            .arg(jitter * 1000.0, 0, 'f', 1)
-                            .arg(lossRate, 0, 'f', 2)
-                            .arg(packetsLost)
-                            .arg(packetsReceived)
-                            .arg(nackCount)
-                            .arg(pliCount)
-                            .arg(firCount);
-                    }, Qt::QueuedConnection);
-
-                    m_prevFramesDecoded = framesDecoded;
-                    m_prevTotalDecodeTime = totalDecodeTime;
-                    m_prevFramesReceived = framesReceived;
-                    m_prevFramesDropped = framesDropped;
-                    m_prevJitterBufferDelay = jitterBufferDelay;
-                    m_prevJitterBufferEmitted = jitterBufferEmitted;
-                    break;
-                }
-            },
-            [](const char *error) {
-                qWarning() << "[DecodeStats] GetStats failed:" << error;
-            });
-    });
-    m_statsTimer->start();
-    qDebug() << "[DecodeStats] 统计定时器已启动 (每 3s)";
+            m_prevFramesDecoded = framesDecoded;
+            m_prevTotalDecodeTime = totalDecodeTime;
+            m_prevFramesReceived = framesReceived;
+            m_prevFramesDropped = framesDropped;
+            m_prevJitterBufferDelay = jitterBufferDelay;
+            m_prevJitterBufferEmitted = jitterBufferEmitted;
+            break;
+          }
+        });
+    m_peerConnection->GetStats(cb.get());
+  });
+  m_statsTimer->start();
+  qDebug() << "[DecodeStats] 统计定时器已启动 (每 3s)";
 }
 
 void WebRTCReceiverClient::stopStatsTimer()
 {
-    if (m_statsTimer) {
-        m_statsTimer->stop();
-        m_statsTimer->deleteLater();
-        m_statsTimer = nullptr;
-        qDebug() << "[DecodeStats] 统计定时器已停止";
-    }
+  if (m_statsTimer) {
+    m_statsTimer->stop();
+    m_statsTimer->deleteLater();
+    m_statsTimer = nullptr;
+    qDebug() << "[DecodeStats] 统计定时器已停止";
+  }
 }

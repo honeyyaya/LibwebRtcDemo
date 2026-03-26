@@ -1,4 +1,5 @@
 #include "webrtc_video_renderer.h"
+
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
@@ -6,17 +7,14 @@
 #include <QElapsedTimer>
 #include <cstring>
 
-using namespace libwebrtc;
+#include "api/video/video_frame_buffer.h"
+#include "api/video/video_rotation.h"
+#include "api/video/video_source_interface.h"
 
 #define STATS_INTERVAL 60
 
 // =============================================================================
-// OpenGL Renderer：在 Qt SceneGraph 渲染线程中执行，GPU 完成 YUV→RGB
-// =============================================================================
-class WebRTCGLRenderer
-    : public QQuickFramebufferObject::Renderer
-    , protected QOpenGLFunctions
-{
+class WebRTCGLRenderer : public QQuickFramebufferObject::Renderer, protected QOpenGLFunctions {
 public:
     WebRTCGLRenderer()
     {
@@ -47,12 +45,12 @@ public:
         m_program.bind();
 
         static const GLfloat verts[] = {
-            -1.0f, -1.0f,   1.0f, -1.0f,
-            -1.0f,  1.0f,   1.0f,  1.0f
+            -1.0f, -1.0f, 1.0f, -1.0f,
+            -1.0f,  1.0f, 1.0f,  1.0f
         };
         static const GLfloat texCoords[] = {
-            0.0f, 1.0f,   1.0f, 1.0f,
-            0.0f, 0.0f,   1.0f, 0.0f
+            0.0f, 1.0f, 1.0f, 1.0f,
+            0.0f, 0.0f, 1.0f, 0.0f
         };
 
         m_program.setAttributeArray(0, GL_FLOAT, verts, 2);
@@ -99,8 +97,8 @@ public:
     void synchronize(QQuickFramebufferObject *item) override
     {
         auto *vi = qobject_cast<WebRTCVideoRenderer *>(item);
-        if (!vi) return;
-        Q_UNUSED(vi);
+        if (!vi)
+            return;
 
         YuvFrameData frame;
         if (!vi->takeFrame(frame))
@@ -193,8 +191,6 @@ private:
 };
 
 // =============================================================================
-// WebRTCVideoRenderer 实现
-// =============================================================================
 
 WebRTCVideoRenderer::WebRTCVideoRenderer(QQuickItem *parent)
     : QQuickFramebufferObject(parent)
@@ -214,19 +210,28 @@ void WebRTCVideoRenderer::timerEvent(QTimerEvent *)
         update();
 }
 
-void WebRTCVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame)
+void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
 {
+    static int on_frame_calls = 0;
+    ++on_frame_calls;
+    if (on_frame_calls == 1 || (on_frame_calls % 30) == 0) {
+        qDebug() << "[VideoRenderer] OnFrame 调用#" << on_frame_calls
+                 << "rtp_ts=" << frame.rtp_timestamp();
+    }
 
-    qDebug() << "[Thread] OnFrame running on thread:" << QThread::currentThreadId();
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer = frame.video_frame_buffer();
+    if (!buffer)
+        return;
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer->ToI420();
+    if (!i420)
+        return;
 
-    if (!frame) return;
+    const int w = i420->width();
+    const int h = i420->height();
+    if (w <= 0 || h <= 0)
+        return;
 
-    const int w = frame->width();
-    const int h = frame->height();
-    if (w <= 0 || h <= 0) return;
-
-    qint64 tIntervalUs = m_decodeIntervalTimer.isValid()
-        ? m_decodeIntervalTimer.nsecsElapsed() / 1000 : 0;
+    qint64 tIntervalUs = m_decodeIntervalTimer.isValid() ? m_decodeIntervalTimer.nsecsElapsed() / 1000 : 0;
     m_decodeIntervalTimer.start();
 
     QElapsedTimer copyTimer;
@@ -236,33 +241,33 @@ void WebRTCVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame)
     yuvFrame.width = w;
     yuvFrame.height = h;
 
-    int strideY = frame->StrideY();
-    int strideU = frame->StrideU();
-    int strideV = frame->StrideV();
+    int strideY = i420->StrideY();
+    int strideU = i420->StrideU();
+    int strideV = i420->StrideV();
 
     if (strideY == w) {
-        yuvFrame.y = QByteArray(reinterpret_cast<const char *>(frame->DataY()), w * h);
+        yuvFrame.y = QByteArray(reinterpret_cast<const char *>(i420->DataY()), w * h);
     } else {
         yuvFrame.y.resize(w * h);
         for (int row = 0; row < h; ++row)
-            std::memcpy(yuvFrame.y.data() + row * w, frame->DataY() + row * strideY, w);
+            std::memcpy(yuvFrame.y.data() + row * w, i420->DataY() + row * strideY, w);
     }
 
     int hw = w / 2, hh = h / 2;
     if (strideU == hw) {
-        yuvFrame.u = QByteArray(reinterpret_cast<const char *>(frame->DataU()), hw * hh);
+        yuvFrame.u = QByteArray(reinterpret_cast<const char *>(i420->DataU()), hw * hh);
     } else {
         yuvFrame.u.resize(hw * hh);
         for (int row = 0; row < hh; ++row)
-            std::memcpy(yuvFrame.u.data() + row * hw, frame->DataU() + row * strideU, hw);
+            std::memcpy(yuvFrame.u.data() + row * hw, i420->DataU() + row * strideU, hw);
     }
 
     if (strideV == hw) {
-        yuvFrame.v = QByteArray(reinterpret_cast<const char *>(frame->DataV()), hw * hh);
+        yuvFrame.v = QByteArray(reinterpret_cast<const char *>(i420->DataV()), hw * hh);
     } else {
         yuvFrame.v.resize(hw * hh);
         for (int row = 0; row < hh; ++row)
-            std::memcpy(yuvFrame.v.data() + row * hw, frame->DataV() + row * strideV, hw);
+            std::memcpy(yuvFrame.v.data() + row * hw, i420->DataV() + row * strideV, hw);
     }
 
     yuvFrame.valid = true;
@@ -278,17 +283,15 @@ void WebRTCVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame)
     if (m_frameCount % STATS_INTERVAL == 0) {
         qDebug().noquote() << QString(
             "[VideoPerf-GL] OnFrame#%1 | YUV拷贝: %2 ms | 帧间隔: %3 ms | 数据量: %4 KB")
-            .arg(m_frameCount)
-            .arg(tCopyUs / 1000.0, 0, 'f', 2)
-            .arg(tIntervalUs / 1000.0, 0, 'f', 2)
-            .arg((w * h * 3 / 2) / 1024);
+                .arg(m_frameCount)
+                .arg(tCopyUs / 1000.0, 0, 'f', 2)
+                .arg(tIntervalUs / 1000.0, 0, 'f', 2)
+                .arg((w * h * 3 / 2) / 1024);
     }
 
     if (!m_hasVideo) {
         m_hasVideo = true;
-        QMetaObject::invokeMethod(this, [this]() {
-            Q_EMIT hasVideoChanged();
-        }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(this, [this]() { Q_EMIT hasVideoChanged(); }, Qt::QueuedConnection);
     }
 }
 
@@ -307,14 +310,14 @@ QQuickFramebufferObject::Renderer *WebRTCVideoRenderer::createRenderer() const
     return new WebRTCGLRenderer();
 }
 
-void WebRTCVideoRenderer::setVideoTrack(scoped_refptr<RTCVideoTrack> track)
+void WebRTCVideoRenderer::setVideoTrack(webrtc::scoped_refptr<webrtc::VideoTrackInterface> track)
 {
     if (m_track == track)
         return;
     clearVideoTrack();
     m_track = track;
     if (m_track) {
-        m_track->AddRenderer(this);
+        m_track->AddOrUpdateSink(this, webrtc::VideoSinkWants());
         if (!m_hasVideo) {
             m_hasVideo = true;
             Q_EMIT hasVideoChanged();
@@ -326,7 +329,7 @@ void WebRTCVideoRenderer::setVideoTrack(scoped_refptr<RTCVideoTrack> track)
 void WebRTCVideoRenderer::clearVideoTrack()
 {
     if (m_track) {
-        m_track->RemoveRenderer(this);
+        m_track->RemoveSink(this);
         m_track = nullptr;
     }
     QMutexLocker lock(&m_frameMutex);
