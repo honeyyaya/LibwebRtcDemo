@@ -1,6 +1,7 @@
 #include "webrtc_factory_helper.h"
 
 #include <memory>
+#include <utility>
 
 #include <QtGlobal>
 
@@ -12,6 +13,10 @@
 #include "api/task_queue/default_task_queue_factory.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "rtc_base/thread.h"
+
+#if defined(WEBRTC_ANDROID)
+#include "android_hw_video_decoder_factory.h"
+#endif
 
 namespace webrtc_demo {
 namespace {
@@ -69,17 +74,24 @@ webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> CreatePeerConnecti
     return nullptr;
   }
 
-  // 音频：Dummy ADM + 内置编解码工厂；视频解码：全量 libwebrtc 自带的 CreateBuiltinVideoDecoderFactory。
+  // 音频：Dummy ADM + 内置编解码工厂。
+  // Android：H.264 优先 NDK MediaCodec，其它格式走内置解码工厂；桌面：仅内置解码工厂。
   // 仅接收端可不设视频编码工厂。
   // 第三参数传专用 signaling 线程；传 nullptr 时与 network 混用，在 Qt 主线程发起 PC 调用时易出现
   // CreateAnswer 立即返回但 CreateSessionDescriptionObserver 永不回调等问题。
+  std::unique_ptr<webrtc::VideoDecoderFactory> video_decoder_factory;
+#if defined(WEBRTC_ANDROID)
+  video_decoder_factory = CreateAndroidHwOrBuiltinVideoDecoderFactory();
+#else
+  video_decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();
+#endif
   return webrtc::CreatePeerConnectionFactory(
       th.network.get(), th.worker.get(), th.signaling.get(),
       adm,
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
       nullptr,
-      webrtc::CreateBuiltinVideoDecoderFactory(),
+      std::move(video_decoder_factory),
       nullptr,
       nullptr);
 }

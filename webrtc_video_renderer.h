@@ -2,21 +2,14 @@
 #define WEBRTC_VIDEO_RENDERER_H
 
 #include <QQuickFramebufferObject>
-#include <QByteArray>
 #include <QMutex>
 #include <QElapsedTimer>
 
 #include "api/media_stream_interface.h"
 #include "api/scoped_refptr.h"
 #include "api/video/video_frame.h"
+#include "api/video/video_frame_buffer.h"
 #include "api/video/video_sink_interface.h"
-
-struct YuvFrameData {
-    QByteArray y, u, v;
-    int width = 0;
-    int height = 0;
-    bool valid = false;
-};
 
 class WebRTCVideoRenderer : public QQuickFramebufferObject,
                             public webrtc::VideoSinkInterface<webrtc::VideoFrame>
@@ -39,7 +32,8 @@ public:
 
     Renderer *createRenderer() const override;
 
-    bool takeFrame(YuvFrameData &out);
+    // 传出 I420 引用；纹理上传在 GL 线程完成，避免 OnFrame 整帧 memcpy。
+    bool takeFrame(webrtc::scoped_refptr<webrtc::I420BufferInterface> &out);
 
 protected:
     void timerEvent(QTimerEvent *event) override;
@@ -49,7 +43,8 @@ private:
     bool m_hasVideo = false;
 
     QMutex m_frameMutex;
-    YuvFrameData m_pendingFrame;
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> m_pendingI420;
+    bool m_pendingValid = false;
 
     int m_frameCount = 0;
     QElapsedTimer m_decodeIntervalTimer;

@@ -641,7 +641,7 @@ void WebRTCReceiverClient::startStatsTimer()
             int64_t nackCount = inb->nack_count.value_or(0);
             int64_t pliCount = inb->pli_count.value_or(0);
             int64_t firCount = inb->fir_count.value_or(0);
-
+            int64_t fec_packets_received = inb->fec_packets_received.value_or(0);
             uint32_t deltaFrames = framesDecoded - m_prevFramesDecoded;
             double deltaTime = totalDecodeTime - m_prevTotalDecodeTime;
             double avgDecodeMs = (deltaFrames > 0) ? (deltaTime / deltaFrames * 1000.0) : 0.0;
@@ -681,7 +681,7 @@ void WebRTCReceiverClient::startStatsTimer()
                   qDebug().noquote() << QString(
                       "[NetStats] RTT: %1 ms (平均 %2 ms) | "
                       "抖动: %3 ms | 丢包率: %4% (%5/%6) | "
-                      "NACK: %7 | PLI: %8 | FIR: %9")
+                      "NACK: %7 | PLI: %8 | FIR: %9 | FEC: %10")
                       .arg(currentRtt * 1000.0, 0, 'f', 1)
                       .arg(avgRttMs, 0, 'f', 1)
                       .arg(jitter * 1000.0, 0, 'f', 1)
@@ -690,7 +690,8 @@ void WebRTCReceiverClient::startStatsTimer()
                       .arg(packetsReceived)
                       .arg(nackCount)
                       .arg(pliCount)
-                      .arg(firCount);
+                      .arg(firCount)
+                      .arg(fec_packets_received);
                 },
                 Qt::QueuedConnection);
 

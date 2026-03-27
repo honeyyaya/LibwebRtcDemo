@@ -1,20 +1,61 @@
 #include "webrtc_video_renderer.h"
+#include "video_decode_sink_timing_bridge.h"
 
+#include <atomic>
+
+#include <QOpenGLContext>
+#include <QOpenGLExtraFunctions>
 #include <QOpenGLFramebufferObject>
-#include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QDebug>
 #include <QElapsedTimer>
-#include <cstring>
-
 #include "api/video/video_frame_buffer.h"
 #include "api/video/video_rotation.h"
 #include "api/video/video_source_interface.h"
 
 #define STATS_INTERVAL 60
 
+#ifndef GL_UNPACK_ROW_LENGTH
+#define GL_UNPACK_ROW_LENGTH 0x0CF2
+#endif
+
+namespace {
+
+void UploadLuminancePlane(QOpenGLExtraFunctions &gl,
+                          bool use_unpack_row_length,
+                          GLenum texture_unit,
+                          GLuint tex,
+                          int plane_w,
+                          int plane_h,
+                          const uint8_t *data,
+                          int stride_bytes)
+{
+    gl.glActiveTexture(texture_unit);
+    gl.glBindTexture(GL_TEXTURE_2D, tex);
+    if (stride_bytes == plane_w) {
+        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, plane_w, plane_h, 0, GL_LUMINANCE,
+                        GL_UNSIGNED_BYTE, data);
+        return;
+    }
+    if (use_unpack_row_length) {
+        gl.glPixelStorei(GL_UNPACK_ROW_LENGTH, stride_bytes);
+        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, plane_w, plane_h, 0, GL_LUMINANCE,
+                        GL_UNSIGNED_BYTE, data);
+        gl.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        return;
+    }
+    gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, plane_w, plane_h, 0, GL_LUMINANCE,
+                    GL_UNSIGNED_BYTE, nullptr);
+    for (int row = 0; row < plane_h; ++row) {
+        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, row, plane_w, 1, GL_LUMINANCE, GL_UNSIGNED_BYTE,
+                           data + row * stride_bytes);
+    }
+}
+
+}  // namespace
+
 // =============================================================================
-class WebRTCGLRenderer : public QQuickFramebufferObject::Renderer, protected QOpenGLFunctions {
+class WebRTCGLRenderer : public QQuickFramebufferObject::Renderer, protected QOpenGLExtraFunctions {
 public:
     WebRTCGLRenderer()
     {
@@ -100,33 +141,31 @@ public:
         if (!vi)
             return;
 
-        YuvFrameData frame;
-        if (!vi->takeFrame(frame))
+        if (!m_uploadCapsChecked) {
+            m_uploadCapsChecked = true;
+            QOpenGLContext *ctx = QOpenGLContext::currentContext();
+            if (ctx && ctx->format().majorVersion() >= 3)
+                m_useUnpackRowLength = true;
+        }
+
+        webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
+        if (!vi->takeFrame(i420) || !i420)
             return;
+
+        const int w = i420->width();
+        const int h = i420->height();
+        const int hw = w / 2;
+        const int hh = h / 2;
 
         QElapsedTimer uploadTimer;
         uploadTimer.start();
 
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_texY);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE,
-                     frame.width, frame.height, 0,
-                     GL_LUMINANCE, GL_UNSIGNED_BYTE, frame.y.constData());
-
-        int hw = frame.width / 2;
-        int hh = frame.height / 2;
-
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, m_texU);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE,
-                     hw, hh, 0,
-                     GL_LUMINANCE, GL_UNSIGNED_BYTE, frame.u.constData());
-
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, m_texV);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE,
-                     hw, hh, 0,
-                     GL_LUMINANCE, GL_UNSIGNED_BYTE, frame.v.constData());
+        UploadLuminancePlane(*this, m_useUnpackRowLength, GL_TEXTURE0, m_texY, w, h, i420->DataY(),
+                             i420->StrideY());
+        UploadLuminancePlane(*this, m_useUnpackRowLength, GL_TEXTURE1, m_texU, hw, hh, i420->DataU(),
+                             i420->StrideU());
+        UploadLuminancePlane(*this, m_useUnpackRowLength, GL_TEXTURE2, m_texV, hw, hh, i420->DataV(),
+                             i420->StrideV());
 
         m_lastUploadUs = uploadTimer.nsecsElapsed() / 1000;
         m_hasData = true;
@@ -188,6 +227,9 @@ private:
 
     int m_renderFrameCount = 0;
     qint64 m_lastUploadUs = 0;
+
+    bool m_uploadCapsChecked = false;
+    bool m_useUnpackRowLength = false;
 };
 
 // =============================================================================
@@ -212,6 +254,23 @@ void WebRTCVideoRenderer::timerEvent(QTimerEvent *)
 
 void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
 {
+    const int64_t t_onframe_us = webrtc_demo::DecodeSinkMonotonicUs();
+    const uint32_t rtp_ts = frame.rtp_timestamp();
+    int64_t t_after_decoded = 0;
+    if (webrtc_demo::DecodeSinkTakeDecodedReturn(rtp_ts, &t_after_decoded)) {
+        const int64_t de_us = t_onframe_us - t_after_decoded;
+        static std::atomic<uint64_t> g_mc_de_seq{0};
+        const uint64_t n = ++g_mc_de_seq;
+        if (n <= 10u || (n % 30u) == 0u) {
+            qDebug().noquote() << QString(
+                "[VideoPerf] McDE #%1 rtp_ts=%2 de=%3us (Decoded返回->OnFrame入口; "
+                "WebRTC内部至sink线程)")
+                .arg(static_cast<quint64>(n))
+                .arg(rtp_ts)
+                .arg(static_cast<qint64>(de_us));
+        }
+    }
+
     static int on_frame_calls = 0;
     ++on_frame_calls;
     if (on_frame_calls == 1 || (on_frame_calls % 30) == 0) {
@@ -234,57 +293,22 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
     qint64 tIntervalUs = m_decodeIntervalTimer.isValid() ? m_decodeIntervalTimer.nsecsElapsed() / 1000 : 0;
     m_decodeIntervalTimer.start();
 
-    QElapsedTimer copyTimer;
-    copyTimer.start();
-
-    YuvFrameData yuvFrame;
-    yuvFrame.width = w;
-    yuvFrame.height = h;
-
-    int strideY = i420->StrideY();
-    int strideU = i420->StrideU();
-    int strideV = i420->StrideV();
-
-    if (strideY == w) {
-        yuvFrame.y = QByteArray(reinterpret_cast<const char *>(i420->DataY()), w * h);
-    } else {
-        yuvFrame.y.resize(w * h);
-        for (int row = 0; row < h; ++row)
-            std::memcpy(yuvFrame.y.data() + row * w, i420->DataY() + row * strideY, w);
-    }
-
-    int hw = w / 2, hh = h / 2;
-    if (strideU == hw) {
-        yuvFrame.u = QByteArray(reinterpret_cast<const char *>(i420->DataU()), hw * hh);
-    } else {
-        yuvFrame.u.resize(hw * hh);
-        for (int row = 0; row < hh; ++row)
-            std::memcpy(yuvFrame.u.data() + row * hw, i420->DataU() + row * strideU, hw);
-    }
-
-    if (strideV == hw) {
-        yuvFrame.v = QByteArray(reinterpret_cast<const char *>(i420->DataV()), hw * hh);
-    } else {
-        yuvFrame.v.resize(hw * hh);
-        for (int row = 0; row < hh; ++row)
-            std::memcpy(yuvFrame.v.data() + row * hw, i420->DataV() + row * strideV, hw);
-    }
-
-    yuvFrame.valid = true;
-
-    qint64 tCopyUs = copyTimer.nsecsElapsed() / 1000;
-
+    QElapsedTimer handoffTimer;
+    handoffTimer.start();
+    qint64 tHandoffUs = 0;
     {
         QMutexLocker lock(&m_frameMutex);
-        m_pendingFrame = std::move(yuvFrame);
+        m_pendingI420 = i420;
+        m_pendingValid = true;
+        tHandoffUs = handoffTimer.nsecsElapsed() / 1000;
     }
 
     m_frameCount++;
     if (m_frameCount % STATS_INTERVAL == 0) {
         qDebug().noquote() << QString(
-            "[VideoPerf-GL] OnFrame#%1 | YUV拷贝: %2 ms | 帧间隔: %3 ms | 数据量: %4 KB")
+            "[VideoPerf-GL] OnFrame#%1 | 投递(锁内挂接I420,无整帧拷贝): %2 ms | 帧间隔: %3 ms | 数据量: %4 KB")
                 .arg(m_frameCount)
-                .arg(tCopyUs / 1000.0, 0, 'f', 2)
+                .arg(tHandoffUs / 1000.0, 0, 'f', 3)
                 .arg(tIntervalUs / 1000.0, 0, 'f', 2)
                 .arg((w * h * 3 / 2) / 1024);
     }
@@ -295,13 +319,14 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
     }
 }
 
-bool WebRTCVideoRenderer::takeFrame(YuvFrameData &out)
+bool WebRTCVideoRenderer::takeFrame(webrtc::scoped_refptr<webrtc::I420BufferInterface> &out)
 {
     QMutexLocker lock(&m_frameMutex);
-    if (!m_pendingFrame.valid)
+    if (!m_pendingValid || !m_pendingI420)
         return false;
-    out = std::move(m_pendingFrame);
-    m_pendingFrame.valid = false;
+    out = m_pendingI420;
+    m_pendingI420 = nullptr;
+    m_pendingValid = false;
     return true;
 }
 
@@ -333,7 +358,8 @@ void WebRTCVideoRenderer::clearVideoTrack()
         m_track = nullptr;
     }
     QMutexLocker lock(&m_frameMutex);
-    m_pendingFrame.valid = false;
+    m_pendingI420 = nullptr;
+    m_pendingValid = false;
     if (m_hasVideo) {
         m_hasVideo = false;
         Q_EMIT hasVideoChanged();

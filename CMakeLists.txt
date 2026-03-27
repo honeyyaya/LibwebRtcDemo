@@ -28,6 +28,8 @@ qt_add_executable(appLibwebRtcDemo
     webrtc_receiver_client.cpp
     webrtc_video_renderer.h
     webrtc_video_renderer.cpp
+    video_decode_sink_timing_bridge.h
+    video_decode_sink_timing_bridge.cpp
     signaling_client.h
     signaling_client.cpp
 )
@@ -54,10 +56,12 @@ set_target_properties(appLibwebRtcDemo PROPERTIES
 )
 # 静态链接 libwebrtc.a 时，符号打进本应用 .so，无需再向 APK 打入 libwebrtc.so
 
-# Chromium 风格头文件树：absl 在 third_party/abseil-cpp 下，需单独加入 include 路径
+# Chromium 风格头文件树：absl、libyuv 在 third_party 下，需单独加入 include 路径
+# libyuv 头文件使用 #include "libyuv/..."，根目录须为 third_party/libyuv/include
 target_include_directories(appLibwebRtcDemo PRIVATE
     ${WEBRTC_INCLUDE_DIR}
     ${WEBRTC_INCLUDE_DIR}/third_party/abseil-cpp
+    ${WEBRTC_INCLUDE_DIR}/third_party/libyuv/include
 )
 
 # WebRTC 头文件依赖这些宏选择字节序等实现（与 Chromium GN 中 rtc:rtc 一致）
@@ -103,11 +107,16 @@ target_link_libraries(appLibwebRtcDemo
 
 # Android 上 WebRTC 静态库常依赖的系统库（与 NDK/GLES 等；无音频时不链 OpenSLES）
 if(ANDROID)
+  target_sources(appLibwebRtcDemo PRIVATE
+      android_hw_video_decoder_factory.cpp
+      android_mediacodec_video_decoder.cpp
+  )
   target_link_libraries(appLibwebRtcDemo PRIVATE
       log
       android
       GLESv2
       EGL
+      mediandk
   )
 endif()
 
