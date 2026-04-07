@@ -21,6 +21,7 @@
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtc_stats_report.h"
 #include "api/stats/rtcstats_objects.h"
+#include "system_wrappers/include/field_trial.h"
 
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
@@ -391,6 +392,28 @@ void WebRTCReceiverClient::initWebRTC()
 
 void WebRTCReceiverClient::createPeerConnection()
 {
+  // 须在 CreatePeerConnectionFactory 之前注册；全局至多一次（见 field_trial.h）。
+  static const char kVideoFrameTrackingFieldTrials[] =
+      "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+  static bool field_trials_inited = false;
+  if (!field_trials_inited) {
+    webrtc::field_trial::InitFieldTrialsFromString(kVideoFrameTrackingFieldTrials);
+    field_trials_inited = true;
+  }
+  const std::string trial_full_name =
+      webrtc::field_trial::FindFullName("WebRTC-VideoFrameTrackingIdAdvertised");
+  const bool tracking_trial_on =
+      webrtc::field_trial::IsEnabled("WebRTC-VideoFrameTrackingIdAdvertised");
+  VERIFY_LOG("2", QString("FieldTrial WebRTC-VideoFrameTrackingIdAdvertised: fullName=\"%1\", "
+                          "IsEnabled=%2")
+                        .arg(QString::fromStdString(trial_full_name))
+                        .arg(tracking_trial_on ? "true" : "false"));
+
+  initWebRTC();
+  if (!m_factory) {
+    return;
+  }
+
   if (m_peerConnection) {
     m_peerConnection->Close();
     m_peerConnection = nullptr;
@@ -422,7 +445,6 @@ void WebRTCReceiverClient::handleOffer(const std::string &type, const std::strin
   m_pendingCreateAnswerObserver = nullptr;
   m_pendingSetLocalObserver = nullptr;
 
-  initWebRTC();
   createPeerConnection();
   if (!m_peerConnection) {
     return;

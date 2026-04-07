@@ -1,4 +1,5 @@
 #include "android_mediacodec_video_decoder.h"
+#include "encoded_tracking_bridge.h"
 #include "video_decode_sink_timing_bridge.h"
 
 #include <android/log.h>
@@ -11,11 +12,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -223,6 +226,43 @@ class PooledI420 final : public webrtc::I420BufferInterface {
 
 std::atomic<uint64_t> g_mc_decode_ingress_seq{0};
 std::atomic<uint64_t> g_mc_process_frame_seq{0};
+
+// RTP 扩展 / Field Trial 带来的 EncodedImage::VideoFrameTrackingId；与解码后 VideoFrame::id 对齐供测试链路使用。
+void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
+                                    uint32_t rtp_ts,
+                                    bool key) {
+  if (!tracking_id.has_value()) {
+    return;
+  }
+  webrtc_demo::RecordEncodedFrameTrackingId(tracking_id);
+  if (tracking_id.value() % 120u == 0u) {
+    const auto now_sys = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now_sys);
+    const int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now_sys.time_since_epoch())
+                                .count();
+    const auto ms_part = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now_sys.time_since_epoch()) %
+                         1000;
+    std::tm tm_local{};
+#if defined(WEBRTC_WIN)
+    localtime_s(&tm_local, &t);
+#else
+    localtime_r(&t, &tm_local);
+#endif
+    char local_time_str[80];
+    snprintf(local_time_str, sizeof(local_time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03lld",
+             tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday, tm_local.tm_hour,
+             tm_local.tm_min, tm_local.tm_sec, static_cast<long long>(ms_part.count()));
+    const int64_t steady_us = McMonotonicUs();
+
+    ALOGI(
+        "【重要日志！！！】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
+        "local_time=%s unix_ms=%lld steady_us=%lld",
+        static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
+        static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
+  }
+}
 
 // 单次 DrainOutputs 内部细分（微秒）；perf_detail==nullptr 时不采样，避免热路径开销。
 struct McDrainDetail {
@@ -451,7 +491,8 @@ struct AndroidMediaCodecVideoDecoder::Impl {
                     int64_t first_dequeue_timeout_us,
                     McDrainDetail* perf_detail,
                     int* delivered_frames,
-                    const int64_t* decode_wall_t0_us) {
+                    const int64_t* decode_wall_t0_us,
+                    const std::optional<uint16_t>& video_frame_tracking_id) {
     if (!codec_) {
       return;
     }
@@ -548,11 +589,14 @@ struct AndroidMediaCodecVideoDecoder::Impl {
             perf_detail->nv12_i420_us += McMonotonicUs() - t_c0;
           }
           if (i420) {
-            webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
-                                           .set_video_frame_buffer(i420)
-                                           .set_rtp_timestamp(rtp_timestamp)
-                                           .set_timestamp_us(render_time_ms * 1000)
-                                           .build();
+            webrtc::VideoFrame::Builder frame_builder;
+            frame_builder.set_video_frame_buffer(i420)
+                .set_rtp_timestamp(rtp_timestamp)
+                .set_timestamp_us(render_time_ms * 1000);
+            if (video_frame_tracking_id.has_value()) {
+              frame_builder.set_id(*video_frame_tracking_id);
+            }
+            webrtc::VideoFrame frame = frame_builder.build();
             int64_t t_cb0 = 0;
             if (perf_detail) {
               t_cb0 = McMonotonicUs();
@@ -608,7 +652,8 @@ struct AndroidMediaCodecVideoDecoder::Impl {
                        int64_t render_time_ms,
                        uint32_t rtp_timestamp,
                        bool is_keyframe,
-                       int64_t decode_wall_t0_us) {
+                       int64_t decode_wall_t0_us,
+                       const std::optional<uint16_t>& video_frame_tracking_id) {
     if (!codec_ || data.empty()) {
       return;
     }
@@ -646,7 +691,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     if (in_idx < 0) {
       ALOGW("dequeueInputBuffer failed: %zd", in_idx);
       DrainOutputs(render_time_ms, rtp_timestamp, kDrainOnInputBackpressureUs, nullptr, nullptr,
-                   nullptr);
+                   nullptr, video_frame_tracking_id);
       return;
     }
 
@@ -688,13 +733,13 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     McDrainDetail d1{};
     int delivered0 = 0;
     DrainOutputs(render_time_ms, rtp_timestamp, 0, log_perf ? &d0 : nullptr, &delivered0,
-                 e2e_t0_ptr);
+                 e2e_t0_ptr, video_frame_tracking_id);
     if (delivered0 > 0) {
       DrainOutputs(render_time_ms, rtp_timestamp, 0, log_perf ? &d1 : nullptr, nullptr,
-                   e2e_t0_ptr);
+                   e2e_t0_ptr, video_frame_tracking_id);
     } else {
       DrainOutputs(render_time_ms, rtp_timestamp, kDrainAfterQueueShortWaitUs,
-                   log_perf ? &d1 : nullptr, nullptr, e2e_t0_ptr);
+                   log_perf ? &d1 : nullptr, nullptr, e2e_t0_ptr, video_frame_tracking_id);
     }
 
     if (log_perf) {
@@ -768,6 +813,8 @@ int32_t AndroidMediaCodecVideoDecoder::Decode(const webrtc::EncodedImage& input_
   }
   const uint32_t rtp_ts = input_image.RtpTimestamp();
   const bool key = (input_image.FrameType() == webrtc::VideoFrameType::kVideoFrameKey);
+  const std::optional<uint16_t> video_frame_tracking_id = input_image.VideoFrameTrackingId();
+  LogEncodedFrameTrackingIngress(video_frame_tracking_id, rtp_ts, key);
   // 端到端计时起点：与本帧 EncodedImage 对应（含后续排队、worker、Decoded 回调）。
   const int64_t decode_wall_t0_us = McMonotonicUs();
   LogMcDecodeIngress(input_image.data(), sz, rtp_ts, key, render_time_ms);
@@ -781,8 +828,9 @@ int32_t AndroidMediaCodecVideoDecoder::Decode(const webrtc::EncodedImage& input_
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
     impl_->tasks_.push_back([this, copy = std::move(copy), render_time_ms, rtp_ts, key,
-                             decode_wall_t0_us]() mutable {
-      impl_->ProcessOneFrame(copy, render_time_ms, rtp_ts, key, decode_wall_t0_us);
+                             decode_wall_t0_us, video_frame_tracking_id]() mutable {
+      impl_->ProcessOneFrame(copy, render_time_ms, rtp_ts, key, decode_wall_t0_us,
+                             video_frame_tracking_id);
     });
   }
   impl_->cv_.notify_one();

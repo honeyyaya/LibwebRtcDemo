@@ -30,6 +30,8 @@ qt_add_executable(appLibwebRtcDemo
     webrtc_video_renderer.cpp
     video_decode_sink_timing_bridge.h
     video_decode_sink_timing_bridge.cpp
+    encoded_tracking_bridge.h
+    encoded_tracking_bridge.cpp
     signaling_client.h
     signaling_client.cpp
 )

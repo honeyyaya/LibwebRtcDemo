@@ -18,6 +18,18 @@ Window {
     property bool connectReady: false
     // 信令地址：TCP 直连信令服务器（JSON-per-line 协议）
     property string signalingUrl: "192.168.3.20:8765"
+    property string titleClockText: ""
+
+    Timer {
+        id: titleClockTimer
+        interval: 33
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: {
+            titleClockText = Qt.formatDateTime(new Date(), "yyyy-MM-dd hh:mm:ss.zzz")
+        }
+    }
 
     Component.onCompleted: {
         receiverStatus = "方向3 验证: 等待 Activity 就绪 (1.5s)..."
@@ -60,13 +72,26 @@ Window {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 48
 
-                Text {
+                Row {
+                    id: titleRow
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "LibWebRTC Demo"
-                    font.pixelSize: 22
-                    font.bold: true
-                    color: "#E94560"
+                    spacing: 14
+
+                    Text {
+                        text: "LibWebRTC Demo"
+                        font.pixelSize: 22
+                        font.bold: true
+                        color: "#E94560"
+                    }
+
+                    Text {
+                        text: root.titleClockText
+                        font.pixelSize: 22
+                        font.bold: true
+                        font.family: "monospace"
+                        color: "#E94560"
+                    }
                 }
 
                 Text {
@@ -99,12 +124,82 @@ Window {
                     }
                 }
 
-                Text {
+                // 帧 ID：青色=仅编码入站（与 log 一致，解码失败时仍有）；绿/橙=解码后 VideoFrame::id()
+                Rectangle {
+                    anchors.fill: parent
+                    anchors.margins: 1
+                    radius: 10
+                    color: "transparent"
+                    border.width: (videoRenderer.hasEncodedIngressTracking
+                                   || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)) ? 2 : 0
+                    border.color: (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
+                                  ? (videoRenderer.frameIdFromTracking ? "#22C55E" : "#F59E0B")
+                                  : (videoRenderer.hasEncodedIngressTracking ? "#06B6D4" : "#00000000")
+                    visible: videoRenderer.hasEncodedIngressTracking || videoRenderer.hasVideo
+                }
+
+                Rectangle {
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.margins: 10
+                    implicitWidth: Math.max(idIngress.implicitWidth, idDecoded.implicitWidth) + 16
+                    implicitHeight: idColumn.implicitHeight + 16
+                    radius: 4
+                    color: "#B3000000"
+                    visible: videoRenderer.hasEncodedIngressTracking
+                             || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
+                    Column {
+                        id: idColumn
+                        anchors.centerIn: parent
+                        spacing: 4
+                        Text {
+                            id: idIngress
+                            width: Math.min(280, root.width - 64)
+                            visible: videoRenderer.hasEncodedIngressTracking
+                            wrapMode: Text.WordWrap
+                            text: "编码入站 ID: " + videoRenderer.encodedIngressTrackingId
+                                  + "（Decode 路径，与 logcat EncodedFrame 一致）"
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: "#A5F3FC"
+                        }
+                        Text {
+                            id: idDecoded
+                            width: Math.min(280, root.width - 64)
+                            visible: videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0
+                            wrapMode: Text.WordWrap
+                            text: !videoRenderer.hasVideo || videoRenderer.highlightFrameId < 0
+                                  ? ""
+                                  : (videoRenderer.frameIdFromTracking
+                                     ? ("解码帧 ID: " + videoRenderer.highlightFrameId)
+                                     : ("解码预览 #" + videoRenderer.highlightFrameId))
+                            font.pixelSize: 11
+                            font.bold: videoRenderer.frameIdFromTracking
+                            color: videoRenderer.frameIdFromTracking ? "#BBF7D0" : "#FDE68A"
+                        }
+                    }
+                }
+
+                Column {
                     anchors.centerIn: parent
-                    text: videoRenderer.hasVideo ? "" : "视频将在此显示"
-                    font.pixelSize: 14
-                    color: "#4B5563"
-                    visible: !videoRenderer.hasVideo
+                    width: parent.width - 24
+                    spacing: 6
+                    visible: !videoRenderer.hasVideo && !videoRenderer.hasEncodedIngressTracking
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "视频将在此显示"
+                        font.pixelSize: 14
+                        color: "#4B5563"
+                    }
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "青框+编码入站 ID=仅进解码器（黑屏时仍可见）；绿/橙=已解码出画"
+                        font.pixelSize: 10
+                        color: "#6B7280"
+                        horizontalAlignment: Text.AlignHCenter
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                    }
                 }
             }
 

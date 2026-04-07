@@ -1,4 +1,5 @@
 #include "webrtc_video_renderer.h"
+#include "encoded_tracking_bridge.h"
 #include "video_decode_sink_timing_bridge.h"
 
 #include <atomic>
@@ -248,6 +249,12 @@ WebRTCVideoRenderer::~WebRTCVideoRenderer()
 
 void WebRTCVideoRenderer::timerEvent(QTimerEvent *)
 {
+    const int32_t raw = webrtc_demo::GetLastEncodedFrameTrackingIdForUi();
+    const int cur = raw >= 0 ? static_cast<int>(raw) : -1;
+    if (cur != m_lastPolledEncodedIngressId) {
+        m_lastPolledEncodedIngressId = cur;
+        Q_EMIT encodedIngressTrackingChanged();
+    }
     if (m_hasVideo)
         update();
 }
@@ -293,14 +300,29 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
     qint64 tIntervalUs = m_decodeIntervalTimer.isValid() ? m_decodeIntervalTimer.nsecsElapsed() / 1000 : 0;
     m_decodeIntervalTimer.start();
 
+    const uint16_t raw_id = frame.id();
+
     QElapsedTimer handoffTimer;
     handoffTimer.start();
     qint64 tHandoffUs = 0;
+    bool id_changed = false;
     {
         QMutexLocker lock(&m_frameMutex);
+        const bool from_tracking = (raw_id != webrtc::VideoFrame::kNotSetId);
+        const int display_id =
+            from_tracking ? static_cast<int>(raw_id) : static_cast<int>(++m_localPreviewSeq);
         m_pendingI420 = i420;
         m_pendingValid = true;
+        if (m_highlightFrameId != display_id || m_frameIdFromTracking != from_tracking) {
+            m_highlightFrameId = display_id;
+            m_frameIdFromTracking = from_tracking;
+            id_changed = true;
+        }
         tHandoffUs = handoffTimer.nsecsElapsed() / 1000;
+    }
+    if (id_changed) {
+        QMetaObject::invokeMethod(
+            this, [this]() { Q_EMIT highlightFrameIdChanged(); }, Qt::QueuedConnection);
     }
 
     m_frameCount++;
@@ -317,6 +339,25 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
         m_hasVideo = true;
         QMetaObject::invokeMethod(this, [this]() { Q_EMIT hasVideoChanged(); }, Qt::QueuedConnection);
     }
+}
+
+int WebRTCVideoRenderer::highlightFrameId() const {
+    QMutexLocker lock(&m_frameMutex);
+    return m_highlightFrameId;
+}
+
+bool WebRTCVideoRenderer::frameIdFromTracking() const {
+    QMutexLocker lock(&m_frameMutex);
+    return m_frameIdFromTracking;
+}
+
+int WebRTCVideoRenderer::encodedIngressTrackingId() const {
+    const int32_t v = webrtc_demo::GetLastEncodedFrameTrackingIdForUi();
+    return v >= 0 ? static_cast<int>(v) : -1;
+}
+
+bool WebRTCVideoRenderer::hasEncodedIngressTracking() const {
+    return webrtc_demo::GetLastEncodedFrameTrackingIdForUi() >= 0;
 }
 
 bool WebRTCVideoRenderer::takeFrame(webrtc::scoped_refptr<webrtc::I420BufferInterface> &out)
@@ -343,11 +384,7 @@ void WebRTCVideoRenderer::setVideoTrack(webrtc::scoped_refptr<webrtc::VideoTrack
     m_track = track;
     if (m_track) {
         m_track->AddOrUpdateSink(this, webrtc::VideoSinkWants());
-        if (!m_hasVideo) {
-            m_hasVideo = true;
-            Q_EMIT hasVideoChanged();
-        }
-        qDebug() << "[VideoRenderer] 已绑定视频轨道 (OpenGL)";
+        qDebug() << "[VideoRenderer] 已绑定视频轨道 (OpenGL)；首帧解码成功后才 hasVideo";
     }
 }
 
@@ -357,12 +394,25 @@ void WebRTCVideoRenderer::clearVideoTrack()
         m_track->RemoveSink(this);
         m_track = nullptr;
     }
-    QMutexLocker lock(&m_frameMutex);
-    m_pendingI420 = nullptr;
-    m_pendingValid = false;
+    webrtc_demo::ResetEncodedFrameTrackingForUi();
+    m_lastPolledEncodedIngressId = -1;
+    bool id_reset = false;
+    {
+        QMutexLocker lock(&m_frameMutex);
+        m_pendingI420 = nullptr;
+        m_pendingValid = false;
+        m_highlightFrameId = -1;
+        m_frameIdFromTracking = false;
+        m_localPreviewSeq = 0;
+        id_reset = true;
+    }
     if (m_hasVideo) {
         m_hasVideo = false;
         Q_EMIT hasVideoChanged();
     }
+    if (id_reset) {
+        Q_EMIT highlightFrameIdChanged();
+    }
+    Q_EMIT encodedIngressTrackingChanged();
     update();
 }
