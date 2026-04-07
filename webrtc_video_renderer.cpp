@@ -126,14 +126,27 @@ public:
                 const int64_t t_after_draw_mono_us = webrtc_demo::DecodeSinkMonotonicUs();
                 const qint64 wall_from_queue_us = t_after_draw_mono_us - m_glQueueTraceStartMonoUs;
                 const qint64 sum_upload_draw_us = m_lastUploadUs + tPaintUs;
+                int64_t decode_pipeline_start_us = 0;
+                const bool have_decode_to_render =
+                    webrtc_demo::TakeDecodePipelineStartMonotonicUs(tid, &decode_pipeline_start_us);
+                const double decode_to_render_ms =
+                    have_decode_to_render
+                        ? (t_after_draw_mono_us - decode_pipeline_start_us) / 1000.0
+                        : -1.0;
+                QString decode_to_render_str =
+                    have_decode_to_render
+                        ? QString::number(decode_to_render_ms, 'f', 3)
+                        : QStringLiteral("—");
                 qDebug().noquote() << QString(
                     "【耗时分析】 frame_id=%1 | 上传(CPU发GL): %2 ms | 绘制(draw): %3 ms | 上传+绘制: %4 ms | "
-                    "wall(OnFrame入队→render结束): %5 ms (含线程调度/队列; wall−sum 为排队开销; 与 tracking_id mod 120 对齐)")
+                    "wall(OnFrame入队→render结束): %5 ms | 总(Decode入口→render结束): %6 ms "
+                    "(Decode入口与 Mc/DecodeSink 同源单调钟; 与 tracking_id mod 120 对齐)")
                     .arg(m_glQueueTraceFrameId)
                     .arg(m_lastUploadUs / 1000.0, 0, 'f', 3)
                     .arg(tPaintUs / 1000.0, 0, 'f', 3)
                     .arg(sum_upload_draw_us / 1000.0, 0, 'f', 3)
-                    .arg(wall_from_queue_us / 1000.0, 0, 'f', 3);
+                    .arg(wall_from_queue_us / 1000.0, 0, 'f', 3)
+                    .arg(decode_to_render_str);
             }
         }
     }

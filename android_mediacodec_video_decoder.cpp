@@ -254,11 +254,11 @@ void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
              tm_local.tm_min, tm_local.tm_sec, static_cast<long long>(ms_part.count()));
     const int64_t steady_us = McMonotonicUs();
 
-    ALOGI(
-        "【耗时分析】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
-        "local_time=%s unix_ms=%lld steady_us=%lld",
-        static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
-        static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
+    // ALOGI(
+    //     "【耗时分析】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
+    //     "local_time=%s unix_ms=%lld steady_us=%lld",
+    //     static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
+    //     static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
   }
 }
 
@@ -812,6 +812,10 @@ int32_t AndroidMediaCodecVideoDecoder::Decode(const webrtc::EncodedImage& input_
   const bool key = (input_image.FrameType() == webrtc::VideoFrameType::kVideoFrameKey);
   const std::optional<uint16_t> video_frame_tracking_id = input_image.VideoFrameTrackingId();
   LogEncodedFrameTrackingIngress(video_frame_tracking_id, rtp_ts, key);
+  if (video_frame_tracking_id.has_value()) {
+    webrtc_demo::RecordDecodePipelineStartForE2eIfSampled(
+        static_cast<uint32_t>(*video_frame_tracking_id));
+  }
   // 端到端计时起点：与本帧 EncodedImage 对应（含后续排队、worker、Decoded 回调）。
   const int64_t decode_wall_t0_us = McMonotonicUs();
   LogMcDecodeIngress(input_image.data(), sz, rtp_ts, key, render_time_ms);
