@@ -274,25 +274,6 @@ Window {
                         }
                     }
 
-                    // // 编解码器信息打印：输出到 logcat，过滤 CODEC 查看
-                    // Button {
-                    //     Layout.fillWidth: true
-                    //     Layout.preferredHeight: 32
-                    //     text: "打印编解码器信息"
-                    //     onClicked: codecPrinter.printAllCodecs()
-                    //     background: Rectangle {
-                    //         radius: 6
-                    //         color: parent.pressed ? "#4B5563" : "#374151"
-                    //     }
-                    //     contentItem: Text {
-                    //         text: parent.text
-                    //         color: "#9CA3AF"
-                    //         font.pixelSize: 12
-                    //         horizontalAlignment: Text.AlignHCenter
-                    //         verticalAlignment: Text.AlignVCenter
-                    //     }
-                    // }
-
                     // 按钮区
                     RowLayout {
                         Layout.fillWidth: true

@@ -14,6 +14,11 @@ int32_t GetLastEncodedFrameTrackingIdForUi();
 
 void ResetEncodedFrameTrackingForUi();
 
+// 与信令/服务端对齐的采样：仅当存在 tracking id 且 (id % 120)==0 时打【耗时分析】；id 用 uint32_t 取模（可 >65535）。
+inline bool ShouldLogTrackingTimedSampleById(uint32_t id) {
+  return (id % 120u) == 0u;
+}
+
 }  // namespace webrtc_demo
 
 #endif

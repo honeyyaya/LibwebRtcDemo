@@ -48,8 +48,6 @@ int64_t McMonotonicUs() {
       .count();
 }
 
-std::atomic<uint64_t> g_mc_e2e_log_seq{0};
-
 namespace {
 
 // COLOR_FormatYUV420SemiPlanar
@@ -235,7 +233,7 @@ void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
     return;
   }
   webrtc_demo::RecordEncodedFrameTrackingId(tracking_id);
-  if (tracking_id.value() % 120u == 0u) {
+  if (webrtc_demo::ShouldLogTrackingTimedSampleById(static_cast<uint32_t>(tracking_id.value()))) {
     const auto now_sys = std::chrono::system_clock::now();
     const std::time_t t = std::chrono::system_clock::to_time_t(now_sys);
     const int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -257,7 +255,7 @@ void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
     const int64_t steady_us = McMonotonicUs();
 
     ALOGI(
-        "【重要日志！！！】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
+        "【耗时分析】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
         "local_time=%s unix_ms=%lld steady_us=%lld",
         static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
         static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
@@ -281,19 +279,19 @@ void LogMcDecodeIngress(const uint8_t* data,
                         uint32_t rtp_ts,
                         bool key,
                         int64_t render_time_ms) {
-  const uint64_t n = ++g_mc_decode_ingress_seq;
-  char head_hex[3 * 16 + 1] = {0};
-  const int nshow = (sz >= 16) ? 16 : static_cast<int>(sz);
-  for (int i = 0; i < nshow; ++i) {
-    snprintf(head_hex + i * 3, 4, "%02x ", static_cast<unsigned int>(data[i]));
-  }
-  if (n <= 10u || (n % 30u) == 0u) {
-    ALOGI(
-        "Decode ingress #%llu sz=%zu rtp_ts=%u key=%d render_ms=%lld head16=[%s] "
-        "(00 00 01=AnnexB; 4byte_len=AVCC)",
-        static_cast<unsigned long long>(n), sz, rtp_ts, key ? 1 : 0,
-        static_cast<long long>(render_time_ms), head_hex);
-  }
+  // const uint64_t n = ++g_mc_decode_ingress_seq;
+  // char head_hex[3 * 16 + 1] = {0};
+  // const int nshow = (sz >= 16) ? 16 : static_cast<int>(sz);
+  // for (int i = 0; i < nshow; ++i) {
+  //   snprintf(head_hex + i * 3, 4, "%02x ", static_cast<unsigned int>(data[i]));
+  // }
+  // if (n <= 10u || (n % 30u) == 0u) {
+  //   ALOGI(
+  //       "Decode ingress #%llu sz=%zu rtp_ts=%u key=%d render_ms=%lld head16=[%s] "
+  //       "(00 00 01=AnnexB; 4byte_len=AVCC)",
+  //       static_cast<unsigned long long>(n), sz, rtp_ts, key ? 1 : 0,
+  //       static_cast<long long>(render_time_ms), head_hex);
+  // }
 }
 
 }  // namespace
@@ -603,16 +601,15 @@ struct AndroidMediaCodecVideoDecoder::Impl {
             }
             cb->Decoded(frame);
             const int64_t t_after_decoded_cb = McMonotonicUs();
-            if (decode_wall_t0_us) {
+            if (decode_wall_t0_us && video_frame_tracking_id.has_value() &&
+                webrtc_demo::ShouldLogTrackingTimedSampleById(
+                    static_cast<uint32_t>(*video_frame_tracking_id))) {
               const int64_t e2e_us = t_after_decoded_cb - *decode_wall_t0_us;
-              const uint64_t n = ++g_mc_e2e_log_seq;
-              if (n <= 10u || (n % 30u) == 0u) {
-                ALOGI(
-                    "McE2E #%llu rtp_ts=%u e2e=%lldus (Decode入口->Decoded返回; "
-                    "含入队等待+worker+MediaCodec+NV12->I420+cb; 不含WebRTC后续sink)",
-                    static_cast<unsigned long long>(n), rtp_timestamp,
-                    static_cast<long long>(e2e_us));
-              }
+              ALOGI(
+                  "【耗时分析】硬件解码总耗时 McE2E tracking_id=%u rtp_ts=%u e2e=%lldus (Decode入口->Decoded返回; "
+                  "含入队等待+worker+MediaCodec+NV12->I420+cb; 不含WebRTC后续sink; 与 tracking_id mod 120 对齐)",
+                  static_cast<unsigned>(*video_frame_tracking_id), rtp_timestamp,
+                  static_cast<long long>(e2e_us));
             }
             // D→E：Decoded 返回时刻，供 sink 侧 OnFrame 计算 WebRTC 内部投递延迟。
             DecodeSinkRecordAfterDecoded(rtp_timestamp, t_after_decoded_cb);
@@ -742,25 +739,25 @@ struct AndroidMediaCodecVideoDecoder::Impl {
                    log_perf ? &d1 : nullptr, nullptr, e2e_t0_ptr, video_frame_tracking_id);
     }
 
-    if (log_perf) {
-      const int64_t worker_total_us = McMonotonicUs() - t_pf0;
-      ALOGI(
-          "McPerf #%llu worker_total=%lldus (prep=%lld deq_in=%lld memcpy_in=%lld q_in=%lld) | "
-          "drain0: tot=%lld deq=%lld getbuf=%lld nv12_i420=%lld decoded_cb=%lld rel=%lld out=%d | "
-          "drain1: tot=%lld deq=%lld getbuf=%lld nv12_i420=%lld decoded_cb=%lld rel=%lld out=%d | "
-          "feed_sz=%zu key=%d "
-          "(UI平均解码含WebRTC适配器+回调链，非本行总和)",
-          static_cast<unsigned long long>(pfn), static_cast<long long>(worker_total_us),
-          static_cast<long long>(prep_us), static_cast<long long>(deq_in_us),
-          static_cast<long long>(memcpy_in_us), static_cast<long long>(q_in_us),
-          static_cast<long long>(d0.total_us), static_cast<long long>(d0.dequeue_us),
-          static_cast<long long>(d0.get_out_buf_us), static_cast<long long>(d0.nv12_i420_us),
-          static_cast<long long>(d0.decoded_cb_us), static_cast<long long>(d0.release_us),
-          d0.out_buffers, static_cast<long long>(d1.total_us),
-          static_cast<long long>(d1.dequeue_us), static_cast<long long>(d1.get_out_buf_us),
-          static_cast<long long>(d1.nv12_i420_us), static_cast<long long>(d1.decoded_cb_us),
-          static_cast<long long>(d1.release_us), d1.out_buffers, feed_size, is_keyframe ? 1 : 0);
-    }
+    // if (log_perf) {
+    //   const int64_t worker_total_us = McMonotonicUs() - t_pf0;
+    //   ALOGI(
+    //       "McPerf #%llu worker_total=%lldus (prep=%lld deq_in=%lld memcpy_in=%lld q_in=%lld) | "
+    //       "drain0: tot=%lld deq=%lld getbuf=%lld nv12_i420=%lld decoded_cb=%lld rel=%lld out=%d | "
+    //       "drain1: tot=%lld deq=%lld getbuf=%lld nv12_i420=%lld decoded_cb=%lld rel=%lld out=%d | "
+    //       "feed_sz=%zu key=%d "
+    //       "(UI平均解码含WebRTC适配器+回调链，非本行总和)",
+    //       static_cast<unsigned long long>(pfn), static_cast<long long>(worker_total_us),
+    //       static_cast<long long>(prep_us), static_cast<long long>(deq_in_us),
+    //       static_cast<long long>(memcpy_in_us), static_cast<long long>(q_in_us),
+    //       static_cast<long long>(d0.total_us), static_cast<long long>(d0.dequeue_us),
+    //       static_cast<long long>(d0.get_out_buf_us), static_cast<long long>(d0.nv12_i420_us),
+    //       static_cast<long long>(d0.decoded_cb_us), static_cast<long long>(d0.release_us),
+    //       d0.out_buffers, static_cast<long long>(d1.total_us),
+    //       static_cast<long long>(d1.dequeue_us), static_cast<long long>(d1.get_out_buf_us),
+    //       static_cast<long long>(d1.nv12_i420_us), static_cast<long long>(d1.decoded_cb_us),
+    //       static_cast<long long>(d1.release_us), d1.out_buffers, feed_size, is_keyframe ? 1 : 0);
+    // }
   }
 };
 

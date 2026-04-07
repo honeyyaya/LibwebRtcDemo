@@ -10,11 +10,10 @@
 #include <QOpenGLShaderProgram>
 #include <QDebug>
 #include <QElapsedTimer>
+#include <algorithm>
 #include "api/video/video_frame_buffer.h"
 #include "api/video/video_rotation.h"
 #include "api/video/video_source_interface.h"
-
-#define STATS_INTERVAL 60
 
 #ifndef GL_UNPACK_ROW_LENGTH
 #define GL_UNPACK_ROW_LENGTH 0x0CF2
@@ -120,12 +119,22 @@ public:
 
         qint64 tPaintUs = paintTimer.nsecsElapsed() / 1000;
         m_renderFrameCount++;
-        if (m_renderFrameCount % STATS_INTERVAL == 0) {
-            qDebug().noquote() << QString(
-                "[VideoPerf-GL] render#%1 | 纹理上传: %2 ms | GPU渲染: %3 ms")
-                .arg(m_renderFrameCount)
-                .arg(m_lastUploadUs / 1000.0, 0, 'f', 2)
-                .arg(tPaintUs / 1000.0, 0, 'f', 2);
+
+        if (m_uploadStatsValidForLastSync && m_haveGlFrameTrace && m_glQueueTraceFromTracking) {
+            const uint32_t tid = static_cast<uint32_t>(std::max(0, m_glQueueTraceFrameId));
+            if (webrtc_demo::ShouldLogTrackingTimedSampleById(tid)) {
+                const int64_t t_after_draw_mono_us = webrtc_demo::DecodeSinkMonotonicUs();
+                const qint64 wall_from_queue_us = t_after_draw_mono_us - m_glQueueTraceStartMonoUs;
+                const qint64 sum_upload_draw_us = m_lastUploadUs + tPaintUs;
+                qDebug().noquote() << QString(
+                    "【耗时分析】 frame_id=%1 | 上传(CPU发GL): %2 ms | 绘制(draw): %3 ms | 上传+绘制: %4 ms | "
+                    "wall(OnFrame入队→render结束): %5 ms (含线程调度/队列; wall−sum 为排队开销; 与 tracking_id mod 120 对齐)")
+                    .arg(m_glQueueTraceFrameId)
+                    .arg(m_lastUploadUs / 1000.0, 0, 'f', 3)
+                    .arg(tPaintUs / 1000.0, 0, 'f', 3)
+                    .arg(sum_upload_draw_us / 1000.0, 0, 'f', 3)
+                    .arg(wall_from_queue_us / 1000.0, 0, 'f', 3);
+            }
         }
     }
 
@@ -150,8 +159,17 @@ public:
         }
 
         webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
-        if (!vi->takeFrame(i420) || !i420)
+        if (!vi->takeFrame(i420) || !i420) {
+            // 本帧未上传新纹理；render() 仍会画上一帧内容，m_lastUploadUs 不应再代表「本帧」。
+            m_uploadStatsValidForLastSync = false;
+            m_haveGlFrameTrace = false;
             return;
+        }
+
+        m_glQueueTraceStartMonoUs = vi->lastTakenGlQueueTraceStartMonoUs();
+        m_glQueueTraceFrameId = vi->lastTakenGlQueueTraceFrameId();
+        m_glQueueTraceFromTracking = vi->lastTakenGlQueueTraceFrameFromTracking();
+        m_haveGlFrameTrace = true;
 
         const int w = i420->width();
         const int h = i420->height();
@@ -168,7 +186,9 @@ public:
         UploadLuminancePlane(*this, m_useUnpackRowLength, GL_TEXTURE2, m_texV, hw, hh, i420->DataV(),
                              i420->StrideV());
 
+        // CPU 上 glTex(Sub)Image 返回耗时；驱动/GPU 可能异步拷贝，非「纹理已在显存就绪」的墙钟。
         m_lastUploadUs = uploadTimer.nsecsElapsed() / 1000;
+        m_uploadStatsValidForLastSync = true;
         m_hasData = true;
     }
 
@@ -228,6 +248,13 @@ private:
 
     int m_renderFrameCount = 0;
     qint64 m_lastUploadUs = 0;
+    /// 最近一次 synchronize 是否成功执行了 Y/U/V 上传（与随后 render 对应）。
+    bool m_uploadStatsValidForLastSync = false;
+
+    int64_t m_glQueueTraceStartMonoUs = 0;
+    int m_glQueueTraceFrameId = -1;
+    bool m_glQueueTraceFromTracking = false;
+    bool m_haveGlFrameTrace = false;
 
     bool m_uploadCapsChecked = false;
     bool m_useUnpackRowLength = false;
@@ -255,24 +282,26 @@ void WebRTCVideoRenderer::timerEvent(QTimerEvent *)
         m_lastPolledEncodedIngressId = cur;
         Q_EMIT encodedIngressTrackingChanged();
     }
-    if (m_hasVideo)
-        update();
+    // 画面重绘由 OnFrame 投递到 GUI 线程后 update()；此处仅轮询编码入站 tracking。
 }
 
 void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
 {
+    QElapsedTimer onFrameTotalTimer;
+    onFrameTotalTimer.start();
+
     const int64_t t_onframe_us = webrtc_demo::DecodeSinkMonotonicUs();
     const uint32_t rtp_ts = frame.rtp_timestamp();
     int64_t t_after_decoded = 0;
     if (webrtc_demo::DecodeSinkTakeDecodedReturn(rtp_ts, &t_after_decoded)) {
         const int64_t de_us = t_onframe_us - t_after_decoded;
-        static std::atomic<uint64_t> g_mc_de_seq{0};
-        const uint64_t n = ++g_mc_de_seq;
-        if (n <= 10u || (n % 30u) == 0u) {
+        const uint16_t fid = frame.id();
+        if (fid != webrtc::VideoFrame::kNotSetId &&
+            webrtc_demo::ShouldLogTrackingTimedSampleById(static_cast<uint32_t>(fid))) {
             qDebug().noquote() << QString(
-                "[VideoPerf] McDE #%1 rtp_ts=%2 de=%3us (Decoded返回->OnFrame入口; "
-                "WebRTC内部至sink线程)")
-                .arg(static_cast<quint64>(n))
+                "【耗时分析】WebRTC 从Decode -> OnFrame tracking_id=%1 rtp_ts=%2 de=%3us (Decoded返回->OnFrame入口; "
+                "WebRTC内部至sink线程; 与 tracking_id mod 120 对齐)")
+                .arg(static_cast<uint>(fid))
                 .arg(rtp_ts)
                 .arg(static_cast<qint64>(de_us));
         }
@@ -306,13 +335,20 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
     handoffTimer.start();
     qint64 tHandoffUs = 0;
     bool id_changed = false;
+    bool from_tracking_for_log = false;
+    int display_id_for_log = -1;
     {
         QMutexLocker lock(&m_frameMutex);
         const bool from_tracking = (raw_id != webrtc::VideoFrame::kNotSetId);
         const int display_id =
             from_tracking ? static_cast<int>(raw_id) : static_cast<int>(++m_localPreviewSeq);
+        from_tracking_for_log = from_tracking;
+        display_id_for_log = display_id;
         m_pendingI420 = i420;
         m_pendingValid = true;
+        m_pendingGlQueueTraceStartMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
+        m_pendingGlQueueTraceFrameId = display_id;
+        m_pendingGlQueueTraceFromTracking = from_tracking;
         if (m_highlightFrameId != display_id || m_frameIdFromTracking != from_tracking) {
             m_highlightFrameId = display_id;
             m_frameIdFromTracking = from_tracking;
@@ -326,18 +362,32 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
     }
 
     m_frameCount++;
-    if (m_frameCount % STATS_INTERVAL == 0) {
-        qDebug().noquote() << QString(
-            "[VideoPerf-GL] OnFrame#%1 | 投递(锁内挂接I420,无整帧拷贝): %2 ms | 帧间隔: %3 ms | 数据量: %4 KB")
-                .arg(m_frameCount)
-                .arg(tHandoffUs / 1000.0, 0, 'f', 3)
-                .arg(tIntervalUs / 1000.0, 0, 'f', 2)
-                .arg((w * h * 3 / 2) / 1024);
-    }
 
     if (!m_hasVideo) {
         m_hasVideo = true;
         QMetaObject::invokeMethod(this, [this]() { Q_EMIT hasVideoChanged(); }, Qt::QueuedConnection);
+    }
+
+    // OnFrame 在 WebRTC 工作线程；update() 必须在 GUI 线程调用，否则 Qt 报
+    // "Updates can only be scheduled from GUI thread or from QQuickItem::updatePaintNode()"。
+    QMetaObject::invokeMethod(
+        this,
+        [this]() {
+            update();
+        },
+        Qt::QueuedConnection);
+
+    const qint64 tOnFrameTotalUs = onFrameTotalTimer.nsecsElapsed() / 1000;
+    if (from_tracking_for_log &&
+        webrtc_demo::ShouldLogTrackingTimedSampleById(static_cast<uint32_t>(display_id_for_log))) {
+        qDebug().noquote() << QString(
+            "【耗时分析】 OnFrame tracking_id=%1 | 投递(锁内挂接I420,无整帧拷贝): %2 ms | 帧间隔: %3 ms | 数据量: %4 KB | "
+            "OnFrame整体: %5 ms (入口至返回,含ToI420与锁内挂接; 与 tracking_id mod 120 对齐)")
+                .arg(display_id_for_log)
+                .arg(tHandoffUs / 1000.0, 0, 'f', 3)
+                .arg(tIntervalUs / 1000.0, 0, 'f', 2)
+                .arg((w * h * 3 / 2) / 1024)
+                .arg(tOnFrameTotalUs / 1000.0, 0, 'f', 3);
     }
 }
 
@@ -366,9 +416,20 @@ bool WebRTCVideoRenderer::takeFrame(webrtc::scoped_refptr<webrtc::I420BufferInte
     if (!m_pendingValid || !m_pendingI420)
         return false;
     out = m_pendingI420;
+    m_lastTakenGlQueueTraceStartMonoUs = m_pendingGlQueueTraceStartMonoUs;
+    m_lastTakenGlQueueTraceFrameId = m_pendingGlQueueTraceFrameId;
+    m_lastTakenGlQueueTraceFromTracking = m_pendingGlQueueTraceFromTracking;
     m_pendingI420 = nullptr;
     m_pendingValid = false;
     return true;
+}
+
+void WebRTCVideoRenderer::setTraceTargetFrameId(int id)
+{
+    if (m_traceTargetFrameId == id)
+        return;
+    m_traceTargetFrameId = id;
+    Q_EMIT traceTargetFrameIdChanged();
 }
 
 QQuickFramebufferObject::Renderer *WebRTCVideoRenderer::createRenderer() const
@@ -404,6 +465,12 @@ void WebRTCVideoRenderer::clearVideoTrack()
         m_highlightFrameId = -1;
         m_frameIdFromTracking = false;
         m_localPreviewSeq = 0;
+        m_pendingGlQueueTraceFrameId = -1;
+        m_pendingGlQueueTraceStartMonoUs = 0;
+        m_pendingGlQueueTraceFromTracking = false;
+        m_lastTakenGlQueueTraceFrameId = -1;
+        m_lastTakenGlQueueTraceStartMonoUs = 0;
+        m_lastTakenGlQueueTraceFromTracking = false;
         id_reset = true;
     }
     if (m_hasVideo) {
@@ -414,5 +481,10 @@ void WebRTCVideoRenderer::clearVideoTrack()
         Q_EMIT highlightFrameIdChanged();
     }
     Q_EMIT encodedIngressTrackingChanged();
-    update();
+    QMetaObject::invokeMethod(
+        this,
+        [this]() {
+            update();
+        },
+        Qt::QueuedConnection);
 }
