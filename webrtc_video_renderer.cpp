@@ -10,6 +10,7 @@
 #include <QOpenGLShaderProgram>
 #include <QDebug>
 #include <QElapsedTimer>
+#include <QMetaObject>
 #include <algorithm>
 #include "api/video/video_frame_buffer.h"
 #include "api/video/video_rotation.h"
@@ -147,6 +148,17 @@ public:
                     .arg(sum_upload_draw_us / 1000.0, 0, 'f', 3)
                     .arg(wall_from_queue_us / 1000.0, 0, 'f', 3)
                     .arg(decode_to_render_str);
+
+                WebRTCVideoRenderer *vi = m_videoItem;
+                if (vi) {
+                    QMetaObject::invokeMethod(
+                        vi,
+                        "applySampledPipelineUi",
+                        Qt::QueuedConnection,
+                        Q_ARG(int, m_glQueueTraceFrameId),
+                        Q_ARG(double, decode_to_render_ms),
+                        Q_ARG(double, wall_from_queue_us / 1000.0));
+                }
             }
         }
     }
@@ -163,6 +175,7 @@ public:
         auto *vi = qobject_cast<WebRTCVideoRenderer *>(item);
         if (!vi)
             return;
+        m_videoItem = vi;
 
         if (!m_uploadCapsChecked) {
             m_uploadCapsChecked = true;
@@ -271,6 +284,8 @@ private:
 
     bool m_uploadCapsChecked = false;
     bool m_useUnpackRowLength = false;
+
+    WebRTCVideoRenderer *m_videoItem = nullptr;
 };
 
 // =============================================================================
@@ -445,6 +460,30 @@ void WebRTCVideoRenderer::setTraceTargetFrameId(int id)
     Q_EMIT traceTargetFrameIdChanged();
 }
 
+void WebRTCVideoRenderer::applySampledPipelineUi(int glTraceFrameId, double decodeToRenderTotalMs,
+                                                 double wallOnFrameToRenderMs)
+{
+    m_sampledHighlightFrameId = glTraceFrameId;
+    m_sampledDecodeToRenderMs = decodeToRenderTotalMs;
+    m_sampledWallOnFrameToRenderMs = wallOnFrameToRenderMs;
+    m_hasSampledPipelineUi = true;
+    Q_EMIT sampledPipelineStatsChanged();
+}
+
+QString WebRTCVideoRenderer::sampledPipelineLine() const
+{
+    if (!m_hasSampledPipelineUi)
+        return {};
+    const QString dtr = (m_sampledDecodeToRenderMs >= 0.0)
+                            ? QString::number(m_sampledDecodeToRenderMs, 'f', 3)
+                            : QStringLiteral("—");
+    return QStringLiteral("采样 highlight=%1 (=GL trace frame_id) | 总(Decode→render)=%2 ms | "
+                          "wall(OnFrame→render)=%3 ms（与 log 同 mod 120 采样）")
+        .arg(m_sampledHighlightFrameId)
+        .arg(dtr)
+        .arg(m_sampledWallOnFrameToRenderMs, 0, 'f', 3);
+}
+
 QQuickFramebufferObject::Renderer *WebRTCVideoRenderer::createRenderer() const
 {
     return new WebRTCGLRenderer();
@@ -492,6 +531,13 @@ void WebRTCVideoRenderer::clearVideoTrack()
     }
     if (id_reset) {
         Q_EMIT highlightFrameIdChanged();
+    }
+    if (m_hasSampledPipelineUi) {
+        m_sampledHighlightFrameId = -1;
+        m_sampledDecodeToRenderMs = -1.0;
+        m_sampledWallOnFrameToRenderMs = -1.0;
+        m_hasSampledPipelineUi = false;
+        Q_EMIT sampledPipelineStatsChanged();
     }
     Q_EMIT encodedIngressTrackingChanged();
     QMetaObject::invokeMethod(

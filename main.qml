@@ -139,15 +139,17 @@ Window {
                 }
 
                 Rectangle {
-                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
                     anchors.left: parent.left
                     anchors.margins: 10
-                    implicitWidth: Math.max(idIngress.implicitWidth, idDecoded.implicitWidth) + 16
+                    implicitWidth: Math.max(idIngress.implicitWidth, idDecoded.implicitWidth,
+                                              idPipeline.implicitWidth) + 16
                     implicitHeight: idColumn.implicitHeight + 16
                     radius: 4
                     color: "#B3000000"
                     visible: videoRenderer.hasEncodedIngressTracking
                              || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
+                             || videoRenderer.hasSampledPipelineUi
                     Column {
                         id: idColumn
                         anchors.centerIn: parent
@@ -176,6 +178,16 @@ Window {
                             font.pixelSize: 11
                             font.bold: videoRenderer.frameIdFromTracking
                             color: videoRenderer.frameIdFromTracking ? "#BBF7D0" : "#FDE68A"
+                        }
+                        Text {
+                            id: idPipeline
+                            width: Math.min(280, root.width - 64)
+                            visible: videoRenderer.hasSampledPipelineUi
+                            wrapMode: Text.WordWrap
+                            text: videoRenderer.sampledPipelineLine
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: "#93C5FD"
                         }
                     }
                 }

@@ -4,6 +4,7 @@
 #include <QQuickFramebufferObject>
 #include <QMutex>
 #include <QElapsedTimer>
+#include <QString>
 
 #include "api/media_stream_interface.h"
 #include "api/scoped_refptr.h"
@@ -30,6 +31,14 @@ class WebRTCVideoRenderer : public QQuickFramebufferObject,
     /// 设为 >=0 时仅对该 VideoFrame::id（或预览序号）打「上传+渲染」跟踪日志；-1 表示不筛选（仍按 STATS 间隔输出带 frame_id 的行）。
     Q_PROPERTY(int traceTargetFrameId READ traceTargetFrameId WRITE setTraceTargetFrameId NOTIFY
                    traceTargetFrameIdChanged)
+    /// 与 m_glQueueTraceFrameId 一致，仅在 tracking_id%120 采样刷新（Decode→render 总耗时展示行）。
+    Q_PROPERTY(int sampledHighlightFrameId READ sampledHighlightFrameId NOTIFY sampledPipelineStatsChanged)
+    Q_PROPERTY(double sampledDecodeToRenderMs READ sampledDecodeToRenderMs NOTIFY
+                   sampledPipelineStatsChanged)
+    Q_PROPERTY(double sampledWallOnFrameToRenderMs READ sampledWallOnFrameToRenderMs NOTIFY
+                   sampledPipelineStatsChanged)
+    Q_PROPERTY(QString sampledPipelineLine READ sampledPipelineLine NOTIFY sampledPipelineStatsChanged)
+    Q_PROPERTY(bool hasSampledPipelineUi READ hasSampledPipelineUi NOTIFY sampledPipelineStatsChanged)
     QML_ELEMENT
 
 public:
@@ -55,6 +64,17 @@ public:
     int traceTargetFrameId() const { return m_traceTargetFrameId; }
     void setTraceTargetFrameId(int id);
     Q_SIGNAL void traceTargetFrameIdChanged();
+
+    int sampledHighlightFrameId() const { return m_sampledHighlightFrameId; }
+    double sampledDecodeToRenderMs() const { return m_sampledDecodeToRenderMs; }
+    double sampledWallOnFrameToRenderMs() const { return m_sampledWallOnFrameToRenderMs; }
+    QString sampledPipelineLine() const;
+    bool hasSampledPipelineUi() const { return m_hasSampledPipelineUi; }
+    Q_SIGNAL void sampledPipelineStatsChanged();
+
+    /// 由 WebRTCGLRenderer::render 经 QMetaObject::invokeMethod 投递到 GUI 线程；glTraceFrameId 即 m_glQueueTraceFrameId。
+    Q_INVOKABLE void applySampledPipelineUi(int glTraceFrameId, double decodeToRenderTotalMs,
+                                            double wallOnFrameToRenderMs);
 
     Renderer *createRenderer() const override;
 
@@ -96,6 +116,11 @@ private:
     int m_lastTakenGlQueueTraceFrameId = -1;
     bool m_pendingGlQueueTraceFromTracking = false;
     bool m_lastTakenGlQueueTraceFromTracking = false;
+
+    int m_sampledHighlightFrameId = -1;
+    double m_sampledDecodeToRenderMs = -1.0;
+    double m_sampledWallOnFrameToRenderMs = -1.0;
+    bool m_hasSampledPipelineUi = false;
 };
 
 #endif

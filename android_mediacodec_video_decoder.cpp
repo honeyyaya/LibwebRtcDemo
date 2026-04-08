@@ -254,11 +254,11 @@ void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
              tm_local.tm_min, tm_local.tm_sec, static_cast<long long>(ms_part.count()));
     const int64_t steady_us = McMonotonicUs();
 
-    // ALOGI(
-    //     "【耗时分析】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
-    //     "local_time=%s unix_ms=%lld steady_us=%lld",
-    //     static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
-    //     static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
+    ALOGI(
+        "【耗时分析】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
+        "local_time=%s unix_ms=%lld steady_us=%lld",
+        static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
+        static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
   }
 }
 
