@@ -18,9 +18,18 @@
 class WebRTCReceiverClient : public QObject
 {
     Q_OBJECT
+    Q_PROPERTY(double rttCurrentMs READ rttCurrentMs NOTIFY connectionStatsChanged)
+    Q_PROPERTY(double rttAvgMs READ rttAvgMs NOTIFY connectionStatsChanged)
+    Q_PROPERTY(double jitterBufferMs READ jitterBufferMs NOTIFY connectionStatsChanged)
+    Q_PROPERTY(bool hasConnectionStats READ hasConnectionStats NOTIFY connectionStatsChanged)
 public:
     explicit WebRTCReceiverClient(QObject *parent = nullptr);
     ~WebRTCReceiverClient();
+
+    double rttCurrentMs() const { return m_rttCurrentMs; }
+    double rttAvgMs() const { return m_rttAvgMs; }
+    double jitterBufferMs() const { return m_jitterBufferMs; }
+    bool hasConnectionStats() const { return m_hasConnectionStats; }
 
     Q_INVOKABLE void connectToSignaling(const QString &addr = QString());
     Q_INVOKABLE void requestPermissionAndConnect(const QString &addr = QString());
@@ -31,6 +40,7 @@ public:
 Q_SIGNALS:
     void statusChanged(const QString &status);
     void remoteVideoTrackReady(webrtc::scoped_refptr<webrtc::VideoTrackInterface> track);
+    void connectionStatsChanged();
 
 private:
     class PeerConnectionObserverImpl;
@@ -73,6 +83,13 @@ private:
     QTimer *m_statsTimer = nullptr;
     void startStatsTimer();
     void stopStatsTimer();
+    void resetConnectionStats();
+
+    double m_rttCurrentMs = 0.0;
+    double m_rttAvgMs = 0.0;
+    double m_jitterBufferMs = 0.0;
+    bool m_hasConnectionStats = false;
+
     uint32_t m_prevFramesDecoded = 0;
     double m_prevTotalDecodeTime = 0.0;
     uint32_t m_prevFramesReceived = 0;

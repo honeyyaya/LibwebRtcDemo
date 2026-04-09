@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include <QDebug>
@@ -16,6 +17,7 @@
 #include "api/make_ref_counted.h"
 #include "api/media_types.h"
 #include "api/rtc_error.h"
+#include "api/rtp_receiver_interface.h"
 #include "api/rtp_transceiver_interface.h"
 #include "api/set_remote_description_observer_interface.h"
 #include "api/stats/rtc_stats_collector_callback.h"
@@ -208,6 +210,9 @@ class WebRTCReceiverClient::PeerConnectionObserverImpl : public webrtc::PeerConn
     auto receiver = transceiver->receiver();
     if (!receiver)
       return;
+    // 将抖动缓冲最小播放延迟设为 0 s（下限）；实际延迟仍可能 >0（重排序、拥塞控制等）。
+    receiver->SetJitterBufferMinimumDelay(std::optional<double>(0.0));
+    qDebug() << "[P2pPlayer] RtpReceiver SetJitterBufferMinimumDelay(0.0) 已应用 (video)";
     auto track = receiver->track();
     if (!track || track->kind() != std::string(webrtc::MediaStreamTrackInterface::kVideoKind))
       return;
@@ -393,21 +398,27 @@ void WebRTCReceiverClient::initWebRTC()
 void WebRTCReceiverClient::createPeerConnection()
 {
   // 须在 CreatePeerConnectionFactory 之前注册；全局至多一次（见 field_trial.h）。
-  static const char kVideoFrameTrackingFieldTrials[] =
-      "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+  // 与发送端保持一致：FrameTracking（RTP 扩展协商）+ FlexFEC-03（SDP 中带 flexfec-03，且启用 FEC 收包；可与 NACK 并存）。
+  static const char kReceiverFieldTrials[] =
+      "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/"
+      "WebRTC-FlexFEC-03-Advertised/Enabled/"
+      "WebRTC-FlexFEC-03/Enabled/";
   static bool field_trials_inited = false;
   if (!field_trials_inited) {
-    webrtc::field_trial::InitFieldTrialsFromString(kVideoFrameTrackingFieldTrials);
+    webrtc::field_trial::InitFieldTrialsFromString(kReceiverFieldTrials);
     field_trials_inited = true;
   }
-  const std::string trial_full_name =
-      webrtc::field_trial::FindFullName("WebRTC-VideoFrameTrackingIdAdvertised");
-  const bool tracking_trial_on =
-      webrtc::field_trial::IsEnabled("WebRTC-VideoFrameTrackingIdAdvertised");
-  VERIFY_LOG("2", QString("FieldTrial WebRTC-VideoFrameTrackingIdAdvertised: fullName=\"%1\", "
-                          "IsEnabled=%2")
-                        .arg(QString::fromStdString(trial_full_name))
-                        .arg(tracking_trial_on ? "true" : "false"));
+  auto log_trial = [](const char *name) {
+    const std::string full = webrtc::field_trial::FindFullName(name);
+    const bool on = webrtc::field_trial::IsEnabled(name);
+    VERIFY_LOG("2", QString("FieldTrial %1: fullName=\"%2\", IsEnabled=%3")
+                        .arg(name)
+                        .arg(QString::fromStdString(full))
+                        .arg(on ? "true" : "false"));
+  };
+  log_trial("WebRTC-VideoFrameTrackingIdAdvertised");
+  log_trial("WebRTC-FlexFEC-03-Advertised");
+  log_trial("WebRTC-FlexFEC-03");
 
   initWebRTC();
   if (!m_factory) {
@@ -421,6 +432,8 @@ void WebRTCReceiverClient::createPeerConnection()
 
   webrtc::PeerConnectionInterface::RTCConfiguration config;
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  // 音频 NetEq：最小目标延迟（ms），默认即为 0；显式写出便于与视频 RtpReceiver 策略一致。
+  config.audio_jitter_buffer_min_delay_ms = 0;
   webrtc::PeerConnectionInterface::IceServer ice_server;
   ice_server.urls.push_back("stun:stun.l.google.com:19302");
   config.servers.push_back(ice_server);
@@ -680,9 +693,16 @@ void WebRTCReceiverClient::startStatsTimer()
             double avgRttMs =
                 (responsesReceived > 0) ? (totalRtt / responsesReceived * 1000.0) : 0.0;
 
+            const double rttCurrentMs = currentRtt * 1000.0;
             QMetaObject::invokeMethod(
                 this,
                 [=]() {
+                  m_rttCurrentMs = rttCurrentMs;
+                  m_rttAvgMs = avgRttMs;
+                  m_jitterBufferMs = avgJitterMs;
+                  m_hasConnectionStats = true;
+                  Q_EMIT connectionStatsChanged();
+
                   qDebug().noquote() << QString(
                       "[DecodeStats] %1x%2 | 解码器: %3 | fps: %4 | "
                       "解码帧: +%5 (总%6) | 平均解码: %7 ms/帧 | "
@@ -704,7 +724,7 @@ void WebRTCReceiverClient::startStatsTimer()
                       "[NetStats] RTT: %1 ms (平均 %2 ms) | "
                       "抖动: %3 ms | 丢包率: %4% (%5/%6) | "
                       "NACK: %7 | PLI: %8 | FIR: %9 | FEC: %10")
-                      .arg(currentRtt * 1000.0, 0, 'f', 1)
+                      .arg(rttCurrentMs, 0, 'f', 1)
                       .arg(avgRttMs, 0, 'f', 1)
                       .arg(jitter * 1000.0, 0, 'f', 1)
                       .arg(lossRate, 0, 'f', 2)
@@ -739,5 +759,17 @@ void WebRTCReceiverClient::stopStatsTimer()
     m_statsTimer->deleteLater();
     m_statsTimer = nullptr;
     qDebug() << "[DecodeStats] 统计定时器已停止";
+  }
+  resetConnectionStats();
+}
+
+void WebRTCReceiverClient::resetConnectionStats()
+{
+  m_rttCurrentMs = 0.0;
+  m_rttAvgMs = 0.0;
+  m_jitterBufferMs = 0.0;
+  if (m_hasConnectionStats) {
+    m_hasConnectionStats = false;
+    Q_EMIT connectionStatsChanged();
   }
 }

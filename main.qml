@@ -6,7 +6,7 @@ import LibwebRtcDemo 1.0
 Window {
     id: root
     width: 420
-    height: 560
+    height: 600
     visible: true
     title: qsTr("LibWebRTC Demo")
     color: "#1A1A2E"
@@ -142,43 +142,42 @@ Window {
                     anchors.bottom: parent.bottom
                     anchors.left: parent.left
                     anchors.margins: 10
-                    implicitWidth: Math.max(idIngress.implicitWidth, idDecoded.implicitWidth,
-                                              idPipeline.implicitWidth) + 16
+                    implicitWidth:Math.max(bufferline.implicitWidth,rttline.implicitWidth,idPipeline.implicitWidth) + 16
                     implicitHeight: idColumn.implicitHeight + 16
                     radius: 4
                     color: "#B3000000"
                     visible: videoRenderer.hasEncodedIngressTracking
                              || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
                              || videoRenderer.hasSampledPipelineUi
-                    Column {
+                    Row {
                         id: idColumn
                         anchors.centerIn: parent
                         spacing: 4
-                        Text {
-                            id: idIngress
-                            width: Math.min(280, root.width - 64)
-                            visible: videoRenderer.hasEncodedIngressTracking
-                            wrapMode: Text.WordWrap
-                            text: "编码入站 ID: " + videoRenderer.encodedIngressTrackingId
-                                  + "（Decode 路径，与 logcat EncodedFrame 一致）"
-                            font.pixelSize: 11
-                            font.bold: true
-                            color: "#A5F3FC"
-                        }
-                        Text {
-                            id: idDecoded
-                            width: Math.min(280, root.width - 64)
-                            visible: videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0
-                            wrapMode: Text.WordWrap
-                            text: !videoRenderer.hasVideo || videoRenderer.highlightFrameId < 0
-                                  ? ""
-                                  : (videoRenderer.frameIdFromTracking
-                                     ? ("解码帧 ID: " + videoRenderer.highlightFrameId)
-                                     : ("解码预览 #" + videoRenderer.highlightFrameId))
-                            font.pixelSize: 11
-                            font.bold: videoRenderer.frameIdFromTracking
-                            color: videoRenderer.frameIdFromTracking ? "#BBF7D0" : "#FDE68A"
-                        }
+                        // Text {
+                        //     id: idIngress
+                        //     width: Math.min(280, root.width - 64)
+                        //     visible: videoRenderer.hasEncodedIngressTracking
+                        //     wrapMode: Text.WordWrap
+                        //     text: "编码入站 ID: " + videoRenderer.encodedIngressTrackingId
+                        //           + "（Decode 路径，与 logcat EncodedFrame 一致）"
+                        //     font.pixelSize: 11
+                        //     font.bold: true
+                        //     color: "#A5F3FC"
+                        // }
+                        // Text {
+                        //     id: idDecoded
+                        //     width: Math.min(280, root.width - 64)
+                        //     visible: videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0
+                        //     wrapMode: Text.WordWrap
+                        //     text: !videoRenderer.hasVideo || videoRenderer.highlightFrameId < 0
+                        //           ? ""
+                        //           : (videoRenderer.frameIdFromTracking
+                        //              ? ("解码帧 ID: " + videoRenderer.highlightFrameId)
+                        //              : ("解码预览 #" + videoRenderer.highlightFrameId))
+                        //     font.pixelSize: 11
+                        //     font.bold: videoRenderer.frameIdFromTracking
+                        //     color: videoRenderer.frameIdFromTracking ? "#BBF7D0" : "#FDE68A"
+                        // }
                         Text {
                             id: idPipeline
                             width: Math.min(280, root.width - 64)
@@ -189,7 +188,34 @@ Window {
                             font.bold: true
                             color: "#93C5FD"
                         }
+
+                        Text {
+                            id:bufferline
+                            Layout.fillWidth: true
+                            font.pixelSize: 11
+                            font.family: "monospace"
+                            color: "#9CA3AF"
+                            wrapMode: Text.WordWrap
+                            text: receiverClient.hasConnectionStats
+                                  ? ("抖动缓冲(帧平均): "
+                                     + receiverClient.jitterBufferMs.toFixed(1) + " ms")
+                                  : "抖动缓冲(帧平均): —"
+                        }
+                        Text {
+                            id:rttline
+                            Layout.fillWidth: true
+                            font.pixelSize: 11
+                            font.family: "monospace"
+                            color: "#9CA3AF"
+                            wrapMode: Text.WordWrap
+                            text: receiverClient.hasConnectionStats
+                                  ? ("RTT 当前: " + receiverClient.rttCurrentMs.toFixed(1) + " ms"
+                                     + "  |  平均: " + receiverClient.rttAvgMs.toFixed(1) + " ms")
+                                  : "RTT 当前 / 平均: —"
+                        }
                     }
+
+
                 }
 
                 Column {
@@ -218,7 +244,7 @@ Window {
             // ---------- 控制区 ----------
             Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 180
+                Layout.preferredHeight: 228
                 radius: 12
                 color: "#16213E"
                 border.color: "#0F3460"
@@ -250,6 +276,7 @@ Window {
                             maximumLineCount: 2
                         }
                     }
+
 
                     // 信令服务器地址（可编辑，连接时使用 urlField.text）
                     TextField {
