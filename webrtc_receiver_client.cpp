@@ -399,14 +399,16 @@ void WebRTCReceiverClient::createPeerConnection()
 {
   // 须在 CreatePeerConnectionFactory 之前注册；全局至多一次（见 field_trial.h）。
   // 与发送端保持一致：FrameTracking（RTP 扩展协商）+ FlexFEC-03（SDP 中带 flexfec-03，且启用 FEC 收包；可与 NACK 并存）。
-  static const char kReceiverFieldTrials[] =
-      "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/"
-      "WebRTC-FlexFEC-03-Advertised/Enabled/"
-      "WebRTC-FlexFEC-03/Enabled/";
+  static std::string g_field_trials_storage =
+      "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+  g_field_trials_storage +="WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:0/";
+  g_field_trials_storage += "WebRTC-ZeroPlayoutDelay/min_pacing:0ms,max_decode_queue_size:4/";
+  g_field_trials_storage +="WebRTC-Pacer-KeyframeFlushing/Enabled/";
+  g_field_trials_storage +="WebRTC-Pacer-FastRetransmissions/Enabled/";
   static bool field_trials_inited = false;
   if (!field_trials_inited) {
-    webrtc::field_trial::InitFieldTrialsFromString(kReceiverFieldTrials);
-    field_trials_inited = true;
+      webrtc::field_trial::InitFieldTrialsFromString(g_field_trials_storage.c_str());
+      field_trials_inited = true;
   }
   auto log_trial = [](const char *name) {
     const std::string full = webrtc::field_trial::FindFullName(name);
