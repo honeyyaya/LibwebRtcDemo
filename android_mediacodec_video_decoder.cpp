@@ -234,31 +234,32 @@ void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
   }
   webrtc_demo::RecordEncodedFrameTrackingId(tracking_id);
   if (webrtc_demo::ShouldLogTrackingTimedSampleById(static_cast<uint32_t>(tracking_id.value()))) {
-    const auto now_sys = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now_sys);
-    const int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                now_sys.time_since_epoch())
-                                .count();
-    const auto ms_part = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             now_sys.time_since_epoch()) %
-                         1000;
-    std::tm tm_local{};
-#if defined(WEBRTC_WIN)
-    localtime_s(&tm_local, &t);
-#else
-    localtime_r(&t, &tm_local);
-#endif
-    char local_time_str[80];
-    snprintf(local_time_str, sizeof(local_time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03lld",
-             tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday, tm_local.tm_hour,
-             tm_local.tm_min, tm_local.tm_sec, static_cast<long long>(ms_part.count()));
-    const int64_t steady_us = McMonotonicUs();
+      printLocalTime(static_cast<uint32_t>(tracking_id.value()));
+      //     const auto now_sys = std::chrono::system_clock::now();
+//     const std::time_t t = std::chrono::system_clock::to_time_t(now_sys);
+//     const int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+//                                 now_sys.time_since_epoch())
+//                                 .count();
+//     const auto ms_part = std::chrono::duration_cast<std::chrono::milliseconds>(
+//                              now_sys.time_since_epoch()) %
+//                          1000;
+//     std::tm tm_local{};
+// #if defined(WEBRTC_WIN)
+//     localtime_s(&tm_local, &t);
+// #else
+//     localtime_r(&t, &tm_local);
+// #endif
+//     char local_time_str[80];
+//     snprintf(local_time_str, sizeof(local_time_str), "%04d-%02d-%02d %02d:%02d:%02d.%03lld",
+//              tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday, tm_local.tm_hour,
+//              tm_local.tm_min, tm_local.tm_sec, static_cast<long long>(ms_part.count()));
+//     const int64_t steady_us = McMonotonicUs();
 
-    ALOGI(
-        "【耗时分析】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
-        "local_time=%s unix_ms=%lld steady_us=%lld",
-        static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
-        static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
+//     ALOGI(
+//         "【耗时分析】EncodedFrame VideoFrameTrackingId=%u rtp_ts=%u key=%d | "
+//         "local_time=%s unix_ms=%lld steady_us=%lld",
+//         static_cast<unsigned>(*tracking_id), rtp_ts, key ? 1 : 0, local_time_str,
+//         static_cast<long long>(unix_ms), static_cast<long long>(steady_us));
   }
 }
 

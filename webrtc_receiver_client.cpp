@@ -211,8 +211,8 @@ class WebRTCReceiverClient::PeerConnectionObserverImpl : public webrtc::PeerConn
     if (!receiver)
       return;
     // 将抖动缓冲最小播放延迟设为 0 s（下限）；实际延迟仍可能 >0（重排序、拥塞控制等）。
-    receiver->SetJitterBufferMinimumDelay(std::optional<double>(0.0));
-    qDebug() << "[P2pPlayer] RtpReceiver SetJitterBufferMinimumDelay(0.0) 已应用 (video)";
+    //receiver->SetJitterBufferMinimumDelay(std::optional<double>(0.0));
+    //qDebug() << "[P2pPlayer] RtpReceiver SetJitterBufferMinimumDelay(0.0) 已应用 (video)";
     auto track = receiver->track();
     if (!track || track->kind() != std::string(webrtc::MediaStreamTrackInterface::kVideoKind))
       return;
@@ -399,10 +399,13 @@ void WebRTCReceiverClient::createPeerConnection()
 {
   // 须在 CreatePeerConnectionFactory 之前注册；全局至多一次（见 field_trial.h）。
   // 与发送端保持一致：FrameTracking（RTP 扩展协商）+ FlexFEC-03（SDP 中带 flexfec-03，且启用 FEC 收包；可与 NACK 并存）。
-  static const char kReceiverFieldTrials[] =
-      "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/"
-      "WebRTC-FlexFEC-03-Advertised/Enabled/"
-      "WebRTC-FlexFEC-03/Enabled/";
+  // static const char kReceiverFieldTrials[] =
+  //     "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/"
+  //     "WebRTC-FlexFEC-03-Advertised/Enabled/"
+  //     "WebRTC-FlexFEC-03/Enabled/";
+    static const char kReceiverFieldTrials[] =
+       "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+
   static bool field_trials_inited = false;
   if (!field_trials_inited) {
     webrtc::field_trial::InitFieldTrialsFromString(kReceiverFieldTrials);

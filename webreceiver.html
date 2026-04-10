@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebView WebRTC 接收</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0F1629; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  </style>
+  <script src="qwebchannel.js"></script>
+</head>
+<body>
+  <video id="v" playsinline autoplay muted></video>
+  <script>
+    function queryParam(name) {
+      var m = new RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search);
+      return m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : null;
+    }
+
+    var pc = null;
+    var pending = [];
+    var bridge = null;
+
+    /// 相对页面内脚本起点（ms）
+    var tPage0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    function nowMs() {
+      return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    }
+    function sincePage() {
+      return Math.round((nowMs() - tPage0) * 100) / 100;
+    }
+
+    function reportTiming(obj) {
+      obj.t_wall_since_page_ms = sincePage();
+      var line = JSON.stringify(obj);
+      if (bridge && bridge.reportWebRtcTiming)
+        bridge.reportWebRtcTiming(line);
+      else
+        console.log('[WebRTC-TIMING]', line);
+    }
+
+    var statsIntervalId = null;
+    var statsPrevJbDelay = null;
+    var statsPrevJbEmitted = null;
+
+    function stopPlaybackStatsTimer() {
+      if (statsIntervalId != null) {
+        clearInterval(statsIntervalId);
+        statsIntervalId = null;
+      }
+      statsPrevJbDelay = null;
+      statsPrevJbEmitted = null;
+    }
+
+    function startPlaybackStatsTimer() {
+      stopPlaybackStatsTimer();
+      statsIntervalId = setInterval(pollPlaybackStats, 3000);
+    }
+
+    function pollPlaybackStats() {
+      if (!pc || !bridge || !bridge.reportPlaybackStats) return;
+      pc.getStats(null).then(function (report) {
+        var inbound = null;
+        var nominatedPair = null;
+        report.forEach(function (s) {
+          if (s.type === 'inbound-rtp') {
+            if (s.kind === 'video' || s.mediaType === 'video')
+              inbound = s;
+          }
+          if (s.type === 'candidate-pair' && s.nominated)
+            nominatedPair = s;
+        });
+        var out = { event: 'stats_3s', t_since_page_ms: sincePage() };
+        if (inbound) {
+          out.frame_width = inbound.frameWidth;
+          out.frame_height = inbound.frameHeight;
+          out.frames_per_second = inbound.framesPerSecond;
+          out.frames_decoded = inbound.framesDecoded;
+          out.frames_received = inbound.framesReceived;
+          out.frames_dropped = inbound.framesDropped;
+          out.bytes_received = inbound.bytesReceived;
+          out.packets_lost = inbound.packetsLost;
+          out.packets_received = inbound.packetsReceived;
+          if (typeof inbound.jitter === 'number')
+            out.jitter_ms = Math.round(inbound.jitter * 1000 * 100) / 100;
+          var jbd = inbound.jitterBufferDelay;
+          var jbe = inbound.jitterBufferEmittedCount;
+          if (typeof jbd === 'number' && typeof jbe === 'number') {
+            out.jitter_buffer_delay_total_s = Math.round(jbd * 100000) / 100000;
+            out.jitter_buffer_emitted_count = jbe;
+            if (statsPrevJbDelay != null && statsPrevJbEmitted != null) {
+              var dDelay = jbd - statsPrevJbDelay;
+              var dEmit = jbe - statsPrevJbEmitted;
+              if (dEmit > 0)
+                out.jitter_buffer_avg_ms = Math.round((dDelay / dEmit) * 1000000) / 1000;
+            }
+            statsPrevJbDelay = jbd;
+            statsPrevJbEmitted = jbe;
+          }
+          if (typeof inbound.totalDecodeTime === 'number' && inbound.framesDecoded > 0)
+            out.avg_decode_ms = Math.round((inbound.totalDecodeTime / inbound.framesDecoded) * 100000) / 100;
+          if (typeof inbound.totalProcessingDelay === 'number' && inbound.framesDecoded > 0)
+            out.avg_processing_ms = Math.round((inbound.totalProcessingDelay / inbound.framesDecoded) * 100000) / 100;
+        }
+        if (nominatedPair && typeof nominatedPair.currentRoundTripTime === 'number')
+          out.rtt_ms = Math.round(nominatedPair.currentRoundTripTime * 1000 * 100) / 100;
+        bridge.reportPlaybackStats(JSON.stringify(out));
+      }).catch(function (e) {
+        if (bridge) bridge.jsLog('getStats error: ' + e);
+      });
+    }
+
+    function flushPending() {
+      if (!pc) return;
+      var copy = pending;
+      pending = [];
+      copy.forEach(function (c) {
+        pc.addIceCandidate(c).catch(function (e) {
+          if (bridge) bridge.jsLog('addIceCandidate flush: ' + e);
+        });
+      });
+    }
+
+    function setupBridge(b) {
+      bridge = b;
+      reportTiming({ event: 'qwebchannel_ready', note: '信令桥对象已就绪' });
+
+      b.offerReceived.connect(function (sdp) {
+        var tOffer0 = nowMs();
+        stopPlaybackStatsTimer();
+        reportTiming({ event: 'offer_received', sdp_len: (sdp && sdp.length) ? sdp.length : 0 });
+
+        if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+        pending = [];
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
+        var firstTrackReported = false;
+        pc.ontrack = function (ev) {
+          var el = document.getElementById('v');
+          if (ev.streams && ev.streams[0])
+            el.srcObject = ev.streams[0];
+          if (!firstTrackReported && bridge) {
+            firstTrackReported = true;
+            reportTiming({
+              event: 'first_ontrack',
+              ms_since_offer: Math.round((nowMs() - tOffer0) * 100) / 100,
+              track_kind: ev.track ? ev.track.kind : ''
+            });
+          }
+        };
+
+        var iceSentCount = 0;
+        pc.onicecandidate = function (e) {
+          if (e.candidate && bridge) {
+            iceSentCount++;
+            if (iceSentCount === 1)
+              reportTiming({
+                event: 'first_local_ice_out',
+                ms_since_offer: Math.round((nowMs() - tOffer0) * 100) / 100
+              });
+            bridge.sendIceCandidate(
+              e.candidate.sdpMid || '',
+              (e.candidate.sdpMLineIndex != null ? e.candidate.sdpMLineIndex : 0),
+              e.candidate.candidate);
+          } else if (!e.candidate && bridge) {
+            reportTiming({
+              event: 'ice_gathering_done_ui',
+              local_ice_sent: iceSentCount,
+              ms_since_offer: Math.round((nowMs() - tOffer0) * 100) / 100
+            });
+          }
+        };
+
+        pc.onicegatheringstatechange = function () {
+          if (bridge && pc)
+            reportTiming({
+              event: 'ice_gathering_state',
+              state: pc.iceGatheringState,
+              ms_since_offer: Math.round((nowMs() - tOffer0) * 100) / 100
+            });
+        };
+
+        pc.oniceconnectionstatechange = function () {
+          if (bridge && pc)
+            reportTiming({
+              event: 'ice_connection_state',
+              state: pc.iceConnectionState,
+              ms_since_offer: Math.round((nowMs() - tOffer0) * 100) / 100
+            });
+        };
+
+        pc.onconnectionstatechange = function () {
+          if (bridge && pc) {
+            bridge.jsLog('connectionState=' + pc.connectionState);
+            bridge.notifyPeerState(pc.connectionState);
+            reportTiming({
+              event: 'peer_connection_state',
+              state: pc.connectionState,
+              ms_since_offer: Math.round((nowMs() - tOffer0) * 100) / 100
+            });
+            if (pc.connectionState === 'connected') {
+              reportTiming({
+                event: 'summary_connected',
+                ms_page_to_connected: Math.round((nowMs() - tPage0) * 100) / 100,
+                ms_offer_to_connected: Math.round((nowMs() - tOffer0) * 100) / 100
+              });
+              startPlaybackStatsTimer();
+              pollPlaybackStats();
+            }
+            if (pc.connectionState === 'failed' || pc.connectionState === 'closed')
+              stopPlaybackStatsTimer();
+          }
+        };
+
+        var t0 = nowMs();
+        pc.setRemoteDescription({ type: 'offer', sdp: sdp })
+          .then(function () {
+            var dSetRemote = nowMs() - t0;
+            reportTiming({ event: 'set_remote_description_ok', duration_ms: Math.round(dSetRemote * 100) / 100 });
+            flushPending();
+            t0 = nowMs();
+            return pc.createAnswer();
+          })
+          .then(function (answer) {
+            var dAnswer = nowMs() - t0;
+            reportTiming({ event: 'create_answer_ok', duration_ms: Math.round(dAnswer * 100) / 100 });
+            t0 = nowMs();
+            return pc.setLocalDescription(answer);
+          })
+          .then(function () {
+            var dSetLocal = nowMs() - t0;
+            reportTiming({ event: 'set_local_description_ok', duration_ms: Math.round(dSetLocal * 100) / 100 });
+            if (bridge && pc && pc.localDescription) {
+              bridge.sendAnswer(pc.localDescription.sdp);
+              reportTiming({
+                event: 'send_answer_called',
+                ms_since_offer: Math.round((nowMs() - tOffer0) * 100) / 100
+              });
+            }
+          })
+          .catch(function (e) {
+            if (bridge) bridge.jsLog('negotiation error: ' + e);
+            reportTiming({ event: 'negotiation_error', error: String(e) });
+          });
+      });
+
+      b.iceCandidateReceived.connect(function (mid, idx, cand) {
+        if (!pc || !cand) return;
+        var init = { candidate: cand, sdpMid: mid, sdpMLineIndex: idx };
+        if (!pc.remoteDescription) {
+          pending.push(init);
+          return;
+        }
+        pc.addIceCandidate(init).catch(function (e) {
+          if (bridge) bridge.jsLog('addIceCandidate: ' + e);
+        });
+      });
+
+      b.signalingClosed.connect(function () {
+        stopPlaybackStatsTimer();
+        if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+        pending = [];
+        var el = document.getElementById('v');
+        el.srcObject = null;
+        reportTiming({ event: 'signaling_closed_reset' });
+      });
+    }
+
+    var port = queryParam('ws_port');
+    if (!port) {
+      document.body.innerHTML = '<p style="color:#9ca3af;padding:16px">缺少 ws_port 参数</p>';
+    } else {
+      reportTiming({ event: 'page_ws_connect_start', ws_port: port });
+      var wsUrl = 'ws://127.0.0.1:' + port;
+      var ws = new WebSocket(wsUrl);
+      var tWsStart = nowMs();
+      var transport = {
+        send: function (data) {
+          if (typeof data !== 'string')
+            data = JSON.stringify(data);
+          ws.send(data);
+        },
+        onmessage: null
+      };
+      ws.onmessage = function (ev) {
+        if (transport.onmessage)
+          transport.onmessage({ data: ev.data });
+      };
+      ws.onerror = function () {
+        console.error('WebSocket error');
+        reportTiming({ event: 'websocket_error' });
+      };
+      ws.onopen = function () {
+        reportTiming({
+          event: 'websocket_open',
+          duration_connect_ms: Math.round((nowMs() - tWsStart) * 100) / 100
+        });
+        var tCh0 = nowMs();
+        new QWebChannel(transport, function (channel) {
+          reportTiming({
+            event: 'qwebchannel_constructed',
+            duration_ms: Math.round((nowMs() - tCh0) * 100) / 100
+          });
+          setupBridge(channel.objects.signalingBridge);
+        });
+      };
+    }
+  </script>
+</body>
+</html>

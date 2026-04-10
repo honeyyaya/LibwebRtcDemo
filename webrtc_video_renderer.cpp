@@ -148,7 +148,7 @@ public:
                     .arg(sum_upload_draw_us / 1000.0, 0, 'f', 3)
                     .arg(wall_from_queue_us / 1000.0, 0, 'f', 3)
                     .arg(decode_to_render_str);
-
+                webrtc_demo::printLocalTime(m_glQueueTraceFrameId);
                 WebRTCVideoRenderer *vi = m_videoItem;
                 if (vi) {
                     QMetaObject::invokeMethod(

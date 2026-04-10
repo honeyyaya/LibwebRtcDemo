@@ -30,5 +30,5 @@ bool DecodeSinkTakeDecodedReturn(uint32_t rtp_timestamp, int64_t* out_decoded_re
 // Android VideoDecoder::Decode 入口 → Qt FBO render() 完成；仅采样帧会记录（ShouldLogTrackingTimedSampleById）。
 void RecordDecodePipelineStartForE2eIfSampled(uint32_t tracking_id);
 bool TakeDecodePipelineStartMonotonicUs(uint32_t tracking_id, int64_t* out_start_us);
-
+void printLocalTime(int id);
 }  // namespace webrtc_demo

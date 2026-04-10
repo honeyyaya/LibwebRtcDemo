@@ -87,7 +87,7 @@ webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> CreatePeerConnecti
 #endif
   return webrtc::CreatePeerConnectionFactory(
       th.network.get(), th.worker.get(), th.signaling.get(),
-      adm,
+      nullptr,//adm,null
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
       nullptr,
