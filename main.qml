@@ -8,16 +8,17 @@ Window {
     width: 420
     height: 600
     visible: true
-    title: qsTr("LibWebRTC Demo")
+    title: qsTr("libRoboFlow Demo")
     color: "#1A1A2E"
     minimumWidth: 360
     minimumHeight: 480
 
     property string receiverStatus: "未连接"
-    // 方向3: 启动后延迟 1.5 秒再允许连接，确保 Activity/JNI 就绪后再连信令
     property bool connectReady: false
-    // 信令地址：TCP 直连信令服务器（JSON-per-line 协议）
     property string signalingUrl: "192.168.3.20:8765"
+    property string deviceId: ""
+    property string deviceSecret: ""
+    property int streamIndex: 0
     property string titleClockText: ""
 
     Timer {
@@ -32,7 +33,7 @@ Window {
     }
 
     Component.onCompleted: {
-        receiverStatus = "方向3 验证: 等待 Activity 就绪 (1.5s)..."
+        receiverStatus = "等待界面与 SDK 就绪..."
         connectReadyTimer.start()
     }
     Timer {
@@ -79,7 +80,7 @@ Window {
                     spacing: 14
 
                     Text {
-                        text: "LibWebRTC Demo"
+                        text: "libRoboFlow Demo"
                         font.pixelSize: 22
                         font.bold: true
                         color: "#E94560"
@@ -97,7 +98,7 @@ Window {
                 Text {
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "接收端"
+                        text: "客户端"
                     font.pixelSize: 12
                     color: "#6B7280"
                 }
@@ -231,7 +232,7 @@ Window {
                     }
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
-                        text: "青框+编码入站 ID=仅进解码器（黑屏时仍可见）；绿/橙=已解码出画"
+                        text: "视频将通过 libRoboFlow SDK 的 on_video 回调直接渲染"
                         font.pixelSize: 10
                         color: "#6B7280"
                         horizontalAlignment: Text.AlignHCenter
@@ -244,7 +245,7 @@ Window {
             // ---------- 控制区 ----------
             Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 228
+                Layout.preferredHeight: 312
                 radius: 12
                 color: "#16213E"
                 border.color: "#0F3460"
@@ -264,7 +265,9 @@ Window {
                             width: 8
                             height: 8
                             radius: 4
-                            color: receiverStatus.indexOf("已连接") >= 0 ? "#22C55E" : "#6B7280"
+                            color: (receiverStatus.indexOf("已连接") >= 0
+                                    || receiverStatus.indexOf("成功") >= 0
+                                    || receiverStatus.indexOf("接收视频") >= 0) ? "#22C55E" : "#6B7280"
                         }
                         Text {
                             Layout.fillWidth: true
@@ -278,12 +281,11 @@ Window {
                     }
 
 
-                    // 信令服务器地址（可编辑，连接时使用 urlField.text）
                     TextField {
                         id: urlField
                         Layout.fillWidth: true
                         Layout.preferredHeight: 36
-                        placeholderText: "host:port (如 192.168.3.20:8765)"
+                        placeholderText: "signal url / host:port"
                         text: root.signalingUrl
                         font.pixelSize: 11
                         color: "#E5E7EB"
@@ -294,11 +296,57 @@ Window {
                         }
                     }
 
-                    // 验证诊断：logcat 过滤 VERIFY（含延迟初始化、纯视频无录音权限、ABI 等）
+                    TextField {
+                        id: deviceIdField
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 36
+                        placeholderText: "device_id（可选）"
+                        text: root.deviceId
+                        font.pixelSize: 11
+                        color: "#E5E7EB"
+                        background: Rectangle {
+                            color: "#0F1629"
+                            border.color: "#0F3460"
+                            radius: 6
+                        }
+                    }
+
+                    TextField {
+                        id: deviceSecretField
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 36
+                        placeholderText: "device_secret（可选）"
+                        text: root.deviceSecret
+                        echoMode: TextInput.Password
+                        font.pixelSize: 11
+                        color: "#E5E7EB"
+                        background: Rectangle {
+                            color: "#0F1629"
+                            border.color: "#0F3460"
+                            radius: 6
+                        }
+                    }
+
+                    TextField {
+                        id: streamIndexField
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 36
+                        placeholderText: "stream index"
+                        text: root.streamIndex.toString()
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        font.pixelSize: 11
+                        color: "#E5E7EB"
+                        background: Rectangle {
+                            color: "#0F1629"
+                            border.color: "#0F3460"
+                            radius: 6
+                        }
+                    }
+
                     Button {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 32
-                        text: "验证诊断 (输出到 logcat)"
+                        text: "输出诊断日志"
                         onClicked: receiverClient.runVerificationDiagnostic()
                         background: Rectangle {
                             radius: 6
@@ -323,7 +371,12 @@ Window {
                             Layout.fillWidth: true
                             Layout.preferredHeight: 44
                             enabled: root.connectReady
-                            onClicked: receiverClient.requestPermissionAndConnect(urlField.text)
+                            onClicked: {
+                                receiverClient.deviceId = deviceIdField.text
+                                receiverClient.deviceSecret = deviceSecretField.text
+                                receiverClient.streamIndex = Number(streamIndexField.text || "0")
+                                receiverClient.requestPermissionAndConnect(urlField.text)
+                            }
 
                             background: Rectangle {
                                 radius: 8

@@ -2,18 +2,14 @@
 #define WEBRTC_RECEIVER_CLIENT_H
 
 #include <QObject>
-#include <QTimer>
-#include <memory>
-#include <string>
-#include <vector>
+#include <QMutex>
+#include <QString>
 
-#include "signaling_client.h"
+extern "C" {
+#include "rflow/Client/librflow_client_api.h"
+}
 
-#include "api/jsep.h"
-#include "api/media_stream_interface.h"
-#include "api/peer_connection_interface.h"
-#include "api/scoped_refptr.h"
-#include "api/set_remote_description_observer_interface.h"
+class WebRTCVideoRenderer;
 
 class WebRTCReceiverClient : public QObject
 {
@@ -22,14 +18,26 @@ class WebRTCReceiverClient : public QObject
     Q_PROPERTY(double rttAvgMs READ rttAvgMs NOTIFY connectionStatsChanged)
     Q_PROPERTY(double jitterBufferMs READ jitterBufferMs NOTIFY connectionStatsChanged)
     Q_PROPERTY(bool hasConnectionStats READ hasConnectionStats NOTIFY connectionStatsChanged)
+    Q_PROPERTY(QString deviceId READ deviceId WRITE setDeviceId NOTIFY deviceIdChanged)
+    Q_PROPERTY(QString deviceSecret READ deviceSecret WRITE setDeviceSecret NOTIFY deviceSecretChanged)
+    Q_PROPERTY(int streamIndex READ streamIndex WRITE setStreamIndex NOTIFY streamIndexChanged)
 public:
     explicit WebRTCReceiverClient(QObject *parent = nullptr);
-    ~WebRTCReceiverClient();
+    ~WebRTCReceiverClient() override;
 
     double rttCurrentMs() const { return m_rttCurrentMs; }
     double rttAvgMs() const { return m_rttAvgMs; }
     double jitterBufferMs() const { return m_jitterBufferMs; }
     bool hasConnectionStats() const { return m_hasConnectionStats; }
+
+    QString deviceId() const { return m_deviceId; }
+    void setDeviceId(const QString &deviceId);
+
+    QString deviceSecret() const { return m_deviceSecret; }
+    void setDeviceSecret(const QString &deviceSecret);
+
+    int streamIndex() const { return m_streamIndex; }
+    void setStreamIndex(int streamIndex);
 
     Q_INVOKABLE void connectToSignaling(const QString &addr = QString());
     Q_INVOKABLE void requestPermissionAndConnect(const QString &addr = QString());
@@ -39,63 +47,55 @@ public:
 
 Q_SIGNALS:
     void statusChanged(const QString &status);
-    void remoteVideoTrackReady(webrtc::scoped_refptr<webrtc::VideoTrackInterface> track);
     void connectionStatsChanged();
+    void deviceIdChanged();
+    void deviceSecretChanged();
+    void streamIndexChanged();
 
 private:
-    class PeerConnectionObserverImpl;
-    friend class PeerConnectionObserverImpl;
+    static void onConnectStateThunk(rflow_connect_state_t state, rflow_err_t reason, void *userdata);
+    static void onStreamStateThunk(librflow_stream_handle_t handle,
+                                   rflow_stream_state_t state,
+                                   rflow_err_t reason,
+                                   void *userdata);
+    static void onVideoFrameThunk(librflow_stream_handle_t handle,
+                                  librflow_video_frame_t frame,
+                                  void *userdata);
+    static void onStreamStatsThunk(librflow_stream_stats_t stats, void *userdata);
 
-    void initWebRTC();
-    void createPeerConnection();
-    void handleOffer(const std::string &type, const std::string &sdp);
-    void handleRemoteIceCandidate(const std::string &mid, int mline_index,
-                                  const std::string &candidate);
-    void addRemoteIceCandidateNow(const std::string &mid, int mline_index,
-                                  const std::string &candidate);
-    void flushPendingRemoteIceCandidates();
-    void doCreateAnswerAfterSetRemote();
+    rflow_err_t configureAndInitSdk(const QString &addr);
+    rflow_err_t connectSdk();
+    rflow_err_t openStream();
+    void closeStream();
+    void cleanupSdk();
 
-    std::unique_ptr<PeerConnectionObserverImpl> m_observer;
+    void handleConnectState(rflow_connect_state_t state, rflow_err_t reason);
+    void handleStreamState(rflow_stream_state_t state, rflow_err_t reason);
+    void handleStreamStats(librflow_stream_stats_t stats);
+    void schedulePendingFrameDelivery();
+    void deliverPendingFrame();
+    void clearPendingFrame();
+    void resetConnectionStats();
+    QString formatSdkError(const QString &prefix, rflow_err_t err) const;
 
-    std::unique_ptr<webrtc_demo::SignalingClient> m_signaling;
-
-    webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> m_factory;
-    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> m_peerConnection;
-
-    // SetRemoteDescription 异步完成前 AddIceCandidate 常失败；先排队，就绪后一次性加入。
-    struct PendingRemoteIce {
-        std::string mid;
-        int mline_index = 0;
-        std::string candidate;
-    };
-    std::vector<PendingRemoteIce> m_pendingRemoteIce;
-    bool m_remoteDescriptionApplied = false;
-
-    // SetRemote / CreateAnswer / SetLocal：异步完成前用成员持有 scoped_refptr，避免只剩栈上引用被析构导致回调不来。
-    webrtc::scoped_refptr<webrtc::SetRemoteDescriptionObserverInterface> m_pendingSetRemoteObserver;
-    webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver> m_pendingCreateAnswerObserver;
-    webrtc::scoped_refptr<webrtc::SetSessionDescriptionObserver> m_pendingSetLocalObserver;
-
-    bool m_webrtcInitialized = false;
     QObject *m_videoRenderer = nullptr;
 
-    QTimer *m_statsTimer = nullptr;
-    void startStatsTimer();
-    void stopStatsTimer();
-    void resetConnectionStats();
+    bool m_sdkInitialized = false;
+    bool m_connected = false;
+    librflow_stream_handle_t m_streamHandle = nullptr;
+
+    QString m_deviceId;
+    QString m_deviceSecret;
+    int m_streamIndex = 0;
+
+    mutable QMutex m_pendingFrameMutex;
+    librflow_video_frame_t m_pendingFrame = nullptr;
+    bool m_frameDeliveryPosted = false;
 
     double m_rttCurrentMs = 0.0;
     double m_rttAvgMs = 0.0;
     double m_jitterBufferMs = 0.0;
     bool m_hasConnectionStats = false;
-
-    uint32_t m_prevFramesDecoded = 0;
-    double m_prevTotalDecodeTime = 0.0;
-    uint32_t m_prevFramesReceived = 0;
-    uint32_t m_prevFramesDropped = 0;
-    double m_prevJitterBufferDelay = 0.0;
-    uint64_t m_prevJitterBufferEmitted = 0;
 };
 
 #endif
