@@ -6,11 +6,14 @@
 #include <QQuickFramebufferObject>
 #include <QString>
 
+#include "video_frame_sink.h"
+
 class WebRTCGLRenderer;
 
-class WebRTCVideoRenderer : public QQuickFramebufferObject
+class WebRTCVideoRenderer : public QQuickFramebufferObject, public VideoFrameSink
 {
     Q_OBJECT
+    Q_INTERFACES(VideoFrameSink)
     friend class WebRTCGLRenderer;
     Q_PROPERTY(bool hasVideo READ hasVideo NOTIFY hasVideoChanged)
     Q_PROPERTY(int highlightFrameId READ highlightFrameId NOTIFY highlightFrameIdChanged)
@@ -28,8 +31,8 @@ public:
     explicit WebRTCVideoRenderer(QQuickItem *parent = nullptr);
     ~WebRTCVideoRenderer() override;
 
-    Q_INVOKABLE void presentFrame(const QByteArray &i420, int width, int height, quint32 frameId);
-    Q_INVOKABLE void clearVideoTrack();
+    Q_INVOKABLE void presentFrame(QByteArray i420, int width, int height, quint32 frameId) override;
+    Q_INVOKABLE void clearVideoTrack() override;
 
     bool hasVideo() const { return m_hasVideo; }
     int highlightFrameId() const;
@@ -52,7 +55,7 @@ public:
 
     Renderer *createRenderer() const override;
 
-    bool takeFrame(QByteArray &outFrame, int &outWidth, int &outHeight);
+    bool takeFrame(QByteArray &outFrame, int &outWidth, int &outHeight, quint32 &outFrameId);
 
 Q_SIGNALS:
     void hasVideoChanged();

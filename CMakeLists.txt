@@ -18,6 +18,9 @@ set(RFLOW_CLIENT_SHARED_LIB "${RFLOW_LIB_DIR}/librflow_client.so" CACHE FILEPATH
 
 qt_add_executable(appLibwebRtcDemo
     main.cpp
+    latency_trace.h
+    latency_trace.cpp
+    video_frame_sink.h
     webrtc_receiver_client.h
     webrtc_receiver_client.cpp
     webrtc_video_renderer.h

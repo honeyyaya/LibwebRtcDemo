@@ -1,5 +1,6 @@
 #include "webrtc_receiver_client.h"
 
+#include "latency_trace.h"
 #include "webrtc_video_renderer.h"
 
 #include <QByteArray>
@@ -72,6 +73,7 @@ void WebRTCReceiverClient::requestPermissionAndConnect(const QString &addr)
 void WebRTCReceiverClient::connectToSignaling(const QString &addr)
 {
     disconnect();
+    demo::latency_trace::reset();
 
     const QString signalAddr = effectiveSignalAddr(addr);
     Q_EMIT statusChanged(QStringLiteral("正在初始化 libRoboFlow..."));
@@ -106,9 +108,10 @@ void WebRTCReceiverClient::disconnect()
     cleanupSdk();
     clearPendingFrame();
     resetConnectionStats();
+    demo::latency_trace::reset();
 
-    if (auto *renderer = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer)) {
-        renderer->clearVideoTrack();
+    if (m_videoSink) {
+        m_videoSink->clearVideoTrack();
     }
 
     Q_EMIT statusChanged(QStringLiteral("已断开"));
@@ -134,13 +137,19 @@ void WebRTCReceiverClient::runVerificationDiagnostic()
 
 void WebRTCReceiverClient::setVideoRenderer(QObject *renderer)
 {
-    if (m_videoRenderer == renderer) {
+    setVideoSink(renderer);
+}
+
+void WebRTCReceiverClient::setVideoSink(QObject *sink)
+{
+    if (m_videoRenderer == sink) {
         return;
     }
-    if (auto *oldRenderer = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer)) {
-        oldRenderer->clearVideoTrack();
+    if (m_videoSink) {
+        m_videoSink->clearVideoTrack();
     }
-    m_videoRenderer = renderer;
+    m_videoRenderer = sink;
+    m_videoSink = qobject_cast<VideoFrameSink *>(sink);
 }
 
 void WebRTCReceiverClient::onConnectStateThunk(rflow_connect_state_t state,
@@ -190,6 +199,14 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
     if (!self || !frame) {
         return;
     }
+
+    const quint32 frameId = librflow_video_frame_get_seq(frame);
+    demo::latency_trace::recordSdkCallback(frameId,
+                                           librflow_video_frame_get_pts_ms(frame),
+                                           librflow_video_frame_get_utc_ms(frame),
+                                           librflow_video_frame_get_width(frame),
+                                           librflow_video_frame_get_height(frame),
+                                           librflow_video_frame_get_data_size(frame));
 
     librflow_video_frame_t retained = librflow_video_frame_retain(frame);
     if (!retained) {
@@ -438,14 +455,15 @@ void WebRTCReceiverClient::deliverPendingFrame()
         const uint8_t *data = librflow_video_frame_get_data(frame);
         const quint32 frameId = librflow_video_frame_get_seq(frame);
         const quint64 expectedSize = static_cast<quint64>(width) * static_cast<quint64>(height) * 3ull / 2ull;
+        demo::latency_trace::recordUiDispatch(frameId);
 
         if (codec == RFLOW_CODEC_I420 && data && width > 0 && height > 0 && size >= expectedSize) {
-            if (auto *renderer = qobject_cast<WebRTCVideoRenderer *>(m_videoRenderer)) {
-                renderer->presentFrame(QByteArray(reinterpret_cast<const char *>(data),
-                                                 static_cast<int>(expectedSize)),
-                                       static_cast<int>(width),
-                                       static_cast<int>(height),
-                                       frameId);
+            if (m_videoSink) {
+                m_videoSink->presentFrame(QByteArray(reinterpret_cast<const char *>(data),
+                                                     static_cast<int>(expectedSize)),
+                                          static_cast<int>(width),
+                                          static_cast<int>(height),
+                                          frameId);
             }
         } else {
             qWarning().noquote()

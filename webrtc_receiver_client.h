@@ -5,6 +5,8 @@
 #include <QMutex>
 #include <QString>
 
+#include "video_frame_sink.h"
+
 extern "C" {
 #include "rflow/Client/librflow_client_api.h"
 }
@@ -44,6 +46,7 @@ public:
     Q_INVOKABLE void disconnect();
     Q_INVOKABLE void runVerificationDiagnostic();
     Q_INVOKABLE void setVideoRenderer(QObject *renderer);
+    Q_INVOKABLE void setVideoSink(QObject *sink);
 
 Q_SIGNALS:
     void statusChanged(const QString &status);
@@ -79,6 +82,7 @@ private:
     QString formatSdkError(const QString &prefix, rflow_err_t err) const;
 
     QObject *m_videoRenderer = nullptr;
+    VideoFrameSink *m_videoSink = nullptr;
 
     bool m_sdkInitialized = false;
     bool m_connected = false;

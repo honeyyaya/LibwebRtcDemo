@@ -1,10 +1,12 @@
 #include "webrtc_video_renderer.h"
+#include "latency_trace.h"
 
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLShaderProgram>
 #include <QMutexLocker>
+#include <utility>
 
 #ifndef GL_UNPACK_ROW_LENGTH
 #define GL_UNPACK_ROW_LENGTH 0x0CF2
@@ -133,6 +135,11 @@ public:
         m_program.disableAttributeArray(0);
         m_program.disableAttributeArray(1);
         m_program.release();
+
+        if (m_hasFrameId) {
+            demo::latency_trace::recordRender(m_currentFrameId);
+            m_hasFrameId = false;
+        }
     }
 
     QOpenGLFramebufferObject *createFramebufferObject(const QSize &size) override
@@ -159,9 +166,13 @@ public:
         QByteArray frame;
         int width = 0;
         int height = 0;
-        if (!rendererItem->takeFrame(frame, width, height) || frame.isEmpty() || width <= 0 || height <= 0) {
+        quint32 frameId = 0;
+        if (!rendererItem->takeFrame(frame, width, height, frameId) || frame.isEmpty() || width <= 0 || height <= 0) {
             return;
         }
+        demo::latency_trace::recordSync(frameId);
+        m_currentFrameId = frameId;
+        m_hasFrameId = true;
 
         const int ySize = width * height;
         const int chromaWidth = width / 2;
@@ -246,6 +257,8 @@ private:
     GLuint m_texU = 0;
     GLuint m_texV = 0;
     bool m_hasData = false;
+    quint32 m_currentFrameId = 0;
+    bool m_hasFrameId = false;
     bool m_uploadCapsChecked = false;
     bool m_useUnpackRowLength = false;
 };
@@ -263,7 +276,7 @@ WebRTCVideoRenderer::~WebRTCVideoRenderer()
     clearVideoTrack();
 }
 
-void WebRTCVideoRenderer::presentFrame(const QByteArray &i420, int width, int height, quint32 frameId)
+void WebRTCVideoRenderer::presentFrame(QByteArray i420, int width, int height, quint32 frameId)
 {
     if (width <= 0 || height <= 0) {
         return;
@@ -273,11 +286,14 @@ void WebRTCVideoRenderer::presentFrame(const QByteArray &i420, int width, int he
     if (i420.size() < expectedSize) {
         return;
     }
+    if (i420.size() > expectedSize) {
+        i420.truncate(expectedSize);
+    }
 
     bool highlightChanged = false;
     {
         QMutexLocker locker(&m_frameMutex);
-        m_pendingFrame = i420.left(expectedSize);
+        m_pendingFrame = std::move(i420);
         m_pendingWidth = width;
         m_pendingHeight = height;
         m_pendingValid = true;
@@ -287,6 +303,7 @@ void WebRTCVideoRenderer::presentFrame(const QByteArray &i420, int width, int he
             highlightChanged = true;
         }
     }
+    demo::latency_trace::recordPresent(frameId, width, height);
 
     if (!m_hasVideo) {
         m_hasVideo = true;
@@ -380,16 +397,16 @@ QQuickFramebufferObject::Renderer *WebRTCVideoRenderer::createRenderer() const
     return new WebRTCGLRendererImpl();
 }
 
-bool WebRTCVideoRenderer::takeFrame(QByteArray &outFrame, int &outWidth, int &outHeight)
+bool WebRTCVideoRenderer::takeFrame(QByteArray &outFrame, int &outWidth, int &outHeight, quint32 &outFrameId)
 {
     QMutexLocker locker(&m_frameMutex);
     if (!m_pendingValid || m_pendingFrame.isEmpty()) {
         return false;
     }
-    outFrame = m_pendingFrame;
+    outFrame = std::move(m_pendingFrame);
     outWidth = m_pendingWidth;
     outHeight = m_pendingHeight;
-    m_pendingFrame.clear();
+    outFrameId = static_cast<quint32>(m_highlightFrameId >= 0 ? m_highlightFrameId : 0);
     m_pendingValid = false;
     return true;
 }
