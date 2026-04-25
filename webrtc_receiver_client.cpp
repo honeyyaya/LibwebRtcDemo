@@ -107,6 +107,8 @@ void WebRTCReceiverClient::disconnect()
     cleanupSdk();
     clearPendingFrame();
     resetConnectionStats();
+    m_overwrittenPendingFrames = 0;
+    m_deliveredFrames = 0;
     demo::latency_trace::reset();
 
     if (m_videoSink) {
@@ -215,6 +217,13 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
     {
         QMutexLocker locker(&self->m_pendingFrameMutex);
         if (self->m_pendingFrame) {
+            ++self->m_overwrittenPendingFrames;
+            if (self->m_overwrittenPendingFrames <= 5 || (self->m_overwrittenPendingFrames % 60) == 0) {
+                qInfo().noquote()
+                    << QStringLiteral("[RenderQueue] overwrite pending frame total=%1 incoming_frame=%2")
+                           .arg(self->m_overwrittenPendingFrames)
+                           .arg(frameId);
+            }
             librflow_video_frame_release(self->m_pendingFrame);
         }
         self->m_pendingFrame = retained;
@@ -460,6 +469,15 @@ void WebRTCReceiverClient::deliverPendingFrame()
 
         if (supportedFrame) {
             if (m_videoSink) {
+                ++m_deliveredFrames;
+                if (m_deliveredFrames <= 5 || (m_deliveredFrames % 120) == 0) {
+                    qInfo().noquote()
+                        << QStringLiteral("[RenderQueue] delivered=%1 overwritten=%2 frame=%3 codec=%4")
+                               .arg(m_deliveredFrames)
+                               .arg(m_overwrittenPendingFrames)
+                               .arg(frameId)
+                               .arg(codec);
+                }
                 m_videoSink->presentFrame(frame);
                 frame = nullptr;
             }

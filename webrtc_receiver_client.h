@@ -95,6 +95,8 @@ private:
     mutable QMutex m_pendingFrameMutex;
     librflow_video_frame_t m_pendingFrame = nullptr;
     bool m_frameDeliveryPosted = false;
+    quint64 m_overwrittenPendingFrames = 0;
+    quint64 m_deliveredFrames = 0;
 
     double m_rttCurrentMs = 0.0;
     double m_rttAvgMs = 0.0;
