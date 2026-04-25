@@ -2,6 +2,7 @@
 #define WEBRTC_VIDEO_RENDERER_H
 
 #include <QQuickFramebufferObject>
+#include <QRectF>
 #include <QMutex>
 #include <QElapsedTimer>
 #include <QString>
@@ -14,6 +15,8 @@
 
 class WebRTCGLRenderer;
 
+/// 远程帧路径（典型）：OnFrame(非主线程) → 队列 update() → 下一场景图帧里 synchronize() → render() → 再经窗口合成，故常见约 1 帧(≈16ms@60Hz) 的隐藏时延，threaded S.G. 时偶发 2 帧。
+/// 缓解：主程序可用 QSG_RENDER_LOOP=basic（见 main.cpp）；最省延迟需改结构（OES+同上下文、QSG 纹理节点、QQuickRenderControl/原生子窗口 等）而非本类单独修完。
 class WebRTCVideoRenderer : public QQuickFramebufferObject,
                             public webrtc::VideoSinkInterface<webrtc::VideoFrame>
 {
@@ -78,8 +81,9 @@ public:
 
     Renderer *createRenderer() const override;
 
-    // 传出 I420 引用；纹理上传在 GL 线程完成，避免 OnFrame 整帧 memcpy。
-    bool takeFrame(webrtc::scoped_refptr<webrtc::I420BufferInterface> &out);
+    /// 传出本帧的 VideoFrameBuffer：可为 I420 平面缓冲，或 kNative 的 OesEglTextureFrameBuffer（OES / EGLImage 外纹理）；
+    /// 纹理在 GL 线程与 synchronize 中绑定/更新，OnFrame 仅持引用、不整帧 CPU 拷。
+    bool takeFrame(webrtc::scoped_refptr<webrtc::VideoFrameBuffer> &out);
 
     // 最近一次 takeFrame 对应的跟踪元数据（仅 GL 线程在 takeFrame 之后读取）。
     int64_t lastTakenGlQueueTraceStartMonoUs() const { return m_lastTakenGlQueueTraceStartMonoUs; }
@@ -88,13 +92,15 @@ public:
 
 protected:
     void timerEvent(QTimerEvent *event) override;
+    void geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry) override;
 
 private:
+    void applyVideoSinkWants();
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> m_track;
     bool m_hasVideo = false;
 
     mutable QMutex m_frameMutex;
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> m_pendingI420;
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> m_pendingBuffer;
     bool m_pendingValid = false;
 
     int m_highlightFrameId = -1;

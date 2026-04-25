@@ -1,3 +1,7 @@
+// 当前实现：AMediaCodec 走 ByteBuffer 出 NV12 → CPU 再转 I420。要「第二刀」彻底避免 ToI420() 并走
+// OesEglTextureFrameBuffer：需 ANativeWindow + Surface（典型为 SurfaceTexture 的 Surface），
+// glGenTextures+SurfaceTexture(oes)->configure MediaCodec 输出，Decoded 里 CreateOesEglTextureFrameBuffer
+// 并在与 OES 同 GL 上下文的线程 updateTexImage。可与 VideoSinkWants/渲染侧 OES 路径配套。
 #include "android_mediacodec_video_decoder.h"
 #include "encoded_tracking_bridge.h"
 #include "video_decode_sink_timing_bridge.h"
@@ -463,7 +467,6 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 #if __ANDROID_API__ >= 30
     AMediaFormat_setInt32(format, kMediaFormatLowLatency, 1);
 #endif
-
     media_status_t st = AMediaCodec_configure(codec_, format, nullptr, nullptr, 0);
     AMediaFormat_delete(format);
     if (st != AMEDIA_OK) {
@@ -821,17 +824,17 @@ int32_t AndroidMediaCodecVideoDecoder::Decode(const webrtc::EncodedImage& input_
   const int64_t decode_wall_t0_us = McMonotonicUs();
   LogMcDecodeIngress(input_image.data(), sz, rtp_ts, key, render_time_ms);
 
-  std::vector<uint8_t> copy(sz);
-  memcpy(copy.data(), input_image.data(), sz);
+  // EncodedImage 仅在本调用内有效，异步入队须自有缓冲。用 shared_ptr+vector 持有一份字节，worker 上通过 data()/size 直接指针进 MediaCodec，不经过 Qt 字节类。
+  auto enc_owned = std::make_shared<std::vector<uint8_t>>(input_image.data(), input_image.data() + sz);
 
   {
     std::lock_guard<std::mutex> lk(impl_->mu_);
     if (!impl_->running_) {
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
-    impl_->tasks_.push_back([this, copy = std::move(copy), render_time_ms, rtp_ts, key,
-                             decode_wall_t0_us, video_frame_tracking_id]() mutable {
-      impl_->ProcessOneFrame(copy, render_time_ms, rtp_ts, key, decode_wall_t0_us,
+    impl_->tasks_.push_back([this, enc_owned, render_time_ms, rtp_ts, key, decode_wall_t0_us,
+                             video_frame_tracking_id]() mutable {
+      impl_->ProcessOneFrame(*enc_owned, render_time_ms, rtp_ts, key, decode_wall_t0_us,
                              video_frame_tracking_id);
     });
   }

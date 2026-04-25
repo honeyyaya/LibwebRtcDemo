@@ -1,5 +1,6 @@
 {
     "recommendations": [
-        "anysphere.remote-ssh"
+        "anysphere.remote-ssh",
+        "openai.chatgpt"
     ]
 }
