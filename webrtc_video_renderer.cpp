@@ -36,7 +36,15 @@ struct I420PlaneTexCache {
 struct PlaneUploadPbo {
     GLuint ids[2] = {0, 0};
     size_t capacities[2] = {0, 0};
-    int next_index = 0;
+    int next_stage_index = 0;
+    int ready_index = -1;
+    int ready_w = 0;
+    int ready_h = 0;
+    int ready_stride_bytes = 0;
+    GLenum ready_internal_format = GL_LUMINANCE;
+    GLenum ready_format = GL_LUMINANCE;
+    int ready_bytes_per_pixel = 1;
+    bool ready = false;
 };
 
 namespace {
@@ -152,9 +160,60 @@ void UploadPlaneTight(QOpenGLExtraFunctions &gl,
     }
 }
 
-void UploadPlaneViaPbo(QOpenGLExtraFunctions &gl,
-                       GLenum texture_unit,
-                       GLuint tex,
+void ResetPlaneUploadPbo(PlaneUploadPbo *pbo)
+{
+    if (!pbo) {
+        return;
+    }
+    pbo->next_stage_index = 0;
+    pbo->ready_index = -1;
+    pbo->ready_w = 0;
+    pbo->ready_h = 0;
+    pbo->ready_stride_bytes = 0;
+    pbo->ready_internal_format = GL_LUMINANCE;
+    pbo->ready_format = GL_LUMINANCE;
+    pbo->ready_bytes_per_pixel = 1;
+    pbo->ready = false;
+}
+
+bool UploadPlaneFromReadyPbo(QOpenGLExtraFunctions &gl,
+                             GLenum texture_unit,
+                             GLuint tex,
+                             bool supports_unpack_row_length,
+                             I420PlaneTexCache *cached,
+                             PlaneUploadPbo *pbo)
+{
+    if (!pbo || !pbo->ready || pbo->ready_index < 0) {
+        return false;
+    }
+
+    gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo->ids[pbo->ready_index]);
+    gl.glActiveTexture(texture_unit);
+    gl.glBindTexture(GL_TEXTURE_2D, tex);
+    const bool same_size = cached && cached->w == pbo->ready_w && cached->h == pbo->ready_h;
+    if (cached && !same_size) {
+        cached->w = pbo->ready_w;
+        cached->h = pbo->ready_h;
+    }
+    if (!same_size) {
+        gl.glTexImage2D(GL_TEXTURE_2D, 0, pbo->ready_internal_format, pbo->ready_w, pbo->ready_h,
+                        0, pbo->ready_format, GL_UNSIGNED_BYTE, nullptr);
+    }
+    gl.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (supports_unpack_row_length) {
+        gl.glPixelStorei(GL_UNPACK_ROW_LENGTH,
+                         pbo->ready_stride_bytes / pbo->ready_bytes_per_pixel);
+    }
+    gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, pbo->ready_w, pbo->ready_h, pbo->ready_format,
+                       GL_UNSIGNED_BYTE, nullptr);
+    if (supports_unpack_row_length) {
+        gl.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    }
+    gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    return true;
+}
+
+bool StagePlaneIntoPbo(QOpenGLExtraFunctions &gl,
                        int plane_w,
                        int plane_h,
                        GLenum internal_format,
@@ -163,19 +222,15 @@ void UploadPlaneViaPbo(QOpenGLExtraFunctions &gl,
                        const uint8_t *plane_data,
                        int src_stride_bytes,
                        bool supports_unpack_row_length,
-                       I420PlaneTexCache *cached,
                        PlaneUploadPbo *pbo)
 {
     if (!pbo || (!pbo->ids[0] && !pbo->ids[1])) {
-        UploadPlaneTight(gl, texture_unit, tex, plane_w, plane_h, internal_format, format,
-                         bytes_per_pixel, plane_data, src_stride_bytes, supports_unpack_row_length,
-                         cached);
-        return;
+        return false;
     }
 
-    const int index = pbo->next_index;
+    const int index = pbo->next_stage_index;
     const GLuint upload_pbo = pbo->ids[index];
-    pbo->next_index = (index + 1) % 2;
+    pbo->next_stage_index = (index + 1) % 2;
 
     const size_t upload_bytes =
         (supports_unpack_row_length && src_stride_bytes != plane_w * bytes_per_pixel)
@@ -192,43 +247,62 @@ void UploadPlaneViaPbo(QOpenGLExtraFunctions &gl,
                                        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
     if (!mapped) {
         gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        UploadPlaneTight(gl, texture_unit, tex, plane_w, plane_h, internal_format, format,
-                         bytes_per_pixel, plane_data, src_stride_bytes, supports_unpack_row_length,
-                         cached);
-        return;
+        return false;
     }
 
     CopyPlaneForUpload(static_cast<uint8_t *>(mapped), plane_data, src_stride_bytes, plane_w,
                        plane_h, bytes_per_pixel, supports_unpack_row_length);
     if (gl.glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER) == GL_FALSE) {
         gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-        UploadPlaneTight(gl, texture_unit, tex, plane_w, plane_h, internal_format, format,
-                         bytes_per_pixel, plane_data, src_stride_bytes, supports_unpack_row_length,
-                         cached);
-        return;
+        return false;
     }
-
-    gl.glActiveTexture(texture_unit);
-    gl.glBindTexture(GL_TEXTURE_2D, tex);
-    const bool same_size = cached && cached->w == plane_w && cached->h == plane_h;
-    if (cached && !same_size) {
-        cached->w = plane_w;
-        cached->h = plane_h;
-    }
-    if (!same_size) {
-        gl.glTexImage2D(GL_TEXTURE_2D, 0, internal_format, plane_w, plane_h, 0, format,
-                        GL_UNSIGNED_BYTE, nullptr);
-    }
-    gl.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    if (supports_unpack_row_length) {
-        gl.glPixelStorei(GL_UNPACK_ROW_LENGTH, src_stride_bytes / bytes_per_pixel);
-    }
-    gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, plane_w, plane_h, format, GL_UNSIGNED_BYTE,
-                       nullptr);
     if (supports_unpack_row_length) {
         gl.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     }
     gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    pbo->ready_index = index;
+    pbo->ready_w = plane_w;
+    pbo->ready_h = plane_h;
+    pbo->ready_stride_bytes = src_stride_bytes;
+    pbo->ready_internal_format = internal_format;
+    pbo->ready_format = format;
+    pbo->ready_bytes_per_pixel = bytes_per_pixel;
+    pbo->ready = true;
+    return true;
+}
+
+bool UploadPlaneViaPboAsync(QOpenGLExtraFunctions &gl,
+                            GLenum texture_unit,
+                            GLuint tex,
+                            int plane_w,
+                            int plane_h,
+                            GLenum internal_format,
+                            GLenum format,
+                            int bytes_per_pixel,
+                            const uint8_t *plane_data,
+                            int src_stride_bytes,
+                            bool supports_unpack_row_length,
+                            I420PlaneTexCache *cached,
+                            PlaneUploadPbo *pbo)
+{
+    if (!pbo || (!pbo->ids[0] && !pbo->ids[1])) {
+        UploadPlaneTight(gl, texture_unit, tex, plane_w, plane_h, internal_format, format,
+                         bytes_per_pixel, plane_data, src_stride_bytes, supports_unpack_row_length,
+                         cached);
+        return true;
+    }
+
+    const bool uploaded = UploadPlaneFromReadyPbo(gl, texture_unit, tex, supports_unpack_row_length,
+                                                  cached, pbo);
+    if (!StagePlaneIntoPbo(gl, plane_w, plane_h, internal_format, format, bytes_per_pixel,
+                           plane_data, src_stride_bytes, supports_unpack_row_length, pbo)) {
+        ResetPlaneUploadPbo(pbo);
+        UploadPlaneTight(gl, texture_unit, tex, plane_w, plane_h, internal_format, format,
+                         bytes_per_pixel, plane_data, src_stride_bytes, supports_unpack_row_length,
+                         cached);
+        return true;
+    }
+    return uploaded;
 }
 
 }  // namespace
@@ -462,6 +536,13 @@ public:
     }
 
 private:
+    enum class UploadPathKind {
+        None,
+        Oes,
+        Nv12,
+        I420,
+    };
+
     static constexpr GLfloat kTexCoords[8] = {
         0.0f, 1.0f, 1.0f, 1.0f,
         0.0f, 0.0f, 1.0f, 0.0f
@@ -519,6 +600,14 @@ private:
         std::copy(std::begin(verts), std::end(verts), m_vertices);
     }
 
+    void resetCpuUploadPipeline()
+    {
+        ResetPlaneUploadPbo(&m_pboY);
+        ResetPlaneUploadPbo(&m_pboU);
+        ResetPlaneUploadPbo(&m_pboV);
+        ResetPlaneUploadPbo(&m_pboUV);
+    }
+
     void uploadPendingFrame()
     {
         m_pendingUpload = false;
@@ -531,6 +620,10 @@ private:
 #if defined(__ANDROID__)
         if (webrtc_demo::OesEglTextureFrameBuffer *const oes =
                 webrtc_demo::OesEglTextureFrameBuffer::Cast(m_heldBuffer.get())) {
+            if (m_lastUploadPath != UploadPathKind::Oes) {
+                resetCpuUploadPipeline();
+                m_lastUploadPath = UploadPathKind::Oes;
+            }
             if (m_oesProgramLinked) {
                 m_frameIsOes = true;
                 m_oesTextureId = static_cast<GLuint>(oes->oes_texture_id());
@@ -554,6 +647,11 @@ private:
         m_frameIsNv12 = false;
 
         if (const webrtc::NV12BufferInterface *nv12 = m_heldBuffer->GetNV12()) {
+            if (m_lastUploadPath != UploadPathKind::Nv12) {
+                resetCpuUploadPipeline();
+                m_lastUploadPath = UploadPathKind::Nv12;
+                m_hasData = false;
+            }
             const int w = nv12->width();
             const int h = nv12->height();
             const int hw = nv12->ChromaWidth();
@@ -561,13 +659,17 @@ private:
 
             QElapsedTimer uploadTimer;
             uploadTimer.start();
+            bool uploaded = false;
             if (m_supportsPixelUnpackBuffer) {
-                UploadPlaneViaPbo(*this, GL_TEXTURE0, m_texY, w, h, GL_LUMINANCE,
-                                  GL_LUMINANCE, 1, nv12->DataY(), nv12->StrideY(),
-                                  m_supportsUnpackRowLength, &m_planeCacheY, &m_pboY);
-                UploadPlaneViaPbo(*this, GL_TEXTURE1, m_texUV, hw, hh, GL_LUMINANCE_ALPHA,
-                                  GL_LUMINANCE_ALPHA, 2, nv12->DataUV(), nv12->StrideUV(),
-                                  m_supportsUnpackRowLength, &m_planeCacheUV, &m_pboUV);
+                const bool y_uploaded = UploadPlaneViaPboAsync(
+                    *this, GL_TEXTURE0, m_texY, w, h, GL_LUMINANCE, GL_LUMINANCE, 1,
+                    nv12->DataY(), nv12->StrideY(), m_supportsUnpackRowLength, &m_planeCacheY,
+                    &m_pboY);
+                const bool uv_uploaded = UploadPlaneViaPboAsync(
+                    *this, GL_TEXTURE1, m_texUV, hw, hh, GL_LUMINANCE_ALPHA, GL_LUMINANCE_ALPHA, 2,
+                    nv12->DataUV(), nv12->StrideUV(), m_supportsUnpackRowLength, &m_planeCacheUV,
+                    &m_pboUV);
+                uploaded = y_uploaded && uv_uploaded;
             } else {
                 const uint8_t *const pY = PrepareTightPlaneIfNeeded(
                     nv12->DataY(), nv12->StrideY(), w, h, m_supportsUnpackRowLength, &m_tightY);
@@ -591,16 +693,22 @@ private:
                                  GL_LUMINANCE_ALPHA, 2, pUV,
                                  m_supportsUnpackRowLength ? nv12->StrideUV() : uv_row_bytes,
                                  m_supportsUnpackRowLength, &m_planeCacheUV);
+                uploaded = true;
             }
 
             m_lastUploadUs = uploadTimer.nsecsElapsed() / 1000;
-            m_uploadStatsValidForLastFrame = true;
-            m_hasData = true;
-            m_frameIsNv12 = true;
+            m_uploadStatsValidForLastFrame = uploaded;
+            m_hasData = m_hasData || uploaded;
+            m_frameIsNv12 = m_hasData;
             m_heldBuffer = nullptr;
             return;
         }
 
+        if (m_lastUploadPath != UploadPathKind::I420) {
+            resetCpuUploadPipeline();
+            m_lastUploadPath = UploadPathKind::I420;
+            m_hasData = false;
+        }
         webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 =
             webrtc_demo::ResolveI420ForUpload(m_heldBuffer);
         if (!i420) {
@@ -616,16 +724,18 @@ private:
 
         QElapsedTimer uploadTimer;
         uploadTimer.start();
+        bool uploaded = false;
         if (m_supportsPixelUnpackBuffer) {
-            UploadPlaneViaPbo(*this, GL_TEXTURE0, m_texY, w, h, GL_LUMINANCE, GL_LUMINANCE, 1,
-                              i420->DataY(), i420->StrideY(), m_supportsUnpackRowLength,
-                              &m_planeCacheY, &m_pboY);
-            UploadPlaneViaPbo(*this, GL_TEXTURE1, m_texU, hw, hh, GL_LUMINANCE, GL_LUMINANCE, 1,
-                              i420->DataU(), i420->StrideU(), m_supportsUnpackRowLength,
-                              &m_planeCacheU, &m_pboU);
-            UploadPlaneViaPbo(*this, GL_TEXTURE2, m_texV, hw, hh, GL_LUMINANCE, GL_LUMINANCE, 1,
-                              i420->DataV(), i420->StrideV(), m_supportsUnpackRowLength,
-                              &m_planeCacheV, &m_pboV);
+            const bool y_uploaded = UploadPlaneViaPboAsync(
+                *this, GL_TEXTURE0, m_texY, w, h, GL_LUMINANCE, GL_LUMINANCE, 1, i420->DataY(),
+                i420->StrideY(), m_supportsUnpackRowLength, &m_planeCacheY, &m_pboY);
+            const bool u_uploaded = UploadPlaneViaPboAsync(
+                *this, GL_TEXTURE1, m_texU, hw, hh, GL_LUMINANCE, GL_LUMINANCE, 1, i420->DataU(),
+                i420->StrideU(), m_supportsUnpackRowLength, &m_planeCacheU, &m_pboU);
+            const bool v_uploaded = UploadPlaneViaPboAsync(
+                *this, GL_TEXTURE2, m_texV, hw, hh, GL_LUMINANCE, GL_LUMINANCE, 1, i420->DataV(),
+                i420->StrideV(), m_supportsUnpackRowLength, &m_planeCacheV, &m_pboV);
+            uploaded = y_uploaded && u_uploaded && v_uploaded;
         } else {
             const uint8_t *const pY = PrepareTightPlaneIfNeeded(
                 i420->DataY(), i420->StrideY(), w, h, m_supportsUnpackRowLength, &m_tightY);
@@ -639,11 +749,12 @@ private:
                              i420->StrideU(), m_supportsUnpackRowLength, &m_planeCacheU);
             UploadPlaneTight(*this, GL_TEXTURE2, m_texV, hw, hh, GL_LUMINANCE, GL_LUMINANCE, 1, pV,
                              i420->StrideV(), m_supportsUnpackRowLength, &m_planeCacheV);
+            uploaded = true;
         }
 
         m_lastUploadUs = uploadTimer.nsecsElapsed() / 1000;
-        m_uploadStatsValidForLastFrame = true;
-        m_hasData = true;
+        m_uploadStatsValidForLastFrame = uploaded;
+        m_hasData = m_hasData || uploaded;
         m_heldBuffer = nullptr;
     }
 
@@ -799,6 +910,7 @@ private:
     bool m_supportsPixelUnpackBuffer = false;
     bool m_frameIsNv12 = false;
     bool m_frameIsOes = false;
+    UploadPathKind m_lastUploadPath = UploadPathKind::None;
 #if defined(__ANDROID__)
     QOpenGLShaderProgram m_programOes;
     bool m_oesProgramLinked = false;
@@ -886,6 +998,7 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
     int w = 0;
     int h = 0;
     bool oes_native = false;
+    bool is_nv12 = false;
 
     if (webrtc_demo::OesEglTextureFrameBuffer::Cast(buffer.get())) {
         // kNative OES / SurfaceTexture：不经过 ToI420
@@ -893,6 +1006,12 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
         w = buffer->width();
         h = buffer->height();
         oes_native = true;
+    } else if (buffer->GetNV12()) {
+        // 已是 NV12：直接挂接同一缓冲引用，避免退回 ToI420()
+        pending = buffer;
+        w = buffer->width();
+        h = buffer->height();
+        is_nv12 = true;
     } else if (buffer->GetI420()) {
         // 已是 I420：只挂接同一缓冲引用，避免 ToI420()
         pending = buffer;
@@ -965,12 +1084,15 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame &frame)
         webrtc_demo::ShouldLogTrackingTimedSampleById(static_cast<uint32_t>(display_id_for_log))) {
         qDebug().noquote() << QString(
             "【耗时分析】 OnFrame tracking_id=%1 | 投递(锁内挂接buffer,无整帧拷贝): %2 ms | 帧间隔: %3 ms | 数据量: %4 | "
-            "OnFrame整体: %5 ms (入口至返回,含ToI420/Native与锁内挂接; 与 tracking_id mod 120 对齐)")
+            "OnFrame整体: %5 ms (入口至返回,含NV12/I420/OES适配与锁内挂接; 与 tracking_id mod 120 对齐)")
                 .arg(display_id_for_log)
                 .arg(tHandoffUs / 1000.0, 0, 'f', 3)
                 .arg(tIntervalUs / 1000.0, 0, 'f', 2)
-                .arg(oes_native ? QStringLiteral("OES/kNative 纹理")
-                                : QString::number((w * h * 3 / 2) / 1024) + QStringLiteral(" KB"))
+                .arg(oes_native
+                         ? QStringLiteral("OES/kNative 纹理")
+                         : (is_nv12
+                                ? QStringLiteral("NV12 双平面")
+                                : QString::number((w * h * 3 / 2) / 1024) + QStringLiteral(" KB")))
                 .arg(tOnFrameTotalUs / 1000.0, 0, 'f', 3);
     }
 }

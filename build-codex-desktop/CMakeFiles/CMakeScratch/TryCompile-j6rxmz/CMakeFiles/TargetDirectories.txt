@@ -1,0 +1,3 @@
+D:/software/Code/LibwebRtcDemo/build-codex-desktop/CMakeFiles/CMakeScratch/TryCompile-j6rxmz/CMakeFiles/cmTC_f1bb1.dir
+D:/software/Code/LibwebRtcDemo/build-codex-desktop/CMakeFiles/CMakeScratch/TryCompile-j6rxmz/CMakeFiles/edit_cache.dir
+D:/software/Code/LibwebRtcDemo/build-codex-desktop/CMakeFiles/CMakeScratch/TryCompile-j6rxmz/CMakeFiles/rebuild_cache.dir
