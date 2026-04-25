@@ -2,18 +2,17 @@
 #define WEBRTC_VIDEO_RENDERER_H
 
 #include <QMutex>
-#include <QQuickFramebufferObject>
+#include <QQuickItem>
 #include <QString>
 
 #include "video_frame_sink.h"
 
-class WebRTCGLRenderer;
+class QSGNode;
 
-class WebRTCVideoRenderer : public QQuickFramebufferObject, public VideoFrameSink
+class WebRTCVideoRenderer : public QQuickItem, public VideoFrameSink
 {
     Q_OBJECT
     Q_INTERFACES(VideoFrameSink)
-    friend class WebRTCGLRenderer;
     Q_PROPERTY(bool hasVideo READ hasVideo NOTIFY hasVideoChanged)
     Q_PROPERTY(int highlightFrameId READ highlightFrameId NOTIFY highlightFrameIdChanged)
     Q_PROPERTY(bool frameIdFromTracking READ frameIdFromTracking NOTIFY highlightFrameIdChanged)
@@ -52,8 +51,6 @@ public:
                                             double decodeToRenderTotalMs,
                                             double wallOnFrameToRenderMs);
 
-    Renderer *createRenderer() const override;
-
     bool takeFrame(librflow_video_frame_t &outFrame, quint32 &outFrameId);
 
 Q_SIGNALS:
@@ -63,7 +60,13 @@ Q_SIGNALS:
     void traceTargetFrameIdChanged();
     void sampledPipelineStatsChanged();
 
+protected:
+    QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
+    void geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry) override;
+
 private:
+    friend class WebRTCVideoRenderNode;
+
     mutable QMutex m_frameMutex;
     librflow_video_frame_t m_pendingFrame = nullptr;
     bool m_pendingValid = false;
