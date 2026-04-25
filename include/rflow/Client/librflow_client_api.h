@@ -101,7 +101,22 @@ typedef void (*librflow_on_stream_state_fn)(librflow_stream_handle_t handle,
                                             rflow_err_t reason,
                                             void *userdata);
 
-/** 视频帧到达；frame 仅回调栈内有效，跨栈持有用 librflow_video_frame_retain */
+/*
+ * Video frame callback. `frame` is only guaranteed to stay valid within the
+ * callback stack; call librflow_video_frame_retain() if you need to hold it.
+ *
+ * Recommended access pattern:
+ *   - I420: use librflow_video_frame_get_plane_* for Y/U/V
+ *   - NV12: use librflow_video_frame_get_plane_* for Y and interleaved UV
+ *   - use librflow_video_frame_get_data/get_data_size only when your pipeline
+ *     strictly requires one contiguous buffer
+ *
+ * Example:
+ *   rflow_codec_t codec = librflow_video_frame_get_codec(frame);
+ *   uint32_t planes = librflow_video_frame_get_plane_count(frame);
+ *   const uint8_t* p0 = librflow_video_frame_get_plane_data(frame, 0);
+ *   uint32_t s0 = librflow_video_frame_get_plane_stride(frame, 0);
+ */
 typedef void (*librflow_on_video_frame_fn)(librflow_stream_handle_t handle,
                                            librflow_video_frame_t frame,
                                            void *userdata);

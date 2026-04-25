@@ -3,7 +3,6 @@
 #include "latency_trace.h"
 #include "webrtc_video_renderer.h"
 
-#include <QByteArray>
 #include <QDebug>
 #include <QMetaObject>
 #include <QPointer>
@@ -451,29 +450,31 @@ void WebRTCReceiverClient::deliverPendingFrame()
         const rflow_codec_t codec = librflow_video_frame_get_codec(frame);
         const uint32_t width = librflow_video_frame_get_width(frame);
         const uint32_t height = librflow_video_frame_get_height(frame);
-        const uint32_t size = librflow_video_frame_get_data_size(frame);
-        const uint8_t *data = librflow_video_frame_get_data(frame);
         const quint32 frameId = librflow_video_frame_get_seq(frame);
-        const quint64 expectedSize = static_cast<quint64>(width) * static_cast<quint64>(height) * 3ull / 2ull;
+        const uint32_t planeCount = librflow_video_frame_get_plane_count(frame);
         demo::latency_trace::recordUiDispatch(frameId);
 
-        if (codec == RFLOW_CODEC_I420 && data && width > 0 && height > 0 && size >= expectedSize) {
+        const bool supportedFrame =
+            ((codec == RFLOW_CODEC_I420 && planeCount >= 3) || (codec == RFLOW_CODEC_NV12 && planeCount >= 2)) &&
+            width > 0 && height > 0;
+
+        if (supportedFrame) {
             if (m_videoSink) {
-                m_videoSink->presentFrame(QByteArray(reinterpret_cast<const char *>(data),
-                                                     static_cast<int>(expectedSize)),
-                                          static_cast<int>(width),
-                                          static_cast<int>(height),
-                                          frameId);
+                m_videoSink->presentFrame(frame);
+                frame = nullptr;
             }
         } else {
             qWarning().noquote()
-                << QStringLiteral("Unsupported frame from libRoboFlow: codec=%1 size=%2 expected=%3")
+                << QStringLiteral("Unsupported frame from libRoboFlow: codec=%1 planes=%2 size=%3x%4")
                        .arg(codec)
-                       .arg(size)
-                       .arg(expectedSize);
+                       .arg(planeCount)
+                       .arg(width)
+                       .arg(height);
         }
 
-        librflow_video_frame_release(frame);
+        if (frame) {
+            librflow_video_frame_release(frame);
+        }
     }
 
     bool repost = false;

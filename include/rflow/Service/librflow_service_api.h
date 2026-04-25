@@ -197,6 +197,12 @@ LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_set_dynamic_bitrate(li
 
 /* 输入/输出 codec 相同且不启用，SDK 透传；启用时即使相同 codec 也会强制转码 */
 LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_set_enable_transcode(librflow_svc_stream_param_t p, bool enable);
+/*
+ * 鍐呴儴閲囬泦锛氳缃?video_device_path 鎴?video_device_index 鍚庯紝SDK 浣跨敤鍐呴儴鎽勫儚澶撮噰闆?
+ * + 缂栫爜 + 鎺ㄦ祦锛屼笟鍔″眰涓嶅簲鍐嶈皟鐢?librflow_svc_push_video_frame 鍚戣娴佹姇甯с€?
+ * video_device_path 浼樺厛浜?video_device_index锛涗袱鑰呭潎鏈缃椂淇濇寔澶栭儴 push 妯″紡銆? */
+LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_set_video_device_path (librflow_svc_stream_param_t p, const char *device_path);
+LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_set_video_device_index(librflow_svc_stream_param_t p, uint32_t device_index);
 
 /*
  * Getter：读回当前设置值。统一返回 rflow_err_t，以消除"未设置"与"显式设为 0 /
@@ -223,6 +229,11 @@ LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_get_dynamic_bitrate(li
                                                                               uint32_t *out_lowest_kbps,
                                                                               uint32_t *out_highest_kbps);
 LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_get_enable_transcode(librflow_svc_stream_param_t p, bool *out_enable);
+LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_get_video_device_path (librflow_svc_stream_param_t p,
+                                                                                 char *buf, uint32_t buf_len,
+                                                                                 uint32_t *out_needed);
+LIBRFLOW_API_EXPORT rflow_err_t librflow_svc_stream_param_get_video_device_index(librflow_svc_stream_param_t p,
+                                                                                 uint32_t *out_device_index);
 
 /******************************************************************************
  *                          StreamCb（流本地观测回调，可选）

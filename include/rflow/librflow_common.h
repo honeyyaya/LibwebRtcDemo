@@ -110,6 +110,9 @@ typedef int32_t rflow_err_t;
 #define RFLOW_LIMIT_MAX_DEVICE_ID_LEN         128
 #define RFLOW_LIMIT_MAX_SERVICE_ID_LEN        64
 
+/** 未设置 device_id 时用于信令 stream_id（device_id:stream_index）的默认前缀 */
+#define RFLOW_DEFAULT_DEVICE_ID               "demo_device"
+
 /******************************************************************************
  *                                 枚举
  ******************************************************************************/
@@ -381,8 +384,33 @@ LIBRFLOW_API_EXPORT rflow_err_t librflow_global_config_set_region     (librflow_
 /******************************************************************************
  *                           Video Frame Getter / 生命周期（共享）
  ******************************************************************************/
+/*
+ * 视频帧格式说明：
+ *   - codec == RFLOW_CODEC_I420:
+ *       plane_count = 3
+ *       plane 0 = Y, plane 1 = U, plane 2 = V
+ *   - codec == RFLOW_CODEC_NV12:
+ *       plane_count = 2
+ *       plane 0 = Y, plane 1 = UV(交错)
+ *
+ * 推荐用法：
+ *   1. 先读 codec / width / height / plane_count
+ *   2. 再按 plane 读取 data/stride/plane_width/plane_height
+ *   3. 仅在你明确需要“单块连续内存”时，才使用 get_data/get_data_size
+ *
+ * 兼容说明：
+ *   - get_data/get_data_size 仍保留给旧代码。
+ *   - 当帧底层是多平面 buffer 时，SDK 会在首次调用 get_data 时按 codec
+ *     规则拼出连续缓存；新代码优先使用 plane getter，避免额外拷贝。
+ */
 LIBRFLOW_API_EXPORT rflow_codec_t      librflow_video_frame_get_codec    (librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT rflow_frame_type_t librflow_video_frame_get_type     (librflow_video_frame_t f);
+LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_plane_count (librflow_video_frame_t f);
+LIBRFLOW_API_EXPORT const uint8_t*     librflow_video_frame_get_plane_data  (librflow_video_frame_t f, uint32_t plane_index);
+LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_plane_stride(librflow_video_frame_t f, uint32_t plane_index);
+LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_plane_width (librflow_video_frame_t f, uint32_t plane_index);
+LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_plane_height(librflow_video_frame_t f, uint32_t plane_index);
+/* 旧接口：需要连续内存时再用；新代码优先使用 plane getter。 */
 LIBRFLOW_API_EXPORT const uint8_t*     librflow_video_frame_get_data     (librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_data_size(librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_width    (librflow_video_frame_t f);

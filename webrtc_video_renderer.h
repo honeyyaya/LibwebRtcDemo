@@ -1,7 +1,6 @@
 #ifndef WEBRTC_VIDEO_RENDERER_H
 #define WEBRTC_VIDEO_RENDERER_H
 
-#include <QByteArray>
 #include <QMutex>
 #include <QQuickFramebufferObject>
 #include <QString>
@@ -31,7 +30,7 @@ public:
     explicit WebRTCVideoRenderer(QQuickItem *parent = nullptr);
     ~WebRTCVideoRenderer() override;
 
-    Q_INVOKABLE void presentFrame(QByteArray i420, int width, int height, quint32 frameId) override;
+    void presentFrame(librflow_video_frame_t frame) override;
     Q_INVOKABLE void clearVideoTrack() override;
 
     bool hasVideo() const { return m_hasVideo; }
@@ -55,7 +54,7 @@ public:
 
     Renderer *createRenderer() const override;
 
-    bool takeFrame(QByteArray &outFrame, int &outWidth, int &outHeight, quint32 &outFrameId);
+    bool takeFrame(librflow_video_frame_t &outFrame, quint32 &outFrameId);
 
 Q_SIGNALS:
     void hasVideoChanged();
@@ -66,9 +65,7 @@ Q_SIGNALS:
 
 private:
     mutable QMutex m_frameMutex;
-    QByteArray m_pendingFrame;
-    int m_pendingWidth = 0;
-    int m_pendingHeight = 0;
+    librflow_video_frame_t m_pendingFrame = nullptr;
     bool m_pendingValid = false;
 
     bool m_hasVideo = false;

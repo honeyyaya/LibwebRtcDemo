@@ -1,15 +1,19 @@
 #ifndef VIDEO_FRAME_SINK_H
 #define VIDEO_FRAME_SINK_H
 
-#include <QByteArray>
 #include <QtPlugin>
+
+extern "C" {
+#include "rflow/Client/librflow_client_api.h"
+}
 
 class VideoFrameSink
 {
 public:
     virtual ~VideoFrameSink() = default;
 
-    virtual void presentFrame(QByteArray i420, int width, int height, quint32 frameId) = 0;
+    // Takes ownership of one retained SDK frame reference.
+    virtual void presentFrame(librflow_video_frame_t frame) = 0;
     virtual void clearVideoTrack() = 0;
 };
 
