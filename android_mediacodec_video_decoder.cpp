@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "api/video/i420_buffer.h"
+#include "api/video/nv12_buffer.h"
 #include "api/video/video_frame.h"
 #include "api/video/video_frame_type.h"
 #include "modules/video_coding/include/video_error_codes.h"
@@ -176,6 +177,58 @@ bool FillI420FromNv12Tight(const uint8_t* src, size_t src_cap, int offset,
   const uint8_t* ys = src + offset;
   return libyuv::NV12ToI420(ys, width, ys + width * height, width,
                             dy, dsy, du, dsu, dv, dsv, width, height) == 0;
+}
+
+bool FillNV12BufferFromNv12(const uint8_t* src,
+                            size_t src_cap,
+                            int offset,
+                            int width,
+                            int height,
+                            int y_stride,
+                            int slice_height,
+                            webrtc::NV12Buffer* dst) {
+  if (!src || !dst || width <= 0 || height <= 0 || y_stride < width) return false;
+  const int y_plane = y_stride * slice_height;
+  const int uv_rows = (height + 1) / 2;
+  if (offset + y_plane + y_stride * uv_rows > static_cast<int>(src_cap)) return false;
+  const uint8_t* ys = src + offset;
+  const uint8_t* uvs = ys + y_plane;
+  for (int y = 0; y < height; ++y) {
+    std::memcpy(dst->MutableDataY() + static_cast<size_t>(y) * dst->StrideY(),
+                ys + static_cast<size_t>(y) * y_stride,
+                static_cast<size_t>(width));
+  }
+  for (int y = 0; y < uv_rows; ++y) {
+    std::memcpy(dst->MutableDataUV() + static_cast<size_t>(y) * dst->StrideUV(),
+                uvs + static_cast<size_t>(y) * y_stride,
+                static_cast<size_t>(width));
+  }
+  return true;
+}
+
+bool FillNV12BufferFromNv12Tight(const uint8_t* src,
+                                 size_t src_cap,
+                                 int offset,
+                                 int width,
+                                 int height,
+                                 webrtc::NV12Buffer* dst) {
+  if (!src || !dst || width <= 0 || height <= 0) return false;
+  const int uv_rows = (height + 1) / 2;
+  const int need = width * height + width * uv_rows;
+  if (offset < 0 || offset + need > static_cast<int>(src_cap)) return false;
+  const uint8_t* ys = src + offset;
+  const uint8_t* uvs = ys + width * height;
+  for (int y = 0; y < height; ++y) {
+    std::memcpy(dst->MutableDataY() + static_cast<size_t>(y) * dst->StrideY(),
+                ys + static_cast<size_t>(y) * width,
+                static_cast<size_t>(width));
+  }
+  for (int y = 0; y < uv_rows; ++y) {
+    std::memcpy(dst->MutableDataUV() + static_cast<size_t>(y) * dst->StrideUV(),
+                uvs + static_cast<size_t>(y) * width,
+                static_cast<size_t>(width));
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -554,45 +607,62 @@ struct AndroidMediaCodecVideoDecoder::Impl {
           if (perf_detail) {
             t_c0 = McMonotonicUs();
           }
-          webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
-          PoolResult pr{};
-          if (AcquirePoolSlot(out_width_, out_height_, &pr)) {
+          webrtc::scoped_refptr<webrtc::VideoFrameBuffer> frame_buffer;
+          auto nv12 = webrtc::NV12Buffer::Create(out_width_, out_height_);
+          if (nv12) {
             const bool ok =
-                FillI420FromNv12(out_buf, cap, info.offset, out_width_, out_height_,
-                                 y_stride_, slice_height_,
-                                 pr.y, pr.sy, pr.u, pr.su, pr.v, pr.sv) ||
-                FillI420FromNv12Tight(out_buf, cap, info.offset, out_width_, out_height_,
-                                      pr.y, pr.sy, pr.u, pr.su, pr.v, pr.sv);
+                FillNV12BufferFromNv12(out_buf, cap, info.offset, out_width_, out_height_,
+                                       y_stride_, slice_height_, nv12.get()) ||
+                FillNV12BufferFromNv12Tight(out_buf, cap, info.offset, out_width_, out_height_,
+                                            nv12.get());
             if (ok) {
-              i420 = webrtc::scoped_refptr<PooledI420>(
-                  new PooledI420(pr.mem, out_width_, out_height_,
-                                 pr.sy, pr.su, pr.sv, pr.ou, pr.ov, pr.flag));
-            } else {
-              pr.flag->store(true, std::memory_order_release);
+              frame_buffer = webrtc::scoped_refptr<webrtc::VideoFrameBuffer>(nv12);
             }
           }
-          if (!i420) {
-            auto buf420 = webrtc::I420Buffer::Create(out_width_, out_height_);
-            if (buf420) {
+          if (!frame_buffer) {
+            webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
+            PoolResult pr{};
+            if (AcquirePoolSlot(out_width_, out_height_, &pr)) {
               const bool ok =
                   FillI420FromNv12(out_buf, cap, info.offset, out_width_, out_height_,
                                    y_stride_, slice_height_,
-                                   buf420->MutableDataY(), buf420->StrideY(),
-                                   buf420->MutableDataU(), buf420->StrideU(),
-                                   buf420->MutableDataV(), buf420->StrideV()) ||
+                                   pr.y, pr.sy, pr.u, pr.su, pr.v, pr.sv) ||
                   FillI420FromNv12Tight(out_buf, cap, info.offset, out_width_, out_height_,
-                                        buf420->MutableDataY(), buf420->StrideY(),
-                                        buf420->MutableDataU(), buf420->StrideU(),
-                                        buf420->MutableDataV(), buf420->StrideV());
-              if (ok) i420 = buf420;
+                                        pr.y, pr.sy, pr.u, pr.su, pr.v, pr.sv);
+              if (ok) {
+                i420 = webrtc::scoped_refptr<PooledI420>(
+                    new PooledI420(pr.mem, out_width_, out_height_,
+                                   pr.sy, pr.su, pr.sv, pr.ou, pr.ov, pr.flag));
+              } else {
+                pr.flag->store(true, std::memory_order_release);
+              }
+            }
+            if (!i420) {
+              auto buf420 = webrtc::I420Buffer::Create(out_width_, out_height_);
+              if (buf420) {
+                const bool ok =
+                    FillI420FromNv12(out_buf, cap, info.offset, out_width_, out_height_,
+                                     y_stride_, slice_height_,
+                                     buf420->MutableDataY(), buf420->StrideY(),
+                                     buf420->MutableDataU(), buf420->StrideU(),
+                                     buf420->MutableDataV(), buf420->StrideV()) ||
+                    FillI420FromNv12Tight(out_buf, cap, info.offset, out_width_, out_height_,
+                                          buf420->MutableDataY(), buf420->StrideY(),
+                                          buf420->MutableDataU(), buf420->StrideU(),
+                                          buf420->MutableDataV(), buf420->StrideV());
+                if (ok) i420 = buf420;
+              }
+            }
+            if (i420) {
+              frame_buffer = webrtc::scoped_refptr<webrtc::VideoFrameBuffer>(i420);
             }
           }
           if (perf_detail) {
             perf_detail->nv12_i420_us += McMonotonicUs() - t_c0;
           }
-          if (i420) {
+          if (frame_buffer) {
             webrtc::VideoFrame::Builder frame_builder;
-            frame_builder.set_video_frame_buffer(i420)
+            frame_builder.set_video_frame_buffer(frame_buffer)
                 .set_rtp_timestamp(rtp_timestamp)
                 .set_timestamp_us(render_time_ms * 1000);
             if (video_frame_tracking_id.has_value()) {
@@ -611,7 +681,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
               const int64_t e2e_us = t_after_decoded_cb - *decode_wall_t0_us;
               ALOGI(
                   "【耗时分析】硬件解码总耗时 McE2E tracking_id=%u rtp_ts=%u e2e=%lldus (Decode入口->Decoded返回; "
-                  "含入队等待+worker+MediaCodec+NV12->I420+cb; 不含WebRTC后续sink; 与 tracking_id mod 120 对齐)",
+                  "含入队等待+worker+MediaCodec+NV12输出整理+cb; 不含WebRTC后续sink; 与 tracking_id mod 120 对齐)",
                   static_cast<unsigned>(*video_frame_tracking_id), rtp_timestamp,
                   static_cast<long long>(e2e_us));
             }
@@ -625,7 +695,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
               ++(*delivered_frames);
             }
           } else {
-            ALOGW("NV12->I420 failed w=%d h=%d stride=%d slice=%d color=%d cap=%zu off=%d size=%d",
+            ALOGW("NV12 frame copy failed w=%d h=%d stride=%d slice=%d color=%d cap=%zu off=%d size=%d",
                   out_width_, out_height_, y_stride_, slice_height_,
                   static_cast<int>(color_format_), cap, info.offset, info.size);
           }

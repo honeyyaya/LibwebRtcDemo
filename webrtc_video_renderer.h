@@ -1,7 +1,7 @@
 #ifndef WEBRTC_VIDEO_RENDERER_H
 #define WEBRTC_VIDEO_RENDERER_H
 
-#include <QQuickFramebufferObject>
+#include <QQuickItem>
 #include <QRectF>
 #include <QMutex>
 #include <QElapsedTimer>
@@ -13,15 +13,15 @@
 #include "api/video/video_frame_buffer.h"
 #include "api/video/video_sink_interface.h"
 
-class WebRTCGLRenderer;
+class WebRTCVideoRenderNode;
 
-/// 远程帧路径（典型）：OnFrame(非主线程) → 队列 update() → 下一场景图帧里 synchronize() → render() → 再经窗口合成，故常见约 1 帧(≈16ms@60Hz) 的隐藏时延，threaded S.G. 时偶发 2 帧。
-/// 缓解：主程序可用 QSG_RENDER_LOOP=basic（见 main.cpp）；最省延迟需改结构（OES+同上下文、QSG 纹理节点、QQuickRenderControl/原生子窗口 等）而非本类单独修完。
-class WebRTCVideoRenderer : public QQuickFramebufferObject,
+/// 远程帧路径（当前）：OnFrame(非主线程) → 队列 update() → 下一场景图帧里 updatePaintNode()/QSGRenderNode::render()
+/// → 再经窗口合成。相比 QQuickFramebufferObject 去掉了额外 FBO 层，但仍受 scene graph 渲染循环影响。
+class WebRTCVideoRenderer : public QQuickItem,
                             public webrtc::VideoSinkInterface<webrtc::VideoFrame>
 {
     Q_OBJECT
-    friend class WebRTCGLRenderer;
+    friend class WebRTCVideoRenderNode;
     Q_PROPERTY(bool hasVideo READ hasVideo NOTIFY hasVideoChanged)
     /// 当前用于高亮的帧标识：来自 VideoFrame::id()（RTP 扩展/Field Trial）时为真实 ID；否则为本地预览序号（未联通服务器时仍可见）。
     Q_PROPERTY(int highlightFrameId READ highlightFrameId NOTIFY highlightFrameIdChanged)
@@ -75,14 +75,12 @@ public:
     bool hasSampledPipelineUi() const { return m_hasSampledPipelineUi; }
     Q_SIGNAL void sampledPipelineStatsChanged();
 
-    /// 由 WebRTCGLRenderer::render 经 QMetaObject::invokeMethod 投递到 GUI 线程；glTraceFrameId 即 m_glQueueTraceFrameId。
+    /// 由渲染线程经 QMetaObject::invokeMethod 投递到 GUI 线程；glTraceFrameId 即 m_glQueueTraceFrameId。
     Q_INVOKABLE void applySampledPipelineUi(int glTraceFrameId, double decodeToRenderTotalMs,
                                             double wallOnFrameToRenderMs);
 
-    Renderer *createRenderer() const override;
-
     /// 传出本帧的 VideoFrameBuffer：可为 I420 平面缓冲，或 kNative 的 OesEglTextureFrameBuffer（OES / EGLImage 外纹理）；
-    /// 纹理在 GL 线程与 synchronize 中绑定/更新，OnFrame 仅持引用、不整帧 CPU 拷。
+    /// 纹理在渲染线程绑定/更新，OnFrame 仅持引用、不整帧 CPU 拷。
     bool takeFrame(webrtc::scoped_refptr<webrtc::VideoFrameBuffer> &out);
 
     // 最近一次 takeFrame 对应的跟踪元数据（仅 GL 线程在 takeFrame 之后读取）。
@@ -93,6 +91,7 @@ public:
 protected:
     void timerEvent(QTimerEvent *event) override;
     void geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry) override;
+    QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
 
 private:
     void applyVideoSinkWants();
