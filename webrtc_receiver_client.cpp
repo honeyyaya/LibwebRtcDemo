@@ -24,6 +24,34 @@ QString effectiveSignalAddr(const QString &addr)
     return trimmed.isEmpty() ? QStringLiteral(DEFAULT_SIGNALING_ADDR) : trimmed;
 }
 
+QString backendToString(rflow_video_frame_backend_t backend)
+{
+    switch (backend) {
+    case RFLOW_VIDEO_FRAME_BACKEND_CPU_PLANAR:
+        return QStringLiteral("CPU_PLANAR");
+    case RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL:
+        return QStringLiteral("GPU_EXTERNAL");
+    case RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER:
+        return QStringLiteral("HARDWARE_BUFFER");
+    case RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN:
+    default:
+        return QStringLiteral("UNKNOWN");
+    }
+}
+
+QString nativeHandleToString(rflow_native_handle_type_t handleType)
+{
+    switch (handleType) {
+    case RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE:
+        return QStringLiteral("ANDROID_OES_TEXTURE");
+    case RFLOW_NATIVE_HANDLE_ANDROID_HARDWARE_BUFFER:
+        return QStringLiteral("ANDROID_HARDWARE_BUFFER");
+    case RFLOW_NATIVE_HANDLE_NONE:
+    default:
+        return QStringLiteral("NONE");
+    }
+}
+
 }  // namespace
 
 WebRTCReceiverClient::WebRTCReceiverClient(QObject *parent)
@@ -321,7 +349,14 @@ rflow_err_t WebRTCReceiverClient::connectSdk()
 rflow_err_t WebRTCReceiverClient::openStream()
 {
     librflow_stream_cb_t cb = librflow_stream_cb_create();
-    if (!cb) {
+    librflow_stream_param_t param = librflow_stream_param_create();
+    if (!cb || !param) {
+        if (param) {
+            librflow_stream_param_destroy(param);
+        }
+        if (cb) {
+            librflow_stream_cb_destroy(cb);
+        }
         return RFLOW_ERR_NO_MEM;
     }
 
@@ -333,9 +368,13 @@ rflow_err_t WebRTCReceiverClient::openStream()
         err = librflow_stream_cb_set_userdata(cb, this);
     }
     if (err == RFLOW_OK) {
-        err = librflow_open_stream(m_streamIndex, nullptr, cb, &m_streamHandle);
+        err = librflow_stream_param_set_video_output_mode(param, RFLOW_VIDEO_OUTPUT_MODE_PREFER_GPU);
+    }
+    if (err == RFLOW_OK) {
+        err = librflow_open_stream(m_streamIndex, param, cb, &m_streamHandle);
     }
 
+    librflow_stream_param_destroy(param);
     librflow_stream_cb_destroy(cb);
     return err;
 }
@@ -456,6 +495,8 @@ void WebRTCReceiverClient::deliverPendingFrame()
     }
 
     if (frame) {
+        const rflow_video_frame_backend_t backend = librflow_video_frame_get_backend(frame);
+        const rflow_native_handle_type_t nativeHandleType = librflow_video_frame_get_native_handle_type(frame);
         const rflow_codec_t codec = librflow_video_frame_get_codec(frame);
         const uint32_t width = librflow_video_frame_get_width(frame);
         const uint32_t height = librflow_video_frame_get_height(frame);
@@ -463,19 +504,27 @@ void WebRTCReceiverClient::deliverPendingFrame()
         const uint32_t planeCount = librflow_video_frame_get_plane_count(frame);
         demo::latency_trace::recordUiDispatch(frameId);
 
-        const bool supportedFrame =
+        const bool isCpuPlanarBackend =
+            backend == RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN || backend == RFLOW_VIDEO_FRAME_BACKEND_CPU_PLANAR;
+        const bool supportedCpuFrame =
             ((codec == RFLOW_CODEC_I420 && planeCount >= 3) || (codec == RFLOW_CODEC_NV12 && planeCount >= 2)) &&
             width > 0 && height > 0;
+        const bool supportedFrame =
+            (isCpuPlanarBackend && supportedCpuFrame) ||
+            (backend == RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL) ||
+            (backend == RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER);
 
         if (supportedFrame) {
             if (m_videoSink) {
                 ++m_deliveredFrames;
                 if (m_deliveredFrames <= 5 || (m_deliveredFrames % 120) == 0) {
                     qInfo().noquote()
-                        << QStringLiteral("[RenderQueue] delivered=%1 overwritten=%2 frame=%3 codec=%4")
+                        << QStringLiteral("[RenderQueue] delivered=%1 overwritten=%2 frame=%3 backend=%4 handle=%5 codec=%6")
                                .arg(m_deliveredFrames)
                                .arg(m_overwrittenPendingFrames)
                                .arg(frameId)
+                               .arg(backendToString(backend))
+                               .arg(nativeHandleToString(nativeHandleType))
                                .arg(codec);
                 }
                 m_videoSink->presentFrame(frame);
@@ -483,7 +532,9 @@ void WebRTCReceiverClient::deliverPendingFrame()
             }
         } else {
             qWarning().noquote()
-                << QStringLiteral("Unsupported frame from libRoboFlow: codec=%1 planes=%2 size=%3x%4")
+                << QStringLiteral("Unsupported frame from libRoboFlow: backend=%1 handle=%2 codec=%3 planes=%4 size=%5x%6")
+                       .arg(backendToString(backend))
+                       .arg(nativeHandleToString(nativeHandleType))
                        .arg(codec)
                        .arg(planeCount)
                        .arg(width)

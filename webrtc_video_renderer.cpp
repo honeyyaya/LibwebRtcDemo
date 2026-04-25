@@ -18,6 +18,10 @@
 #include <iterator>
 #include <vector>
 
+#ifdef Q_OS_ANDROID
+#include <GLES2/gl2ext.h>
+#endif
+
 #ifndef GL_UNPACK_ROW_LENGTH
 #define GL_UNPACK_ROW_LENGTH 0x0CF2
 #endif
@@ -35,6 +39,9 @@
 #endif
 #ifndef GL_LUMINANCE_ALPHA
 #define GL_LUMINANCE_ALPHA 0x190A
+#endif
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
 #endif
 
 namespace {
@@ -63,6 +70,39 @@ enum class UploadPathKind {
     NV12,
 };
 
+enum class NativeFramePath {
+    None,
+    ExternalOes,
+};
+
+QString backendToString(rflow_video_frame_backend_t backend)
+{
+    switch (backend) {
+    case RFLOW_VIDEO_FRAME_BACKEND_CPU_PLANAR:
+        return QStringLiteral("CPU_PLANAR");
+    case RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL:
+        return QStringLiteral("GPU_EXTERNAL");
+    case RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER:
+        return QStringLiteral("HARDWARE_BUFFER");
+    case RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN:
+    default:
+        return QStringLiteral("UNKNOWN");
+    }
+}
+
+QString nativeHandleToString(rflow_native_handle_type_t handleType)
+{
+    switch (handleType) {
+    case RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE:
+        return QStringLiteral("ANDROID_OES_TEXTURE");
+    case RFLOW_NATIVE_HANDLE_ANDROID_HARDWARE_BUFFER:
+        return QStringLiteral("ANDROID_HARDWARE_BUFFER");
+    case RFLOW_NATIVE_HANDLE_NONE:
+    default:
+        return QStringLiteral("NONE");
+    }
+}
+
 bool supportsUnpackRowLength()
 {
     QOpenGLContext *const ctx = QOpenGLContext::currentContext();
@@ -90,6 +130,15 @@ bool supportsPixelUnpackBuffer()
         return true;
     }
     return ctx->format().majorVersion() >= 3;
+}
+
+bool supportsExternalOesSampling()
+{
+    QOpenGLContext *const ctx = QOpenGLContext::currentContext();
+    if (!ctx || !ctx->isOpenGLES()) {
+        return false;
+    }
+    return ctx->hasExtension(QByteArrayLiteral("GL_OES_EGL_image_external"));
 }
 
 const uint8_t *prepareTightPlaneIfNeeded(const uint8_t *src,
@@ -409,7 +458,10 @@ public:
         }
 
         QOpenGLShaderProgram *program = nullptr;
-        if (m_frameFormat == RFLOW_CODEC_NV12 && m_nv12Program.isLinked()) {
+        const bool useNativeOes = m_nativePath == NativeFramePath::ExternalOes && m_oesProgram.isLinked();
+        if (useNativeOes) {
+            program = &m_oesProgram;
+        } else if (m_frameFormat == RFLOW_CODEC_NV12 && m_nv12Program.isLinked()) {
             program = &m_nv12Program;
         } else if (m_i420Program.isLinked()) {
             program = &m_i420Program;
@@ -430,21 +482,27 @@ public:
         program->setAttributeArray(1, GL_FLOAT, kTexCoords, 2);
         program->enableAttributeArray(1);
 
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_texY);
-        program->setUniformValue("tex_y", 0);
-
-        if (m_frameFormat == RFLOW_CODEC_NV12) {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, m_texUV);
-            program->setUniformValue("tex_uv", 1);
+        if (useNativeOes) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_nativeTextureId);
+            program->setUniformValue("tex", 0);
         } else {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, m_texU);
-            glActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, m_texV);
-            program->setUniformValue("tex_u", 1);
-            program->setUniformValue("tex_v", 2);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, m_texY);
+            program->setUniformValue("tex_y", 0);
+
+            if (m_frameFormat == RFLOW_CODEC_NV12) {
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, m_texUV);
+                program->setUniformValue("tex_uv", 1);
+            } else {
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, m_texU);
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, m_texV);
+                program->setUniformValue("tex_u", 1);
+                program->setUniformValue("tex_v", 2);
+            }
         }
 
         glDisable(GL_DEPTH_TEST);
@@ -466,9 +524,12 @@ public:
                        .arg(m_lastUploadUs / 1000.0, 0, 'f', 3)
                        .arg(drawUs / 1000.0, 0, 'f', 3)
                        .arg((m_lastUploadUs + drawUs) / 1000.0, 0, 'f', 3)
-                       .arg(m_frameFormat == RFLOW_CODEC_NV12 ? QStringLiteral("NV12")
-                                                              : QStringLiteral("I420"));
+                       .arg(useNativeOes ? QStringLiteral("OES")
+                                         : (m_frameFormat == RFLOW_CODEC_NV12 ? QStringLiteral("NV12")
+                                                                              : QStringLiteral("I420")));
         }
+
+        releaseSamplingAfterDraw();
 
         if (m_haveFrameId) {
             demo::latency_trace::recordRender(m_currentFrameId);
@@ -495,6 +556,7 @@ private:
         initializeOpenGLFunctions();
         m_canUseUnpackRowLength = supportsUnpackRowLength();
         m_canUsePixelUnpackBuffer = supportsPixelUnpackBuffer();
+        m_canUseExternalOesSampling = supportsExternalOesSampling();
         initShaders();
         initTextures();
         initUploadPbos();
@@ -546,8 +608,19 @@ private:
             "  gl_FragColor = vec4(rgb, 1.0);"
             "}";
 
+        static const char *oesFragmentShader =
+            "#extension GL_OES_EGL_image_external : require\n"
+            "varying mediump vec2 textureOut;\n"
+            "uniform samplerExternalOES tex;\n"
+            "void main() {\n"
+            "  gl_FragColor = texture2D(tex, textureOut);\n"
+            "}\n";
+
         initProgram(m_i420Program, vertexShader, i420FragmentShader);
         initProgram(m_nv12Program, vertexShader, nv12FragmentShader);
+        if (m_canUseExternalOesSampling) {
+            initProgram(m_oesProgram, vertexShader, oesFragmentShader);
+        }
     }
 
     void initTextures()
@@ -566,6 +639,7 @@ private:
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         }
+
     }
 
     void destroyGlResources()
@@ -582,15 +656,18 @@ private:
         m_texU = 0;
         m_texV = 0;
         m_texUV = 0;
+        m_nativeTextureId = 0;
         m_glInitialized = false;
     }
 
     void clearHeldFrame()
     {
+        releaseSamplingAfterDraw();
         if (m_heldFrame) {
             librflow_video_frame_release(m_heldFrame);
             m_heldFrame = nullptr;
         }
+        resetNativeFrameState();
     }
 
     void resetPlaneCaches()
@@ -608,6 +685,24 @@ private:
         resetPlaneUploadPbo(m_pboV);
         resetPlaneUploadPbo(m_pboUV);
         resetPlaneCaches();
+    }
+
+    void resetNativeFrameState()
+    {
+        m_nativePath = NativeFramePath::None;
+        m_nativeTextureId = 0;
+        m_nativePrepareFn = nullptr;
+        m_nativePrepareUserdata = nullptr;
+    }
+
+    void releaseSamplingAfterDraw()
+    {
+        if (m_nativeSamplingAcquired && m_heldFrame) {
+            librflow_video_frame_release_after_sampling(m_heldFrame);
+            m_nativeSamplingAcquired = false;
+        }
+        m_nativePrepareFn = nullptr;
+        m_nativePrepareUserdata = nullptr;
     }
 
     void updateGeometry()
@@ -710,6 +805,70 @@ private:
             return true;
         }
         return uploaded;
+    }
+
+    bool prepareNativeFrame(librflow_video_frame_t frame,
+                            rflow_video_frame_backend_t backend,
+                            rflow_native_handle_type_t nativeHandleType)
+    {
+        if (librflow_video_frame_acquire_for_sampling(frame) != RFLOW_OK) {
+            qWarning().noquote()
+                << QStringLiteral("[RenderPerf] acquire_for_sampling failed backend=%1 handle=%2")
+                       .arg(backendToString(backend))
+                       .arg(nativeHandleToString(nativeHandleType));
+            return false;
+        }
+        m_nativeSamplingAcquired = true;
+
+        librflow_gl_prepare_fn prepareFn = nullptr;
+        void *prepareUserdata = nullptr;
+        const rflow_err_t prepareErr =
+            librflow_video_frame_get_gl_prepare_callback(frame, &prepareFn, &prepareUserdata);
+        if (prepareErr == RFLOW_OK && prepareFn) {
+            prepareFn(prepareUserdata);
+            m_nativePrepareFn = prepareFn;
+            m_nativePrepareUserdata = prepareUserdata;
+        } else if (prepareErr != RFLOW_OK && prepareErr != RFLOW_ERR_NOT_SUPPORT) {
+            qWarning().noquote()
+                << QStringLiteral("[RenderPerf] get_gl_prepare_callback failed err=%1 backend=%2 handle=%3")
+                       .arg(prepareErr)
+                       .arg(backendToString(backend))
+                       .arg(nativeHandleToString(nativeHandleType));
+            releaseSamplingAfterDraw();
+            return false;
+        }
+
+        if (nativeHandleType == RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE) {
+            if (!m_canUseExternalOesSampling || !m_oesProgram.isLinked()) {
+                qWarning().noquote()
+                    << QStringLiteral("[RenderPerf] OES backend negotiated but OpenGL external texture sampling "
+                                      "is unavailable on this context");
+                releaseSamplingAfterDraw();
+                return false;
+            }
+
+            const GLuint textureId = librflow_video_frame_get_oes_texture_id(frame);
+            if (textureId == 0) {
+                qWarning().noquote()
+                    << QStringLiteral("[RenderPerf] OES backend negotiated but texture id is 0");
+                releaseSamplingAfterDraw();
+                return false;
+            }
+
+            m_nativePath = NativeFramePath::ExternalOes;
+            m_nativeTextureId = textureId;
+            m_lastUploadUs = 0;
+            m_uploadStatsValidForLastFrame = true;
+            m_hasData = true;
+            return true;
+        }
+
+        qWarning().noquote()
+            << QStringLiteral("[RenderPerf] native frame backend=%1 handle=%2 is not wired into renderer yet")
+                   .arg(backendToString(backend))
+                   .arg(nativeHandleToString(nativeHandleType));
+        releaseSamplingAfterDraw();
+        return false;
     }
 
     bool uploadI420(librflow_video_frame_t frame)
@@ -819,6 +978,34 @@ private:
         if (!m_heldFrame) {
             m_hasData = false;
             m_uploadStatsValidForLastFrame = false;
+            resetNativeFrameState();
+            return;
+        }
+
+        const rflow_video_frame_backend_t backend = librflow_video_frame_get_backend(m_heldFrame);
+        const rflow_native_handle_type_t nativeHandleType =
+            librflow_video_frame_get_native_handle_type(m_heldFrame);
+        resetNativeFrameState();
+
+        if (backend == RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL ||
+            backend == RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER) {
+            if ((backend != m_lastFrameBackend || nativeHandleType != m_lastNativeHandleType ||
+                 m_renderedFrames < 5) &&
+                (nativeHandleType == RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE ||
+                 nativeHandleType == RFLOW_NATIVE_HANDLE_ANDROID_HARDWARE_BUFFER)) {
+                qInfo().noquote()
+                    << QStringLiteral("[RenderPerf] native frame path backend=%1 handle=%2")
+                           .arg(backendToString(backend))
+                           .arg(nativeHandleToString(nativeHandleType));
+            }
+            const bool prepared = prepareNativeFrame(m_heldFrame, backend, nativeHandleType);
+            m_lastFrameBackend = backend;
+            m_lastNativeHandleType = nativeHandleType;
+            if (!prepared) {
+                m_hasData = false;
+                m_uploadStatsValidForLastFrame = false;
+                clearHeldFrame();
+            }
             return;
         }
 
@@ -851,6 +1038,8 @@ private:
         m_lastUploadUs = uploadTimer.nsecsElapsed() / 1000;
         m_uploadStatsValidForLastFrame = uploaded;
         m_hasData = uploaded;
+        m_lastFrameBackend = backend;
+        m_lastNativeHandleType = nativeHandleType;
         clearHeldFrame();
     }
 
@@ -861,12 +1050,21 @@ private:
     bool m_glInitialized = false;
     bool m_canUseUnpackRowLength = false;
     bool m_canUsePixelUnpackBuffer = false;
+    bool m_canUseExternalOesSampling = false;
     bool m_hasData = false;
     rflow_codec_t m_frameFormat = RFLOW_CODEC_I420;
     UploadPathKind m_lastUploadPath = UploadPathKind::None;
+    rflow_video_frame_backend_t m_lastFrameBackend = RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN;
+    rflow_native_handle_type_t m_lastNativeHandleType = RFLOW_NATIVE_HANDLE_NONE;
+    NativeFramePath m_nativePath = NativeFramePath::None;
+    GLuint m_nativeTextureId = 0;
+    bool m_nativeSamplingAcquired = false;
+    librflow_gl_prepare_fn m_nativePrepareFn = nullptr;
+    void *m_nativePrepareUserdata = nullptr;
 
     QOpenGLShaderProgram m_i420Program;
     QOpenGLShaderProgram m_nv12Program;
+    QOpenGLShaderProgram m_oesProgram;
     GLuint m_texY = 0;
     GLuint m_texU = 0;
     GLuint m_texV = 0;

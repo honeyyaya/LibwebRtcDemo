@@ -151,6 +151,25 @@ typedef enum {
     RFLOW_FRAME_B       = 3,
 } rflow_frame_type_t;
 
+typedef enum {
+    RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN         = 0,
+    RFLOW_VIDEO_FRAME_BACKEND_CPU_PLANAR      = 1,
+    RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL    = 2,
+    RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER = 3,
+} rflow_video_frame_backend_t;
+
+typedef enum {
+    RFLOW_NATIVE_HANDLE_NONE                    = 0,
+    RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE     = 1,
+    RFLOW_NATIVE_HANDLE_ANDROID_HARDWARE_BUFFER = 2,
+} rflow_native_handle_type_t;
+
+typedef enum {
+    RFLOW_VIDEO_OUTPUT_MODE_CPU_PLANAR = 0,
+    RFLOW_VIDEO_OUTPUT_MODE_PREFER_GPU = 1,
+    RFLOW_VIDEO_OUTPUT_MODE_REQUIRE_GPU = 2,
+} rflow_video_output_mode_t;
+
 /* 连接状态 */
 typedef enum {
     RFLOW_CONN_IDLE         = 0,
@@ -403,6 +422,30 @@ LIBRFLOW_API_EXPORT rflow_err_t librflow_global_config_set_region     (librflow_
  *   - 当帧底层是多平面 buffer 时，SDK 会在首次调用 get_data 时按 codec
  *     规则拼出连续缓存；新代码优先使用 plane getter，避免额外拷贝。
  */
+/*
+ * GPU/native texture prepare hook.
+ * If present, call it on the target GL thread after acquire_for_sampling()
+ * and before sampling the exported texture handle.
+ */
+typedef void (*librflow_gl_prepare_fn)(void *userdata);
+
+LIBRFLOW_API_EXPORT rflow_video_frame_backend_t librflow_video_frame_get_backend(librflow_video_frame_t f);
+LIBRFLOW_API_EXPORT rflow_native_handle_type_t  librflow_video_frame_get_native_handle_type(librflow_video_frame_t f);
+/* Returns 0 when this frame is not backed by Android OES texture. */
+LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_oes_texture_id(librflow_video_frame_t f);
+/* Returns NULL when this frame is not backed by Android AHardwareBuffer. The pointer is borrowed from `frame`. */
+LIBRFLOW_API_EXPORT void*              librflow_video_frame_get_android_hardware_buffer(librflow_video_frame_t f);
+/* Returns -1 when there is no sync fence. The fd is borrowed from `frame` and must not be closed by caller. */
+LIBRFLOW_API_EXPORT int32_t            librflow_video_frame_get_sync_fence_fd(librflow_video_frame_t f);
+/* Returns RFLOW_ERR_NOT_SUPPORT when the current frame backend has no prepare hook. */
+LIBRFLOW_API_EXPORT rflow_err_t        librflow_video_frame_get_gl_prepare_callback(
+                                            librflow_video_frame_t f,
+                                            librflow_gl_prepare_fn *out_fn,
+                                            void **out_userdata);
+/* Acquire sampling rights for GPU/native texture backends. CPU planar frames return RFLOW_ERR_NOT_SUPPORT. */
+LIBRFLOW_API_EXPORT rflow_err_t        librflow_video_frame_acquire_for_sampling(librflow_video_frame_t f);
+/* Paired with acquire_for_sampling(); CPU planar frames are a no-op. */
+LIBRFLOW_API_EXPORT void               librflow_video_frame_release_after_sampling(librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT rflow_codec_t      librflow_video_frame_get_codec    (librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT rflow_frame_type_t librflow_video_frame_get_type     (librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_plane_count (librflow_video_frame_t f);

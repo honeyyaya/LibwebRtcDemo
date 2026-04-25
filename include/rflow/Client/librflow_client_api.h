@@ -90,6 +90,9 @@ LIBRFLOW_API_EXPORT rflow_err_t librflow_stream_param_set_preferred_max_size(lib
                                                                              uint32_t max_width,
                                                                              uint32_t max_height);
 LIBRFLOW_API_EXPORT rflow_err_t librflow_stream_param_set_preferred_fps     (librflow_stream_param_t p, uint32_t fps);
+/* 输出偏好：当前默认/实际仍为 CPU planar，后续可扩展为 GPU/native texture。 */
+LIBRFLOW_API_EXPORT rflow_err_t librflow_stream_param_set_video_output_mode (librflow_stream_param_t p,
+                                                                             rflow_video_output_mode_t mode);
 
 /******************************************************************************
  *                          StreamCb
@@ -108,6 +111,9 @@ typedef void (*librflow_on_stream_state_fn)(librflow_stream_handle_t handle,
  * Recommended access pattern:
  *   - I420: use librflow_video_frame_get_plane_* for Y/U/V
  *   - NV12: use librflow_video_frame_get_plane_* for Y and interleaved UV
+ *   - GPU/native texture: check get_backend()/get_native_handle_type() first,
+ *     then call acquire_for_sampling() -> optional gl_prepare callback ->
+ *     read OES texture id or AHardwareBuffer/sync fence -> release_after_sampling()
  *   - use librflow_video_frame_get_data/get_data_size only when your pipeline
  *     strictly requires one contiguous buffer
  *
