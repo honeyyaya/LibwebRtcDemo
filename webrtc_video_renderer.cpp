@@ -19,7 +19,10 @@
 #include <vector>
 
 #ifdef Q_OS_ANDROID
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES2/gl2ext.h>
+#include <android/hardware_buffer.h>
 #endif
 
 #ifndef GL_UNPACK_ROW_LENGTH
@@ -73,6 +76,7 @@ enum class UploadPathKind {
 enum class NativeFramePath {
     None,
     ExternalOes,
+    HardwareBufferEglImage,
 };
 
 QString backendToString(rflow_video_frame_backend_t backend)
@@ -140,6 +144,29 @@ bool supportsExternalOesSampling()
     }
     return ctx->hasExtension(QByteArrayLiteral("GL_OES_EGL_image_external"));
 }
+
+#ifdef Q_OS_ANDROID
+bool hasExtensionToken(const char *extensions, const char *needle)
+{
+    if (!extensions || !needle || !needle[0]) {
+        return false;
+    }
+
+    const QByteArray haystack(extensions);
+    const QByteArray token(needle);
+    int pos = 0;
+    while ((pos = haystack.indexOf(token, pos)) >= 0) {
+        const bool startOk = pos == 0 || haystack.at(pos - 1) == ' ';
+        const int endPos = pos + token.size();
+        const bool endOk = endPos == haystack.size() || haystack.at(endPos) == ' ';
+        if (startOk && endOk) {
+            return true;
+        }
+        pos = endPos;
+    }
+    return false;
+}
+#endif
 
 const uint8_t *prepareTightPlaneIfNeeded(const uint8_t *src,
                                          int srcStrideBytes,
@@ -458,8 +485,8 @@ public:
         }
 
         QOpenGLShaderProgram *program = nullptr;
-        const bool useNativeOes = m_nativePath == NativeFramePath::ExternalOes && m_oesProgram.isLinked();
-        if (useNativeOes) {
+        const bool useNativeTexture = m_nativePath != NativeFramePath::None && m_oesProgram.isLinked();
+        if (useNativeTexture) {
             program = &m_oesProgram;
         } else if (m_frameFormat == RFLOW_CODEC_NV12 && m_nv12Program.isLinked()) {
             program = &m_nv12Program;
@@ -482,7 +509,7 @@ public:
         program->setAttributeArray(1, GL_FLOAT, kTexCoords, 2);
         program->enableAttributeArray(1);
 
-        if (useNativeOes) {
+        if (useNativeTexture) {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_nativeTextureId);
             program->setUniformValue("tex", 0);
@@ -524,9 +551,12 @@ public:
                        .arg(m_lastUploadUs / 1000.0, 0, 'f', 3)
                        .arg(drawUs / 1000.0, 0, 'f', 3)
                        .arg((m_lastUploadUs + drawUs) / 1000.0, 0, 'f', 3)
-                       .arg(useNativeOes ? QStringLiteral("OES")
-                                         : (m_frameFormat == RFLOW_CODEC_NV12 ? QStringLiteral("NV12")
-                                                                              : QStringLiteral("I420")));
+                       .arg(m_nativePath == NativeFramePath::ExternalOes
+                                ? QStringLiteral("OES")
+                                : (m_nativePath == NativeFramePath::HardwareBufferEglImage
+                                       ? QStringLiteral("AHB")
+                                       : (m_frameFormat == RFLOW_CODEC_NV12 ? QStringLiteral("NV12")
+                                                                            : QStringLiteral("I420"))));
         }
 
         releaseSamplingAfterDraw();
@@ -557,6 +587,9 @@ private:
         m_canUseUnpackRowLength = supportsUnpackRowLength();
         m_canUsePixelUnpackBuffer = supportsPixelUnpackBuffer();
         m_canUseExternalOesSampling = supportsExternalOesSampling();
+#ifdef Q_OS_ANDROID
+        initializeAndroidNativeInterop();
+#endif
         initShaders();
         initTextures();
         initUploadPbos();
@@ -640,6 +673,16 @@ private:
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         }
 
+#ifdef Q_OS_ANDROID
+        if (m_canUseExternalOesSampling && m_importTextureId == 0) {
+            glGenTextures(1, &m_importTextureId);
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_importTextureId);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+#endif
     }
 
     void destroyGlResources()
@@ -656,6 +699,13 @@ private:
         m_texU = 0;
         m_texV = 0;
         m_texUV = 0;
+#ifdef Q_OS_ANDROID
+        destroyImportedEglImage();
+        if (m_importTextureId != 0) {
+            glDeleteTextures(1, &m_importTextureId);
+            m_importTextureId = 0;
+        }
+#endif
         m_nativeTextureId = 0;
         m_glInitialized = false;
     }
@@ -663,6 +713,9 @@ private:
     void clearHeldFrame()
     {
         releaseSamplingAfterDraw();
+#ifdef Q_OS_ANDROID
+        destroyImportedEglImage();
+#endif
         if (m_heldFrame) {
             librflow_video_frame_release(m_heldFrame);
             m_heldFrame = nullptr;
@@ -704,6 +757,110 @@ private:
         m_nativePrepareFn = nullptr;
         m_nativePrepareUserdata = nullptr;
     }
+
+#ifdef Q_OS_ANDROID
+    void initializeAndroidNativeInterop()
+    {
+        if (m_androidInteropInitialized) {
+            return;
+        }
+
+        m_eglDisplay = eglGetCurrentDisplay();
+        if (m_eglDisplay == EGL_NO_DISPLAY) {
+            return;
+        }
+
+        const char *eglExts = eglQueryString(m_eglDisplay, EGL_EXTENSIONS);
+        const bool hasImageBase = hasExtensionToken(eglExts, "EGL_KHR_image_base");
+        const bool hasNativeBuffer = hasExtensionToken(eglExts, "EGL_ANDROID_image_native_buffer");
+        const bool hasGetNativeBuffer = hasExtensionToken(eglExts, "EGL_ANDROID_get_native_client_buffer");
+        const bool hasGlEglImage = QOpenGLContext::currentContext()->hasExtension(QByteArrayLiteral("GL_OES_EGL_image"));
+
+        if (hasImageBase && hasNativeBuffer && hasGetNativeBuffer && hasGlEglImage &&
+            m_canUseExternalOesSampling) {
+            m_eglCreateImageKHR =
+                reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+            m_eglDestroyImageKHR =
+                reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+            m_eglGetNativeClientBufferANDROID =
+                reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(
+                    eglGetProcAddress("eglGetNativeClientBufferANDROID"));
+            m_glEGLImageTargetTexture2DOES =
+                reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+                    eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+            m_canImportHardwareBuffer = m_eglCreateImageKHR && m_eglDestroyImageKHR &&
+                                        m_eglGetNativeClientBufferANDROID && m_glEGLImageTargetTexture2DOES;
+        }
+
+        m_androidInteropInitialized = true;
+    }
+
+    void destroyImportedEglImage()
+    {
+        if (m_currentEglImage != EGL_NO_IMAGE_KHR && m_eglDestroyImageKHR && m_eglDisplay != EGL_NO_DISPLAY) {
+            m_eglDestroyImageKHR(m_eglDisplay, m_currentEglImage);
+        }
+        m_currentEglImage = EGL_NO_IMAGE_KHR;
+    }
+
+    bool importHardwareBufferFrame(librflow_video_frame_t frame,
+                                   rflow_video_frame_backend_t backend,
+                                   rflow_native_handle_type_t nativeHandleType)
+    {
+        if (!m_canImportHardwareBuffer || m_importTextureId == 0 || m_eglDisplay == EGL_NO_DISPLAY) {
+            qWarning().noquote()
+                << QStringLiteral("[RenderPerf] AHardwareBuffer import unavailable backend=%1 handle=%2")
+                       .arg(backendToString(backend))
+                       .arg(nativeHandleToString(nativeHandleType));
+            return false;
+        }
+
+        auto *hardwareBuffer = static_cast<AHardwareBuffer *>(
+            librflow_video_frame_get_android_hardware_buffer(frame));
+        if (!hardwareBuffer) {
+            qWarning().noquote() << QStringLiteral("[RenderPerf] AHardwareBuffer handle is null");
+            return false;
+        }
+
+        destroyImportedEglImage();
+
+        EGLClientBuffer nativeClientBuffer = m_eglGetNativeClientBufferANDROID(hardwareBuffer);
+        if (!nativeClientBuffer) {
+            qWarning().noquote() << QStringLiteral("[RenderPerf] eglGetNativeClientBufferANDROID failed");
+            return false;
+        }
+
+        const EGLint attrs[] = {
+            EGL_IMAGE_PRESERVED_KHR, EGL_FALSE,
+            EGL_NONE
+        };
+        m_currentEglImage = m_eglCreateImageKHR(
+            m_eglDisplay, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, nativeClientBuffer, attrs);
+        if (m_currentEglImage == EGL_NO_IMAGE_KHR) {
+            qWarning().noquote() << QStringLiteral("[RenderPerf] eglCreateImageKHR failed for AHardwareBuffer");
+            return false;
+        }
+
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_importTextureId);
+        m_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES,
+                                       reinterpret_cast<GLeglImageOES>(m_currentEglImage));
+
+        const int32_t syncFenceFd = librflow_video_frame_get_sync_fence_fd(frame);
+        if (syncFenceFd >= 0 && (m_renderedFrames <= 5 || (m_renderedFrames % 120) == 0)) {
+            qInfo().noquote()
+                << QStringLiteral("[RenderPerf] AHardwareBuffer frame carries sync fence fd=%1; relying on SDK "
+                                  "acquire/prepare ordering")
+                       .arg(syncFenceFd);
+        }
+
+        m_nativePath = NativeFramePath::HardwareBufferEglImage;
+        m_nativeTextureId = m_importTextureId;
+        m_lastUploadUs = 0;
+        m_uploadStatsValidForLastFrame = true;
+        m_hasData = true;
+        return true;
+    }
+#endif
 
     void updateGeometry()
     {
@@ -861,6 +1018,17 @@ private:
             m_uploadStatsValidForLastFrame = true;
             m_hasData = true;
             return true;
+        }
+
+        if (nativeHandleType == RFLOW_NATIVE_HANDLE_ANDROID_HARDWARE_BUFFER) {
+#ifdef Q_OS_ANDROID
+            return importHardwareBufferFrame(frame, backend, nativeHandleType);
+#else
+            qWarning().noquote()
+                << QStringLiteral("[RenderPerf] AHardwareBuffer backend received on non-Android build");
+            releaseSamplingAfterDraw();
+            return false;
+#endif
         }
 
         qWarning().noquote()
@@ -1051,6 +1219,17 @@ private:
     bool m_canUseUnpackRowLength = false;
     bool m_canUsePixelUnpackBuffer = false;
     bool m_canUseExternalOesSampling = false;
+#ifdef Q_OS_ANDROID
+    bool m_androidInteropInitialized = false;
+    bool m_canImportHardwareBuffer = false;
+    EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
+    EGLImageKHR m_currentEglImage = EGL_NO_IMAGE_KHR;
+    PFNEGLCREATEIMAGEKHRPROC m_eglCreateImageKHR = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC m_eglDestroyImageKHR = nullptr;
+    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC m_eglGetNativeClientBufferANDROID = nullptr;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC m_glEGLImageTargetTexture2DOES = nullptr;
+    GLuint m_importTextureId = 0;
+#endif
     bool m_hasData = false;
     rflow_codec_t m_frameFormat = RFLOW_CODEC_I420;
     UploadPathKind m_lastUploadPath = UploadPathKind::None;
