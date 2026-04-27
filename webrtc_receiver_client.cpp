@@ -143,6 +143,8 @@ QString errorToString(rflow_err_t err)
 WebRTCReceiverClient::WebRTCReceiverClient(QObject *parent)
     : QObject(parent)
 {
+    m_statsPollTimer.setInterval(3000);
+    connect(&m_statsPollTimer, &QTimer::timeout, this, &WebRTCReceiverClient::pollStreamStats);
 }
 
 WebRTCReceiverClient::~WebRTCReceiverClient()
@@ -224,6 +226,7 @@ void WebRTCReceiverClient::connectToSignaling(const QString &addr)
 
 void WebRTCReceiverClient::disconnect()
 {
+    m_statsPollTimer.stop();
     closeStream();
     cleanupSdk();
     clearPendingFrame();
@@ -233,6 +236,8 @@ void WebRTCReceiverClient::disconnect()
     m_hasReceivedVideoFrame = false;
     m_hasReceivedVideoCallback = false;
     m_hasReportedRendererMissing = false;
+    m_lastFrameWidth = 0;
+    m_lastFrameHeight = 0;
     demo::latency_trace::reset();
 
     if (m_videoSink) {
@@ -329,11 +334,13 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
     }
 
     const quint32 frameId = librflow_video_frame_get_seq(frame);
+    self->m_lastFrameWidth = librflow_video_frame_get_width(frame);
+    self->m_lastFrameHeight = librflow_video_frame_get_height(frame);
     demo::latency_trace::recordSdkCallback(frameId,
                                            librflow_video_frame_get_pts_ms(frame),
                                            librflow_video_frame_get_utc_ms(frame),
-                                           librflow_video_frame_get_width(frame),
-                                           librflow_video_frame_get_height(frame),
+                                           self->m_lastFrameWidth,
+                                           self->m_lastFrameHeight,
                                            librflow_video_frame_get_data_size(frame));
 
     if (!self->m_hasReceivedVideoCallback) {
@@ -359,7 +366,7 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
         QMutexLocker locker(&self->m_pendingFrameMutex);
         if (self->m_pendingFrame) {
             ++self->m_overwrittenPendingFrames;
-            if (self->m_overwrittenPendingFrames <= 5 || (self->m_overwrittenPendingFrames % 60) == 0) {
+            if (self->m_overwrittenPendingFrames <= 3 || (self->m_overwrittenPendingFrames % 300) == 0) {
                 qInfo().noquote()
                     << QStringLiteral("[RenderQueue] overwrite pending frame total=%1 incoming_frame=%2")
                            .arg(self->m_overwrittenPendingFrames)
@@ -375,8 +382,26 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
 
 void WebRTCReceiverClient::onStreamStatsThunk(librflow_stream_stats_t stats, void *userdata)
 {
-    Q_UNUSED(stats);
-    Q_UNUSED(userdata);
+    auto *self = static_cast<WebRTCReceiverClient *>(userdata);
+    if (!self || !stats) {
+        return;
+    }
+
+    librflow_stream_stats_t retained = librflow_stream_stats_retain(stats);
+    if (!retained) {
+        return;
+    }
+
+    QPointer<WebRTCReceiverClient> guard(self);
+    QMetaObject::invokeMethod(
+        self,
+        [guard, retained]() {
+            if (guard) {
+                guard->handleStreamStats(retained);
+            }
+            librflow_stream_stats_release(retained);
+        },
+        Qt::QueuedConnection);
 }
 
 rflow_err_t WebRTCReceiverClient::configureAndInitSdk(const QString &addr)
@@ -511,6 +536,7 @@ rflow_err_t WebRTCReceiverClient::openStream()
     if (err == RFLOW_OK) {
         qInfo().noquote() << QStringLiteral("[RFlowStream] librflow_open_stream submitted handle=%1")
                                  .arg(reinterpret_cast<quintptr>(m_streamHandle));
+        m_statsPollTimer.start();
     } else {
         qWarning().noquote() << QStringLiteral("[RFlowStream] librflow_open_stream failed err=%1").arg(err);
     }
@@ -611,11 +637,65 @@ void WebRTCReceiverClient::handleStreamState(rflow_stream_state_t state, rflow_e
 
 void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
 {
-    // m_rttCurrentMs = static_cast<double>(librflow_stream_stats_get_rtt_ms(stats));
-    // m_rttAvgMs = m_rttCurrentMs;
-    // m_jitterBufferMs = static_cast<double>(librflow_stream_stats_get_jitter_ms(stats));
+    if (!stats) {
+        return;
+    }
+
+    const uint32_t durationMs = librflow_stream_stats_get_duration_ms(stats);
+    const uint64_t inboundBytes = librflow_stream_stats_get_in_bound_bytes(stats);
+    const uint64_t inboundPkts = librflow_stream_stats_get_in_bound_pkts(stats);
+    const uint32_t lostPkts = librflow_stream_stats_get_lost_pkts(stats);
+    const uint32_t bitrateKbps = librflow_stream_stats_get_bitrate_kbps(stats);
+    const uint32_t rttMs = librflow_stream_stats_get_rtt_ms(stats);
+    const uint32_t fps = librflow_stream_stats_get_fps(stats);
+    const uint32_t jitterMs = librflow_stream_stats_get_jitter_ms(stats);
+    const uint32_t freezeCount = librflow_stream_stats_get_freeze_count(stats);
+    const uint32_t decodeFailCount = librflow_stream_stats_get_decode_fail_count(stats);
+
+    m_rttCurrentMs = static_cast<double>(rttMs);
+    m_rttAvgMs = m_rttCurrentMs;
+    m_jitterBufferMs = static_cast<double>(jitterMs);
     m_hasConnectionStats = true;
+
+    qInfo().noquote()
+        << QStringLiteral("[RFlowStats] resolution=%1x%2 fps=%3 bitrate_kbps=%4 webrtc_buffer_ms=%5 "
+                          "rtt_ms=%6 lost_pkts=%7 inbound_bytes=%8 inbound_pkts=%9 freeze_count=%10 "
+                          "decode_fail_count=%11 duration_ms=%12")
+               .arg(m_lastFrameWidth)
+               .arg(m_lastFrameHeight)
+               .arg(fps)
+               .arg(bitrateKbps)
+               .arg(jitterMs)
+               .arg(rttMs)
+               .arg(lostPkts)
+               .arg(inboundBytes)
+               .arg(inboundPkts)
+               .arg(freezeCount)
+               .arg(decodeFailCount)
+               .arg(durationMs);
+
     Q_EMIT connectionStatsChanged();
+}
+
+void WebRTCReceiverClient::pollStreamStats()
+{
+    if (!m_streamHandle) {
+        return;
+    }
+
+    librflow_stream_stats_t stats = nullptr;
+    const rflow_err_t err = librflow_stream_get_stats(m_streamHandle, &stats);
+    if (err != RFLOW_OK) {
+        qWarning().noquote() << QStringLiteral("[RFlowStats] get_stats failed err=%1(%2)")
+                                    .arg(errorToString(err))
+                                    .arg(err);
+        return;
+    }
+
+    handleStreamStats(stats);
+    if (stats) {
+        librflow_stream_stats_release(stats);
+    }
 }
 
 void WebRTCReceiverClient::schedulePendingFrameDelivery()
@@ -681,7 +761,7 @@ void WebRTCReceiverClient::deliverPendingFrame()
                     Q_EMIT statusChanged(QStringLiteral("已收到视频流"));
                 }
                 ++m_deliveredFrames;
-                if (m_deliveredFrames <= 5 || (m_deliveredFrames % 120) == 0) {
+                if (m_deliveredFrames <= 3 || (m_deliveredFrames % 600) == 0) {
                     qInfo().noquote()
                         << QStringLiteral("[RenderQueue] delivered=%1 overwritten=%2 frame=%3 backend=%4 handle=%5 codec=%6")
                                .arg(m_deliveredFrames)

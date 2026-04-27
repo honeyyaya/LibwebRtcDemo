@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QMutex>
 #include <QString>
+#include <QTimer>
 
 #include "video_frame_sink.h"
 
@@ -77,6 +78,7 @@ private:
     void handleStreamStats(librflow_stream_stats_t stats);
     void schedulePendingFrameDelivery();
     void deliverPendingFrame();
+    void pollStreamStats();
     void clearPendingFrame();
     void resetConnectionStats();
     void emitStatus(const QString &status);
@@ -101,11 +103,14 @@ private:
     bool m_hasReceivedVideoFrame = false;
     bool m_hasReceivedVideoCallback = false;
     bool m_hasReportedRendererMissing = false;
+    uint32_t m_lastFrameWidth = 0;
+    uint32_t m_lastFrameHeight = 0;
 
     double m_rttCurrentMs = 0.0;
     double m_rttAvgMs = 0.0;
     double m_jitterBufferMs = 0.0;
     bool m_hasConnectionStats = false;
+    QTimer m_statsPollTimer;
 };
 
 #endif

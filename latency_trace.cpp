@@ -273,25 +273,7 @@ void recordRender(quint32 frameId)
         }
     }
 
-    if (!shouldLog(frameId) && completed.totalUs >= 0 && completed.totalUs < 30000) {
-        return;
-    }
-
-    qInfo().noquote()
-        << QStringLiteral("[LatencyTrace] frame=%1 pts_ms=%2 utc_ms=%3 size=%4x%5 bytes=%6 | "
-                          "sdk->ui=%7 ms | ui->present=%8 ms | present->sync=%9 ms | "
-                          "sync->render=%10 ms | total sdk->render=%11 ms")
-               .arg(frameId)
-               .arg(trace.ptsMs)
-               .arg(trace.utcMs)
-               .arg(trace.width)
-               .arg(trace.height)
-               .arg(trace.dataSize)
-               .arg(completed.sdkToUiUs >= 0 ? QString::number(completed.sdkToUiUs / 1000.0, 'f', 3) : QStringLiteral("n/a"))
-               .arg(completed.uiToPresentUs >= 0 ? QString::number(completed.uiToPresentUs / 1000.0, 'f', 3) : QStringLiteral("n/a"))
-               .arg(completed.presentToSyncUs >= 0 ? QString::number(completed.presentToSyncUs / 1000.0, 'f', 3) : QStringLiteral("n/a"))
-               .arg(completed.syncToRenderUs >= 0 ? QString::number(completed.syncToRenderUs / 1000.0, 'f', 3) : QStringLiteral("n/a"))
-               .arg(completed.totalUs >= 0 ? QString::number(completed.totalUs / 1000.0, 'f', 3) : QStringLiteral("n/a"));
+    Q_UNUSED(trace);
 }
 
 }  // namespace demo::latency_trace

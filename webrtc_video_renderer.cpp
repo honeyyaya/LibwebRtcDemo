@@ -549,7 +549,7 @@ public:
         const qint64 drawUs = drawTimer.nsecsElapsed() / 1000;
         ++m_renderedFrames;
         if (m_uploadStatsValidForLastFrame &&
-            (m_renderedFrames <= 5 || (m_renderedFrames % 120) == 0)) {
+            (m_renderedFrames <= 3 || (m_renderedFrames % 600) == 0)) {
             qInfo().noquote()
                 << QStringLiteral("[RenderPerf] frame=%1 upload=%2 ms draw=%3 ms total=%4 ms path=%5")
                        .arg(m_currentFrameId)
