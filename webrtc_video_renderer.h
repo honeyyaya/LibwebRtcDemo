@@ -64,6 +64,8 @@ protected:
     QSGNode *updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *data) override;
     void geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry) override;
 
+public:
+      bool m_hasVideo = false;
 private:
     friend class WebRTCVideoRenderNode;
 
@@ -71,7 +73,6 @@ private:
     librflow_video_frame_t m_pendingFrame = nullptr;
     bool m_pendingValid = false;
 
-    bool m_hasVideo = false;
     int m_highlightFrameId = -1;
     bool m_frameIdFromTracking = false;
 
