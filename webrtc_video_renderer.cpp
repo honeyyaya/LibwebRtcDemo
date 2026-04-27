@@ -501,12 +501,17 @@ public:
             0.0f, 1.0f, 1.0f, 1.0f,
             0.0f, 0.0f, 1.0f, 0.0f
         };
+        static const GLfloat kTexCoordsMirroredX[] = {
+            1.0f, 1.0f, 0.0f, 1.0f,
+            1.0f, 0.0f, 0.0f, 0.0f
+        };
+        const GLfloat *texCoords = useNativeTexture ? kTexCoordsMirroredX : kTexCoords;
 
         program->bind();
         program->setUniformValue("qt_Matrix", mvp);
         program->setAttributeArray(0, GL_FLOAT, m_vertices, 2);
         program->enableAttributeArray(0);
-        program->setAttributeArray(1, GL_FLOAT, kTexCoords, 2);
+        program->setAttributeArray(1, GL_FLOAT, texCoords, 2);
         program->enableAttributeArray(1);
 
         if (useNativeTexture) {

@@ -79,6 +79,7 @@ private:
     void deliverPendingFrame();
     void clearPendingFrame();
     void resetConnectionStats();
+    void emitStatus(const QString &status);
     QString formatSdkError(const QString &prefix, rflow_err_t err) const;
 
     QObject *m_videoRenderer = nullptr;
@@ -97,6 +98,9 @@ private:
     bool m_frameDeliveryPosted = false;
     quint64 m_overwrittenPendingFrames = 0;
     quint64 m_deliveredFrames = 0;
+    bool m_hasReceivedVideoFrame = false;
+    bool m_hasReceivedVideoCallback = false;
+    bool m_hasReportedRendererMissing = false;
 
     double m_rttCurrentMs = 0.0;
     double m_rttAvgMs = 0.0;

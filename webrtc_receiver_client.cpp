@@ -52,6 +52,92 @@ QString nativeHandleToString(rflow_native_handle_type_t handleType)
     }
 }
 
+QString connectStateToString(rflow_connect_state_t state)
+{
+    switch (state) {
+    case RFLOW_CONN_IDLE:
+        return QStringLiteral("IDLE");
+    case RFLOW_CONN_CONNECTING:
+        return QStringLiteral("CONNECTING");
+    case RFLOW_CONN_CONNECTED:
+        return QStringLiteral("CONNECTED");
+    case RFLOW_CONN_DISCONNECTED:
+        return QStringLiteral("DISCONNECTED");
+    case RFLOW_CONN_FAILED:
+        return QStringLiteral("FAILED");
+    default:
+        return QStringLiteral("UNKNOWN");
+    }
+}
+
+QString streamStateToString(rflow_stream_state_t state)
+{
+    switch (state) {
+    case RFLOW_STREAM_IDLE:
+        return QStringLiteral("IDLE");
+    case RFLOW_STREAM_OPENING:
+        return QStringLiteral("OPENING");
+    case RFLOW_STREAM_OPENED:
+        return QStringLiteral("OPENED");
+    case RFLOW_STREAM_CLOSING:
+        return QStringLiteral("CLOSING");
+    case RFLOW_STREAM_CLOSED:
+        return QStringLiteral("CLOSED");
+    case RFLOW_STREAM_FAILED:
+        return QStringLiteral("FAILED");
+    default:
+        return QStringLiteral("UNKNOWN");
+    }
+}
+
+QString errorToString(rflow_err_t err)
+{
+    switch (err) {
+    case RFLOW_OK:
+        return QStringLiteral("RFLOW_OK");
+    case RFLOW_ERR_FAIL:
+        return QStringLiteral("RFLOW_ERR_FAIL");
+    case RFLOW_ERR_PARAM:
+        return QStringLiteral("RFLOW_ERR_PARAM");
+    case RFLOW_ERR_NOT_SUPPORT:
+        return QStringLiteral("RFLOW_ERR_NOT_SUPPORT");
+    case RFLOW_ERR_STATE:
+        return QStringLiteral("RFLOW_ERR_STATE");
+    case RFLOW_ERR_NO_MEM:
+        return QStringLiteral("RFLOW_ERR_NO_MEM");
+    case RFLOW_ERR_TIMEOUT:
+        return QStringLiteral("RFLOW_ERR_TIMEOUT");
+    case RFLOW_ERR_BUSY:
+        return QStringLiteral("RFLOW_ERR_BUSY");
+    case RFLOW_ERR_NOT_FOUND:
+        return QStringLiteral("RFLOW_ERR_NOT_FOUND");
+    case RFLOW_ERR_TRUNCATED:
+        return QStringLiteral("RFLOW_ERR_TRUNCATED");
+    case RFLOW_ERR_CONN_FAIL:
+        return QStringLiteral("RFLOW_ERR_CONN_FAIL");
+    case RFLOW_ERR_CONN_AUTH:
+        return QStringLiteral("RFLOW_ERR_CONN_AUTH");
+    case RFLOW_ERR_CONN_LICENSE:
+        return QStringLiteral("RFLOW_ERR_CONN_LICENSE");
+    case RFLOW_ERR_CONN_NETWORK:
+        return QStringLiteral("RFLOW_ERR_CONN_NETWORK");
+    case RFLOW_ERR_CONN_KICKED:
+        return QStringLiteral("RFLOW_ERR_CONN_KICKED");
+    case RFLOW_ERR_STREAM_NOT_EXIST:
+        return QStringLiteral("RFLOW_ERR_STREAM_NOT_EXIST");
+    case RFLOW_ERR_STREAM_ALREADY_OPEN:
+        return QStringLiteral("RFLOW_ERR_STREAM_ALREADY_OPEN");
+    case RFLOW_ERR_STREAM_CODEC_UNSUPP:
+        return QStringLiteral("RFLOW_ERR_STREAM_CODEC_UNSUPP");
+    case RFLOW_ERR_STREAM_ENCODER_FAIL:
+        return QStringLiteral("RFLOW_ERR_STREAM_ENCODER_FAIL");
+    case RFLOW_ERR_STREAM_NO_SUBSCRIBER:
+        return QStringLiteral("RFLOW_ERR_STREAM_NO_SUBSCRIBER");
+    default:
+        return QStringLiteral("RFLOW_ERR_UNKNOWN");
+    }
+}
+
 }  // namespace
 
 WebRTCReceiverClient::WebRTCReceiverClient(QObject *parent)
@@ -103,6 +189,13 @@ void WebRTCReceiverClient::connectToSignaling(const QString &addr)
     demo::latency_trace::reset();
 
     const QString signalAddr = effectiveSignalAddr(addr);
+    const QString requestedDeviceId =
+        m_deviceId.trimmed().isEmpty() ? QStringLiteral(RFLOW_DEFAULT_DEVICE_ID) : m_deviceId.trimmed();
+    qInfo().noquote() << QStringLiteral("[RFlowConnect] start signal=%1 device_id=\"%2\" stream_index=%3 secret_set=%4")
+                             .arg(signalAddr)
+                             .arg(requestedDeviceId)
+                             .arg(m_streamIndex)
+                             .arg(m_deviceSecret.isEmpty() ? QStringLiteral("false") : QStringLiteral("true"));
     Q_EMIT statusChanged(QStringLiteral("正在初始化 libRoboFlow..."));
 
     rflow_err_t err = configureAndInitSdk(signalAddr);
@@ -137,6 +230,9 @@ void WebRTCReceiverClient::disconnect()
     resetConnectionStats();
     m_overwrittenPendingFrames = 0;
     m_deliveredFrames = 0;
+    m_hasReceivedVideoFrame = false;
+    m_hasReceivedVideoCallback = false;
+    m_hasReportedRendererMissing = false;
     demo::latency_trace::reset();
 
     if (m_videoSink) {
@@ -179,6 +275,9 @@ void WebRTCReceiverClient::setVideoSink(QObject *sink)
     }
     m_videoRenderer = sink;
     m_videoSink = qobject_cast<VideoFrameSink *>(sink);
+    m_hasReportedRendererMissing = false;
+    qInfo().noquote() << QStringLiteral("[RenderQueue] video sink assigned=%1")
+                             .arg(m_videoSink ? QStringLiteral("true") : QStringLiteral("false"));
 }
 
 void WebRTCReceiverClient::onConnectStateThunk(rflow_connect_state_t state,
@@ -237,6 +336,20 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
                                            librflow_video_frame_get_height(frame),
                                            librflow_video_frame_get_data_size(frame));
 
+    if (!self->m_hasReceivedVideoCallback) {
+        self->m_hasReceivedVideoCallback = true;
+        qInfo().noquote() << QStringLiteral("[RenderQueue] first video callback frame=%1").arg(frameId);
+        QPointer<WebRTCReceiverClient> guard(self);
+        QMetaObject::invokeMethod(
+            self,
+            [guard]() {
+                if (guard && !guard->m_hasReceivedVideoFrame) {
+                    guard->statusChanged(QStringLiteral("已收到视频回调，等待渲染"));
+                }
+            },
+            Qt::QueuedConnection);
+    }
+
     librflow_video_frame_t retained = librflow_video_frame_retain(frame);
     if (!retained) {
         return;
@@ -268,9 +381,11 @@ void WebRTCReceiverClient::onStreamStatsThunk(librflow_stream_stats_t stats, voi
 
 rflow_err_t WebRTCReceiverClient::configureAndInitSdk(const QString &addr)
 {
+    qInfo().noquote() << QStringLiteral("[RFlowInit] configure signal=%1").arg(effectiveSignalAddr(addr));
     librflow_global_config_t globalConfig = librflow_global_config_create();
     librflow_signal_config_t signalConfig = librflow_signal_config_create();
     if (!globalConfig || !signalConfig) {
+        qWarning() << "[RFlowInit] config allocation failed";
         if (signalConfig) {
             librflow_signal_config_destroy(signalConfig);
         }
@@ -294,21 +409,31 @@ rflow_err_t WebRTCReceiverClient::configureAndInitSdk(const QString &addr)
     librflow_global_config_destroy(globalConfig);
 
     if (err != RFLOW_OK) {
+        qWarning().noquote() << QStringLiteral("[RFlowInit] configure failed err=%1").arg(err);
         return err;
     }
 
     err = librflow_init();
     if (err == RFLOW_OK) {
         m_sdkInitialized = true;
+        qInfo() << "[RFlowInit] librflow_init ok";
+    } else {
+        qWarning().noquote() << QStringLiteral("[RFlowInit] librflow_init failed err=%1").arg(err);
     }
     return err;
 }
 
 rflow_err_t WebRTCReceiverClient::connectSdk()
 {
+    const QString effectiveDeviceId =
+        m_deviceId.trimmed().isEmpty() ? QStringLiteral(RFLOW_DEFAULT_DEVICE_ID) : m_deviceId.trimmed();
+    qInfo().noquote() << QStringLiteral("[RFlowConnect] connectSdk device_id=\"%1\" secret_set=%2")
+                             .arg(effectiveDeviceId)
+                             .arg(m_deviceSecret.isEmpty() ? QStringLiteral("false") : QStringLiteral("true"));
     librflow_connect_info_t info = librflow_connect_info_create();
     librflow_connect_cb_t cb = librflow_connect_cb_create();
     if (!info || !cb) {
+        qWarning() << "[RFlowConnect] connect info/callback allocation failed";
         if (cb) {
             librflow_connect_cb_destroy(cb);
         }
@@ -323,13 +448,13 @@ rflow_err_t WebRTCReceiverClient::connectSdk()
         err = librflow_connect_cb_set_userdata(cb, this);
     }
 
-    const QByteArray deviceIdUtf8 = m_deviceId.toUtf8();
-    if (err == RFLOW_OK && !m_deviceId.isEmpty()) {
+    const QByteArray deviceIdUtf8 = effectiveDeviceId.toUtf8();
+    if (err == RFLOW_OK) {
         err = librflow_connect_info_set_device_id(info, deviceIdUtf8.constData());
     }
 
     const QByteArray deviceSecretUtf8 = m_deviceSecret.toUtf8();
-    if (err == RFLOW_OK && !m_deviceSecret.isEmpty()) {
+    if (err == RFLOW_OK) {
         err = librflow_connect_info_set_device_secret(info, deviceSecretUtf8.constData());
     }
 
@@ -342,15 +467,22 @@ rflow_err_t WebRTCReceiverClient::connectSdk()
 
     if (err == RFLOW_OK) {
         m_connected = true;
+        qInfo() << "[RFlowConnect] librflow_connect submitted";
+    } else {
+        qWarning().noquote() << QStringLiteral("[RFlowConnect] librflow_connect failed err=%1").arg(err);
     }
     return err;
 }
 
 rflow_err_t WebRTCReceiverClient::openStream()
 {
+    qInfo().noquote()
+        << QStringLiteral("[RFlowStream] openStream stream_index=%1 preferred_codec=H264")
+               .arg(m_streamIndex);
     librflow_stream_cb_t cb = librflow_stream_cb_create();
     librflow_stream_param_t param = librflow_stream_param_create();
     if (!cb || !param) {
+        qWarning() << "[RFlowStream] stream callback/param allocation failed";
         if (param) {
             librflow_stream_param_destroy(param);
         }
@@ -368,7 +500,7 @@ rflow_err_t WebRTCReceiverClient::openStream()
         err = librflow_stream_cb_set_userdata(cb, this);
     }
     if (err == RFLOW_OK) {
-        err = librflow_stream_param_set_video_output_mode(param, RFLOW_VIDEO_OUTPUT_MODE_PREFER_GPU);
+        err = librflow_stream_param_set_preferred_codec(param, RFLOW_CODEC_H264);
     }
     if (err == RFLOW_OK) {
         err = librflow_open_stream(m_streamIndex, param, cb, &m_streamHandle);
@@ -376,14 +508,23 @@ rflow_err_t WebRTCReceiverClient::openStream()
 
     librflow_stream_param_destroy(param);
     librflow_stream_cb_destroy(cb);
+    if (err == RFLOW_OK) {
+        qInfo().noquote() << QStringLiteral("[RFlowStream] librflow_open_stream submitted handle=%1")
+                                 .arg(reinterpret_cast<quintptr>(m_streamHandle));
+    } else {
+        qWarning().noquote() << QStringLiteral("[RFlowStream] librflow_open_stream failed err=%1").arg(err);
+    }
     return err;
 }
 
 void WebRTCReceiverClient::closeStream()
 {
     if (!m_streamHandle) {
+        qInfo() << "[RFlowStream] closeStream skipped: no active handle";
         return;
     }
+    qInfo().noquote() << QStringLiteral("[RFlowStream] closeStream handle=%1")
+                             .arg(reinterpret_cast<quintptr>(m_streamHandle));
     librflow_close_stream(m_streamHandle);
     m_streamHandle = nullptr;
 }
@@ -391,10 +532,12 @@ void WebRTCReceiverClient::closeStream()
 void WebRTCReceiverClient::cleanupSdk()
 {
     if (m_connected) {
+        qInfo() << "[RFlowConnect] disconnect sdk";
         librflow_disconnect();
         m_connected = false;
     }
     if (m_sdkInitialized) {
+        qInfo() << "[RFlowInit] uninit sdk";
         librflow_uninit();
         m_sdkInitialized = false;
     }
@@ -402,6 +545,12 @@ void WebRTCReceiverClient::cleanupSdk()
 
 void WebRTCReceiverClient::handleConnectState(rflow_connect_state_t state, rflow_err_t reason)
 {
+    qInfo().noquote() << QStringLiteral("[RFlowConnect] state=%1 reason=%2 last_error=\"%3\"")
+                             .arg(connectStateToString(state))
+                             .arg(QStringLiteral("%1(%2)")
+                                      .arg(errorToString(reason))
+                                      .arg(reason))
+                             .arg(QString::fromUtf8(librflow_get_last_error() ? librflow_get_last_error() : ""));
     switch (state) {
     case RFLOW_CONN_CONNECTING:
         Q_EMIT statusChanged(QStringLiteral("正在连接设备..."));
@@ -425,8 +574,17 @@ void WebRTCReceiverClient::handleConnectState(rflow_connect_state_t state, rflow
 
 void WebRTCReceiverClient::handleStreamState(rflow_stream_state_t state, rflow_err_t reason)
 {
+    qInfo().noquote() << QStringLiteral("[RFlowStream] state=%1 reason=%2 last_error=\"%3\"")
+                             .arg(streamStateToString(state))
+                             .arg(QStringLiteral("%1(%2)")
+                                      .arg(errorToString(reason))
+                                      .arg(reason))
+                             .arg(QString::fromUtf8(librflow_get_last_error() ? librflow_get_last_error() : ""));
     switch (state) {
     case RFLOW_STREAM_OPENING:
+        m_hasReceivedVideoFrame = false;
+        m_hasReceivedVideoCallback = false;
+        m_hasReportedRendererMissing = false;
         Q_EMIT statusChanged(QStringLiteral("正在拉流..."));
         break;
     case RFLOW_STREAM_OPENED:
@@ -437,10 +595,12 @@ void WebRTCReceiverClient::handleStreamState(rflow_stream_state_t state, rflow_e
         break;
     case RFLOW_STREAM_CLOSED:
         m_streamHandle = nullptr;
+        m_hasReceivedVideoFrame = false;
         Q_EMIT statusChanged(QStringLiteral("流已关闭"));
         break;
     case RFLOW_STREAM_FAILED:
         m_streamHandle = nullptr;
+        m_hasReceivedVideoFrame = false;
         Q_EMIT statusChanged(formatSdkError(QStringLiteral("流失败"), reason));
         break;
     case RFLOW_STREAM_IDLE:
@@ -516,6 +676,10 @@ void WebRTCReceiverClient::deliverPendingFrame()
 
         if (supportedFrame) {
             if (m_videoSink) {
+                if (!m_hasReceivedVideoFrame) {
+                    m_hasReceivedVideoFrame = true;
+                    Q_EMIT statusChanged(QStringLiteral("已收到视频流"));
+                }
                 ++m_deliveredFrames;
                 if (m_deliveredFrames <= 5 || (m_deliveredFrames % 120) == 0) {
                     qInfo().noquote()
@@ -529,6 +693,10 @@ void WebRTCReceiverClient::deliverPendingFrame()
                 }
                 m_videoSink->presentFrame(frame);
                 frame = nullptr;
+            } else if (!m_hasReportedRendererMissing) {
+                m_hasReportedRendererMissing = true;
+                qWarning().noquote() << QStringLiteral("[RenderQueue] video sink missing while frame=%1").arg(frameId);
+                Q_EMIT statusChanged(QStringLiteral("已收到视频流，但渲染器未就绪"));
             }
         } else {
             qWarning().noquote()
@@ -539,13 +707,15 @@ void WebRTCReceiverClient::deliverPendingFrame()
                        .arg(planeCount)
                        .arg(width)
                        .arg(height);
+            if (!m_hasReceivedVideoFrame) {
+                Q_EMIT statusChanged(QStringLiteral("已收到视频流，但当前帧格式不支持渲染"));
+            }
         }
 
         if (frame) {
             librflow_video_frame_release(frame);
         }
     }
-
     bool repost = false;
     {
         QMutexLocker locker(&m_pendingFrameMutex);
@@ -591,9 +761,15 @@ void WebRTCReceiverClient::resetConnectionStats()
     }
 }
 
+void WebRTCReceiverClient::emitStatus(const QString &status)
+{
+    qInfo().noquote() << QStringLiteral("[RFlowStatus] %1").arg(status);
+    Q_EMIT statusChanged(status);
+}
+
 QString WebRTCReceiverClient::formatSdkError(const QString &prefix, rflow_err_t err) const
 {
-    QString message = QStringLiteral("%1: err=%2").arg(prefix).arg(err);
+    QString message = QStringLiteral("%1: %2(%3)").arg(prefix, errorToString(err)).arg(err);
     const char *lastError = librflow_get_last_error();
     if (lastError && lastError[0] != '\0') {
         message += QStringLiteral(" - %1").arg(QString::fromUtf8(lastError));
