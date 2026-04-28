@@ -8,7 +8,7 @@ Window {
     width: 420
     height: 600
     visible: true
-    title: qsTr("LibWebRTC Demo")
+    title: qsTr("LibWebRTC Web Test")
     color: "#1A1A2E"
     minimumWidth: 360
     minimumHeight: 480
@@ -30,8 +30,13 @@ Window {
     }
 
     Component.onCompleted: {
-        receiverStatus = "方向3 验证: 等待 Activity 就绪 (1.5s)..."
-        connectReadyTimer.start()
+        if (Qt.platform.os === "android") {
+            receiverStatus = "等待 Activity 就绪 (1.5s)..."
+            connectReadyTimer.start()
+        } else {
+            connectReady = true
+            receiverStatus = "未连接"
+        }
     }
 
     Timer {
@@ -45,9 +50,9 @@ Window {
     }
 
     Connections {
-        target: receiverClient
-        function onStatusChanged(status) {
-            receiverStatus = status
+        target: webrtcReceiver
+        function onStatusChanged() {
+            receiverStatus = webrtcReceiver.status
         }
     }
 
@@ -71,13 +76,12 @@ Window {
                 Layout.preferredHeight: 48
 
                 Row {
-                    id: titleRow
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: 14
 
                     Text {
-                        text: "LibWebRTC Demo"
+                        text: "WebView WebRTC"
                         font.pixelSize: 22
                         font.bold: true
                         color: "#E94560"
@@ -85,7 +89,7 @@ Window {
 
                     Text {
                         text: root.titleClockText
-                        font.pixelSize: 22
+                        font.pixelSize: 28
                         font.bold: true
                         font.family: "monospace"
                         color: "#E94560"
@@ -95,7 +99,7 @@ Window {
                 Text {
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "接收端"
+                    text: "测试版"
                     font.pixelSize: 12
                     color: "#6B7280"
                 }
@@ -111,113 +115,15 @@ Window {
                 border.width: 1
                 clip: true
 
-                WebRTCVideoRenderer {
-                    id: videoRenderer
+                WebReceiverView {
                     anchors.fill: parent
                     anchors.margins: 2
-
-                    Component.onCompleted: {
-                        receiverClient.setVideoRenderer(videoRenderer)
-                    }
-                }
-
-                Rectangle {
-                    anchors.fill: parent
-                    anchors.margins: 1
-                    radius: 10
-                    color: "transparent"
-                    border.width: (videoRenderer.hasEncodedIngressTracking
-                                   || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)) ? 2 : 0
-                    border.color: (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
-                                  ? (videoRenderer.frameIdFromTracking ? "#22C55E" : "#F59E0B")
-                                  : (videoRenderer.hasEncodedIngressTracking ? "#06B6D4" : "#00000000")
-                    visible: videoRenderer.hasEncodedIngressTracking || videoRenderer.hasVideo
-                }
-
-                Rectangle {
-                    anchors.bottom: parent.bottom
-                    anchors.left: parent.left
-                    anchors.margins: 10
-                    implicitWidth: Math.max(bufferline.implicitWidth, rttline.implicitWidth, idPipeline.implicitWidth) + 16
-                    implicitHeight: idColumn.implicitHeight + 16
-                    radius: 4
-                    color: "#B3000000"
-                    visible: videoRenderer.hasEncodedIngressTracking
-                             || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
-                             || videoRenderer.hasSampledPipelineUi
-
-                    Row {
-                        id: idColumn
-                        anchors.centerIn: parent
-                        spacing: 4
-
-                        Text {
-                            id: idPipeline
-                            width: Math.min(280, root.width - 64)
-                            visible: videoRenderer.hasSampledPipelineUi
-                            wrapMode: Text.WordWrap
-                            text: videoRenderer.sampledPipelineLine
-                            font.pixelSize: 11
-                            font.bold: true
-                            color: "#93C5FD"
-                        }
-
-                        Text {
-                            id: bufferline
-                            Layout.fillWidth: true
-                            font.pixelSize: 11
-                            font.family: "monospace"
-                            color: "#9CA3AF"
-                            wrapMode: Text.WordWrap
-                            text: receiverClient.hasConnectionStats
-                                  ? ("抖动缓冲(帧均值): "
-                                     + receiverClient.jitterBufferMs.toFixed(1) + " ms")
-                                  : "抖动缓冲(帧均值): -"
-                        }
-
-                        Text {
-                            id: rttline
-                            Layout.fillWidth: true
-                            font.pixelSize: 11
-                            font.family: "monospace"
-                            color: "#9CA3AF"
-                            wrapMode: Text.WordWrap
-                            text: receiverClient.hasConnectionStats
-                                  ? ("RTT 当前: " + receiverClient.rttCurrentMs.toFixed(1) + " ms"
-                                     + "  |  平均: " + receiverClient.rttAvgMs.toFixed(1) + " ms")
-                                  : "RTT 当前 / 平均: -"
-                        }
-                    }
-                }
-
-                Column {
-                    anchors.centerIn: parent
-                    width: parent.width - 24
-                    spacing: 6
-                    visible: !videoRenderer.hasVideo && !videoRenderer.hasEncodedIngressTracking
-
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "视频将在此显示"
-                        font.pixelSize: 14
-                        color: "#4B5563"
-                    }
-
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: "青框显示编码入站跟踪，绿色/橙色边框表示已解码帧。"
-                        font.pixelSize: 10
-                        color: "#6B7280"
-                        horizontalAlignment: Text.AlignHCenter
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                    }
                 }
             }
 
             Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 228
+                Layout.preferredHeight: 180
                 radius: 12
                 color: "#16213E"
                 border.color: "#0F3460"
@@ -238,7 +144,6 @@ Window {
                             radius: 4
                             color: receiverStatus.indexOf("已连接") >= 0 ? "#22C55E" : "#6B7280"
                         }
-
                         Text {
                             Layout.fillWidth: true
                             text: receiverStatus
@@ -246,7 +151,7 @@ Window {
                             color: "#E5E7EB"
                             wrapMode: Text.WordWrap
                             elide: Text.ElideRight
-                            maximumLineCount: 2
+                            maximumLineCount: 3
                         }
                     }
 
@@ -265,24 +170,6 @@ Window {
                         }
                     }
 
-                    Button {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 32
-                        text: "验证诊断 (输出到 logcat)"
-                        onClicked: receiverClient.runVerificationDiagnostic()
-                        background: Rectangle {
-                            radius: 6
-                            color: parent.pressed ? "#4B5563" : "#374151"
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "#9CA3AF"
-                            font.pixelSize: 12
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                    }
-
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 12
@@ -291,8 +178,8 @@ Window {
                             text: "连接接收"
                             Layout.fillWidth: true
                             Layout.preferredHeight: 44
-                            enabled: root.connectReady
-                            onClicked: receiverClient.requestPermissionAndConnect(urlField.text)
+                            enabled: root.connectReady && webrtcReceiver.webChannelPort > 0
+                            onClicked: webrtcReceiver.requestPermissionAndConnect(urlField.text)
 
                             background: Rectangle {
                                 radius: 8
@@ -312,7 +199,7 @@ Window {
                             text: "断开"
                             Layout.fillWidth: true
                             Layout.preferredHeight: 44
-                            onClicked: receiverClient.disconnect()
+                            onClicked: webrtcReceiver.disconnect()
 
                             background: Rectangle {
                                 radius: 8

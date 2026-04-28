@@ -2,8 +2,9 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QtGlobal>
+#include <QtWebView/qtwebviewfunctions.h>
 
-#include "webrtc_receiver_client.h"
+#include "webrtc_webview_receiver.h"
 
 static void initSceneGraphForLowerVideoLatency()
 {
@@ -17,11 +18,12 @@ int main(int argc, char *argv[])
 {
     initSceneGraphForLowerVideoLatency();
     QGuiApplication app(argc, argv);
+    QtWebView::initialize();
 
-    WebRTCReceiverClient receiver;
+    WebRtcWebViewReceiver receiver;
 
     QQmlApplicationEngine engine;
-    engine.rootContext()->setContextProperty("receiverClient", &receiver);
+    engine.rootContext()->setContextProperty("webrtcReceiver", &receiver);
 
     const QUrl url(QStringLiteral("qrc:/LibwebRtcDemo/main.qml"));
     QObject::connect(
