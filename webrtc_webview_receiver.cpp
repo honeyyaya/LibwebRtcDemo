@@ -13,7 +13,7 @@
 #include <QWebSocketServer>
 
 #ifndef DEFAULT_SIGNALING_ADDR
-#define DEFAULT_SIGNALING_ADDR "192.168.3.20:8765"
+#define DEFAULT_SIGNALING_ADDR "192.168.3.20:8765?stream_id=demo_device:0"
 #endif
 
 // --- WebViewSignalingBridge ---

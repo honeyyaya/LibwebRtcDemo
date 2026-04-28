@@ -7,42 +7,38 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Qt WebView：Android 使用系统 WebView（Chromium）；网页内标准 WebRTC（谷歌栈）
-# 信令仍为 C++ TCP（SignalingClient）；QWebChannel 经本机 WebSocket 与页面通信
-find_package(Qt6 6.2 REQUIRED COMPONENTS
-    Quick
-    Network
-    WebSockets
-    WebChannel
-    WebView
-    WebViewQuick
-    Widgets
-)
+find_package(Qt6 6.2 COMPONENTS Quick WebSockets Widgets Network OpenGL REQUIRED)
+
+set(WEBRTC_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include" CACHE PATH "WebRTC headers root")
+if(ANDROID)
+  set(WEBRTC_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/${ANDROID_ABI}" CACHE PATH "WebRTC prebuilt lib dir")
+else()
+  set(WEBRTC_LIB_DIR "${CMAKE_SOURCE_DIR}/lib" CACHE PATH "WebRTC prebuilt lib dir")
+endif()
+set(WEBRTC_STATIC_LIB "${WEBRTC_LIB_DIR}/libwebrtc.a" CACHE FILEPATH "Path to libwebrtc.a")
 
 qt_add_executable(appLibwebRtcDemo
     main.cpp
+    webrtc_factory_helper.h
+    webrtc_factory_helper.cpp
+    webrtc_receiver_client.h
+    webrtc_receiver_client.cpp
+    webrtc_video_renderer.h
+    webrtc_video_renderer.cpp
+    video_decode_sink_timing_bridge.h
+    video_decode_sink_timing_bridge.cpp
+    encoded_tracking_bridge.h
+    encoded_tracking_bridge.cpp
     signaling_client.h
     signaling_client.cpp
-    webchannel_websocket_transport.h
-    webchannel_websocket_transport.cpp
-    webrtc_webview_receiver.h
-    webrtc_webview_receiver.cpp
 )
 
 qt_add_qml_module(appLibwebRtcDemo
     URI LibwebRtcDemo
     VERSION 1.0
-    QML_FILES
-        main.qml
-        WebReceiverView.qml
+    QML_FILES main.qml
     SOURCES
-)
-
-qt_add_resources(appLibwebRtcDemo "libwebrtc_demo_web"
-    PREFIX "/LibwebRtcDemo"
-    FILES
-        webreceiver.html
-        qwebchannel.js
+        webrtc_video_renderer.h
 )
 
 if(ANDROID)
@@ -58,17 +54,62 @@ set_target_properties(appLibwebRtcDemo PROPERTIES
     WIN32_EXECUTABLE TRUE
 )
 
-target_link_libraries(appLibwebRtcDemo PRIVATE
-    Qt6::Quick
-    Qt6::Network
-    Qt6::WebSockets
-    Qt6::WebChannel
-    Qt6::WebView
-    Qt6::WebViewQuick
-    Qt6::Widgets
+target_include_directories(appLibwebRtcDemo PRIVATE
+    ${WEBRTC_INCLUDE_DIR}
+    ${WEBRTC_INCLUDE_DIR}/third_party/abseil-cpp
+    ${WEBRTC_INCLUDE_DIR}/third_party/libyuv/include
 )
 
-message(STATUS "LibwebRtcDemo: WebView + 页面 WebRTC（本机 ws QWebChannel），入口 qrc:/LibwebRtcDemo/main.qml")
+set(_webrtc_platform_defs QT_NO_KEYWORDS)
+if(ANDROID)
+  list(APPEND _webrtc_platform_defs WEBRTC_POSIX WEBRTC_ANDROID)
+elseif(APPLE)
+  list(APPEND _webrtc_platform_defs WEBRTC_MAC)
+elseif(WIN32)
+  list(APPEND _webrtc_platform_defs WEBRTC_WIN)
+else()
+  list(APPEND _webrtc_platform_defs WEBRTC_POSIX)
+endif()
+target_compile_definitions(appLibwebRtcDemo PRIVATE ${_webrtc_platform_defs})
+
+if(NOT EXISTS "${WEBRTC_STATIC_LIB}")
+  message(FATAL_ERROR
+    "WebRTC static library not found: ${WEBRTC_STATIC_LIB}\n"
+    "Place libwebrtc.a in:\n"
+    "  ${WEBRTC_LIB_DIR}/\n"
+    "or rerun CMake with:\n"
+    "  -DWEBRTC_STATIC_LIB=D:/path/to/libwebrtc.a\n")
+endif()
+
+add_library(webrtc STATIC IMPORTED)
+set_target_properties(webrtc PROPERTIES
+    IMPORTED_LOCATION "${WEBRTC_STATIC_LIB}"
+    IMPORTED_LINK_INTERFACE_LANGUAGES CXX
+)
+
+target_link_libraries(appLibwebRtcDemo
+    PRIVATE
+        Qt6::Quick
+        Qt6::WebSockets
+        Qt6::Widgets
+        Qt6::Network
+        Qt6::OpenGL
+        webrtc
+)
+
+if(ANDROID)
+  target_sources(appLibwebRtcDemo PRIVATE
+      android_hw_video_decoder_factory.cpp
+      android_mediacodec_video_decoder.cpp
+  )
+  target_link_libraries(appLibwebRtcDemo PRIVATE
+      log
+      android
+      GLESv2
+      EGL
+      mediandk
+  )
+endif()
 
 include(GNUInstallDirs)
 install(TARGETS appLibwebRtcDemo

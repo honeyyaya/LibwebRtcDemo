@@ -28,6 +28,28 @@
 #include <limits>
 #include <QtGlobal>
 
+#if defined(__ANDROID__)
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+#endif
+
+#ifndef GL_UNPACK_ROW_LENGTH
+#define GL_UNPACK_ROW_LENGTH 0x0CF2
+#endif
+#ifndef GL_PIXEL_UNPACK_BUFFER
+#define GL_PIXEL_UNPACK_BUFFER 0x88EC
+#endif
+#ifndef GL_STREAM_DRAW
+#define GL_STREAM_DRAW 0x88E0
+#endif
+#ifndef GL_MAP_WRITE_BIT
+#define GL_MAP_WRITE_BIT 0x0002
+#endif
+#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
+#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
+#endif
+
 struct I420PlaneTexCache {
     int w = 0;
     int h = 0;
@@ -340,27 +362,6 @@ static webrtc::scoped_refptr<webrtc::I420BufferInterface> ResolveI420ForUpload(
 
 }  // namespace webrtc_demo
 
-#if defined(__ANDROID__)
-#ifndef GL_TEXTURE_EXTERNAL_OES
-#define GL_TEXTURE_EXTERNAL_OES 0x8D65
-#endif
-#endif
-
-#ifndef GL_UNPACK_ROW_LENGTH
-#define GL_UNPACK_ROW_LENGTH 0x0CF2
-#endif
-#ifndef GL_PIXEL_UNPACK_BUFFER
-#define GL_PIXEL_UNPACK_BUFFER 0x88EC
-#endif
-#ifndef GL_STREAM_DRAW
-#define GL_STREAM_DRAW 0x88E0
-#endif
-#ifndef GL_MAP_WRITE_BIT
-#define GL_MAP_WRITE_BIT 0x0002
-#endif
-#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
-#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
-#endif
 #ifndef GL_LUMINANCE_ALPHA
 #define GL_LUMINANCE_ALPHA 0x190A
 #endif
@@ -544,8 +545,8 @@ private:
     };
 
     static constexpr GLfloat kTexCoords[8] = {
-        0.0f, 1.0f, 1.0f, 1.0f,
-        0.0f, 0.0f, 1.0f, 0.0f
+        1.0f, 1.0f, 0.0f, 1.0f,
+        1.0f, 0.0f, 0.0f, 0.0f
     };
 
     bool ensureInitialized()

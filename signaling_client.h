@@ -2,6 +2,7 @@
 #define SIGNALING_CLIENT_H
 
 #include <functional>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <thread>
@@ -39,11 +40,20 @@ private:
     void ParseAndDispatch(const std::string& line);
     bool Connect();
     void SendLine(const std::string& line);
+    std::string BuildRegisterLine() const;
+    static std::string EscapeJsonString(const std::string& value);
 
     std::string server_addr_;
     std::string host_;
     uint16_t port_;
     std::string role_;
+    std::string stream_id_;
+    std::string device_id_;
+    int stream_index_{0};
+    std::string self_peer_id_;
+    std::string last_remote_peer_id_;
+    mutable std::mutex peer_mutex_;
+    mutable std::mutex send_mutex_;
 
     OnAnswerCallback on_answer_;
     OnOfferCallback on_offer_;
