@@ -8,7 +8,7 @@ Window {
     width: 420
     height: 600
     visible: true
-    title: qsTr("LibWebRTC Demo")
+    title: qsTr("webDemo")
     color: "#1A1A2E"
     minimumWidth: 360
     minimumHeight: 480
@@ -17,7 +17,7 @@ Window {
     // 方向3: 启动后延迟 1.5 秒再允许连接，确保 Activity/JNI 就绪后再连信令
     property bool connectReady: false
     // 信令地址：TCP 直连信令服务器（JSON-per-line 协议）
-    property string signalingUrl: "192.168.3.20:8765"
+    property string signalingUrl: "192.168.3.20:8765?stream_id=demo_device:0"
     property string titleClockText: ""
 
     Timer {
@@ -79,7 +79,7 @@ Window {
                     spacing: 14
 
                     Text {
-                        text: "LibWebRTC Demo"
+                        text: "webDemo"
                         font.pixelSize: 22
                         font.bold: true
                         color: "#E94560"
@@ -283,7 +283,7 @@ Window {
                         id: urlField
                         Layout.fillWidth: true
                         Layout.preferredHeight: 36
-                        placeholderText: "host:port (如 192.168.3.20:8765)"
+                        placeholderText: "host:port?stream_id=demo_device:0"
                         text: root.signalingUrl
                         font.pixelSize: 11
                         color: "#E5E7EB"

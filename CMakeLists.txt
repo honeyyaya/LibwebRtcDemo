@@ -47,6 +47,7 @@ qt_add_qml_module(appLibwebRtcDemo
 if(ANDROID)
     set_target_properties(appLibwebRtcDemo PROPERTIES
         QT_ANDROID_PACKAGE_SOURCE_DIR ${CMAKE_SOURCE_DIR}/android
+        QT_ANDROID_APP_NAME "webDemo"
         QT_ANDROID_PACKAGE_NAME "org.qtproject.example.libwebrtcdemo")
 endif()
 
