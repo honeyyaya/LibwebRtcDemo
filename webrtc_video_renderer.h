@@ -72,6 +72,7 @@ private:
     mutable QMutex m_frameMutex;
     librflow_video_frame_t m_pendingFrame = nullptr;
     bool m_pendingValid = false;
+    bool m_updatePending = false;
 
     int m_highlightFrameId = -1;
     bool m_frameIdFromTracking = false;

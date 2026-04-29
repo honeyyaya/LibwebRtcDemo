@@ -1303,6 +1303,7 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
     }
 
     bool highlightChanged = false;
+    bool shouldRequestUpdate = false;
     {
         QMutexLocker locker(&m_frameMutex);
         if (m_pendingFrame) {
@@ -1310,6 +1311,10 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
         }
         m_pendingFrame = frame;
         m_pendingValid = true;
+        if (!m_updatePending) {
+            m_updatePending = true;
+            shouldRequestUpdate = true;
+        }
         if (m_highlightFrameId != static_cast<int>(frameId) || m_frameIdFromTracking) {
             m_highlightFrameId = static_cast<int>(frameId);
             m_frameIdFromTracking = false;
@@ -1326,7 +1331,9 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
     if (highlightChanged) {
         Q_EMIT highlightFrameIdChanged();
     }
-    update();
+    if (shouldRequestUpdate) {
+        update();
+    }
 }
 
 void WebRTCVideoRenderer::clearVideoTrack()
@@ -1339,6 +1346,7 @@ void WebRTCVideoRenderer::clearVideoTrack()
             m_pendingFrame = nullptr;
         }
         m_pendingValid = false;
+        m_updatePending = false;
         m_highlightFrameId = -1;
         m_frameIdFromTracking = false;
     }
@@ -1445,6 +1453,7 @@ void WebRTCVideoRenderer::geometryChange(const QRectF &newGeometry, const QRectF
 bool WebRTCVideoRenderer::takeFrame(librflow_video_frame_t &outFrame, quint32 &outFrameId)
 {
     QMutexLocker locker(&m_frameMutex);
+    m_updatePending = false;
     if (!m_pendingValid || !m_pendingFrame) {
         return false;
     }
