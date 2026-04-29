@@ -112,6 +112,7 @@ target_link_libraries(appLibwebRtcDemo
 if(ANDROID)
   target_sources(appLibwebRtcDemo PRIVATE
       android_hw_video_decoder_factory.cpp
+      android_native_video_frame_buffer.cpp
       android_mediacodec_video_decoder.cpp
   )
   target_link_libraries(appLibwebRtcDemo PRIVATE

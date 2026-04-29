@@ -399,12 +399,14 @@ void WebRTCReceiverClient::createPeerConnection()
 {
   // 须在 CreatePeerConnectionFactory 之前注册；全局至多一次（见 field_trial.h）。
   // 与发送端保持一致：FrameTracking（RTP 扩展协商）+ FlexFEC-03（SDP 中带 flexfec-03，且启用 FEC 收包；可与 NACK 并存）。
-  static std::string g_field_trials_storage =
-      "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
-  g_field_trials_storage +="WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:0/";
-  g_field_trials_storage += "WebRTC-ZeroPlayoutDelay/min_pacing:0ms,max_decode_queue_size:4/";
-  g_field_trials_storage +="WebRTC-Pacer-KeyframeFlushing/Enabled/";
-  g_field_trials_storage +="WebRTC-Pacer-FastRetransmissions/Enabled/";
+  // static std::string g_field_trials_storage ="WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+  // g_field_trials_storage +="WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:0/";
+  // g_field_trials_storage += "WebRTC-ZeroPlayoutDelay/min_pacing:0ms,max_decode_queue_size:4/";
+  // g_field_trials_storage +="WebRTC-Pacer-KeyframeFlushing/Enabled/";
+  // g_field_trials_storage +="WebRTC-Pacer-FastRetransmissions/Enabled/";
+
+  static std::string g_field_trials_storage = "WebRTC-ZeroPlayoutDelay/min_pacing:1ms,max_decode_queue_size:4/";
+    g_field_trials_storage +="WebRTC-Pacer-KeyframeFlushing/Enabled/";
   static bool field_trials_inited = false;
   if (!field_trials_inited) {
       webrtc::field_trial::InitFieldTrialsFromString(g_field_trials_storage.c_str());
@@ -434,8 +436,10 @@ void WebRTCReceiverClient::createPeerConnection()
 
   webrtc::PeerConnectionInterface::RTCConfiguration config;
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  config.audio_jitter_buffer_max_packets = 1;
   // 音频 NetEq：最小目标延迟（ms），默认即为 0；显式写出便于与视频 RtpReceiver 策略一致。
   config.audio_jitter_buffer_min_delay_ms = 0;
+  config.audio_jitter_buffer_fast_accelerate = true;
   webrtc::PeerConnectionInterface::IceServer ice_server;
   ice_server.urls.push_back("stun:stun.l.google.com:19302");
   config.servers.push_back(ice_server);
@@ -568,8 +572,10 @@ void WebRTCReceiverClient::doCreateAnswerAfterSetRemote()
             QString("CreateAnswer 失败: %1").arg(QString::fromStdString(e.message())));
       });
   qDebug() << "[P2pPlayer] 即将调用 CreateAnswer(异步)";
-  m_peerConnection->CreateAnswer(m_pendingCreateAnswerObserver.get(),
-                                   webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
+  webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
+  options.offer_to_receive_audio = 0;
+  options.num_simulcast_layers = 1;
+  m_peerConnection->CreateAnswer(m_pendingCreateAnswerObserver.get(), options);
   qDebug() << "[P2pPlayer] CreateAnswer 调用已返回(结果在回调)";
 }
 

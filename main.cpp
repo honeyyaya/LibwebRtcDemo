@@ -1,4 +1,6 @@
- #include <QGuiApplication>
+#include <QGuiApplication>
+#include <QQuickWindow>
+#include <QSGRendererInterface>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QtQml>
@@ -8,6 +10,7 @@
 
 int main(int argc, char *argv[])
 {
+    QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     QGuiApplication app(argc, argv);
 
     // 手动注册 WebRTCVideoRenderer，确保 QML 可正常 import LibwebRtcDemo 1.0

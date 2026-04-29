@@ -1,10 +1,16 @@
 #include "android_mediacodec_video_decoder.h"
+#include "android_native_video_frame_buffer.h"
 #include "encoded_tracking_bridge.h"
 #include "video_decode_sink_timing_bridge.h"
 
+#include <android/hardware_buffer.h>
 #include <android/log.h>
+#include <android/native_window.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
+#include <media/NdkImage.h>
+#include <media/NdkImageReader.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -23,25 +29,22 @@
 #include <utility>
 #include <vector>
 
-#include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "api/video/video_frame_type.h"
 #include "modules/video_coding/include/video_error_codes.h"
-#include "rtc_base/ref_counter.h"
-#include "libyuv/convert.h"
 
 #define LOG_TAG "McVideoDec"
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// NDK r26+ 的 NdkMediaCodec.h 可能不再定义 KEY_FRAME；与 Java MediaCodec.BUFFER_FLAG_KEY_FRAME 一致。
+// NDK r26+ �?NdkMediaCodec.h 可能不再定义 KEY_FRAME；与 Java MediaCodec.BUFFER_FLAG_KEY_FRAME 一致�?
 #ifndef AMEDIACODEC_BUFFER_FLAG_KEY_FRAME
 #define AMEDIACODEC_BUFFER_FLAG_KEY_FRAME 1u
 #endif
 
 namespace webrtc_demo {
 
-// 供 Decode（类外）与匿名命名空间内共用。
+// �?Decode（类外）与匿名命名空间内共用�?
 int64_t McMonotonicUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -51,31 +54,23 @@ int64_t McMonotonicUs() {
 namespace {
 
 // COLOR_FormatYUV420SemiPlanar
-constexpr int32_t kColorFormatNv12 = 21;
 // COLOR_FormatYUV420Flexible
-constexpr int32_t kColorFormatYuv420Flexible = 0x7F420888;
-// 部分厂商 Codec2 在 AMessage 里使用与 color-format 不同的 android._color-format
-constexpr int32_t kColorFormatQtiSurface = 2141391876;
+// 部分厂商 Codec2 �?AMessage 里使用与 color-format 不同�?android._color-format
 
-// 与 Java MediaFormat.KEY_LOW_LATENCY 一致；部分设备在 API 30+ 上可降低解码器内部排队。
+// �?Java MediaFormat.KEY_LOW_LATENCY 一致；部分设备�?API 30+ 上可降低解码器内部排队�?
 constexpr char kMediaFormatLowLatency[] = "low-latency";
 
-// queue 后 drain：先非阻塞清空已就绪帧，再单次短阻塞吸收「刚完成」的 output。
-// 原先单阶段 first_timeout=35ms 会在 worker 上串行堆叠，主观延迟远大于软解。
+// queue �?drain：先非阻塞清空已就绪帧，再单次短阻塞吸收「刚完成」的 output�?
+// 原先单阶�?first_timeout=35ms 会在 worker 上串行堆叠，主观延迟远大于软解�?
 constexpr int64_t kDrainAfterQueueShortWaitUs = 3000;
 constexpr int64_t kDrainOnInputBackpressureUs = 3000;
 constexpr int64_t kDequeueInputTimeoutUs = 3000;
+constexpr int32_t kImageReaderMaxImages = 4;
+constexpr int kAcquireLatestImageMaxAttempts = 4;
+constexpr int64_t kAcquireLatestImageRetryDelayUs = 250;
 
-bool IsNv12FamilyOutput(int32_t fmt) {
-  if (fmt == 0) {
-    return true;
-  }
-  return fmt == kColorFormatNv12 || fmt == kColorFormatYuv420Flexible ||
-         fmt == kColorFormatQtiSurface;
-}
-
-// WebRTC H264 接收路径多为 Annex B（00 00 01 / 00 00 00 01）。Codec2 解码器通常要这种输入；
-// 若误转成 AVCC（4 字节长度前缀），部分机型会吃满 input 但永远不出 output（fps=0）。
+// WebRTC H264 接收路径多为 Annex B�?0 00 01 / 00 00 00 01）。Codec2 解码器通常要这种输入；
+// 若误转成 AVCC�? 字节长度前缀），部分机型会吃�?input 但永远不�?output（fps=0）�?
 bool LooksLikeAnnexB(const uint8_t* d, size_t sz) {
   if (sz < 4 || !d) {
     return false;
@@ -151,81 +146,12 @@ void AnnexBToAvcc(const uint8_t* data, size_t size, std::vector<uint8_t>* out) {
   }
 }
 
-// NV12→I420 直接写入已分配好的 dst 平面（不做任何分配）。
-bool FillI420FromNv12(const uint8_t* src, size_t src_cap, int offset,
-                      int width, int height, int y_stride, int slice_height,
-                      uint8_t* dy, int dsy, uint8_t* du, int dsu, uint8_t* dv, int dsv) {
-  if (width <= 0 || height <= 0 || y_stride < width) return false;
-  const int y_plane = y_stride * slice_height;
-  if (offset + y_plane + y_stride * (slice_height / 2) > static_cast<int>(src_cap)) return false;
-  const uint8_t* ys = src + offset;
-  return libyuv::NV12ToI420(ys, y_stride, ys + y_plane, y_stride,
-                            dy, dsy, du, dsu, dv, dsv, width, height) == 0;
-}
-
-bool FillI420FromNv12Tight(const uint8_t* src, size_t src_cap, int offset,
-                           int width, int height,
-                           uint8_t* dy, int dsy, uint8_t* du, int dsu, uint8_t* dv, int dsv) {
-  if (width <= 0 || height <= 0) return false;
-  const int need = width * height + width * (height / 2);
-  if (offset < 0 || offset + need > static_cast<int>(src_cap)) return false;
-  const uint8_t* ys = src + offset;
-  return libyuv::NV12ToI420(ys, width, ys + width * height, width,
-                            dy, dsy, du, dsu, dv, dsv, width, height) == 0;
-}
-
-// ---------------------------------------------------------------------------
-// I420 内存池：避免每帧 mmap + 338 次 page-fault（1280×720 ≈ 1.38 MB）。
-// 槽位内存通过 shared_ptr 与 PooledI420 共享生命周期，即使解码器销毁时
-// 仍有帧在渲染管线中也不会产生悬垂指针。
-// ---------------------------------------------------------------------------
-struct I420PoolSlot {
-  std::shared_ptr<uint8_t> mem;
-  int width = 0, height = 0;
-  int stride_y = 0, stride_u = 0, stride_v = 0;
-  size_t off_u = 0, off_v = 0;
-  std::atomic<bool> free{true};
-};
-
-class PooledI420 final : public webrtc::I420BufferInterface {
- public:
-  PooledI420(std::shared_ptr<uint8_t> m, int w, int h,
-             int sy, int su, int sv, size_t ou, size_t ov,
-             std::atomic<bool>* flag)
-      : m_(std::move(m)), w_(w), h_(h),
-        sy_(sy), su_(su), sv_(sv), ou_(ou), ov_(ov), flag_(flag) {}
-  ~PooledI420() override {
-    if (flag_) flag_->store(true, std::memory_order_release);
-  }
-
-  void AddRef() const override { rc_.IncRef(); }
-  webrtc::RefCountReleaseStatus Release() const override {
-    auto s = rc_.DecRef();
-    if (s == webrtc::RefCountReleaseStatus::kDroppedLastRef) delete this;
-    return s;
-  }
-
-  int width() const override { return w_; }
-  int height() const override { return h_; }
-  const uint8_t* DataY() const override { return m_.get(); }
-  const uint8_t* DataU() const override { return m_.get() + ou_; }
-  const uint8_t* DataV() const override { return m_.get() + ov_; }
-  int StrideY() const override { return sy_; }
-  int StrideU() const override { return su_; }
-  int StrideV() const override { return sv_; }
-
- private:
-  std::shared_ptr<uint8_t> m_;
-  int w_, h_, sy_, su_, sv_;
-  size_t ou_, ov_;
-  std::atomic<bool>* flag_;
-  mutable webrtc::webrtc_impl::RefCounter rc_{0};
-};
-
+// Decoder output stays on the native AImageReader/AHardwareBuffer path.
+// The old NV12->I420 CPU fallback has been removed to keep the pipeline single-path.
 std::atomic<uint64_t> g_mc_decode_ingress_seq{0};
 std::atomic<uint64_t> g_mc_process_frame_seq{0};
 
-// RTP 扩展 / Field Trial 带来的 EncodedImage::VideoFrameTrackingId；与解码后 VideoFrame::id 对齐供测试链路使用。
+// RTP 扩展 / Field Trial 带来�?EncodedImage::VideoFrameTrackingId；与解码�?VideoFrame::id 对齐供测试链路使用�?
 void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
                                     uint32_t rtp_ts,
                                     bool key) {
@@ -262,7 +188,7 @@ void LogEncodedFrameTrackingIngress(const std::optional<uint16_t>& tracking_id,
   }
 }
 
-// 单次 DrainOutputs 内部细分（微秒）；perf_detail==nullptr 时不采样，避免热路径开销。
+// 单次 DrainOutputs 内部细分（微秒）；perf_detail==nullptr 时不采样，避免热路径开销�?
 struct McDrainDetail {
   int64_t total_us = 0;
   int64_t dequeue_us = 0;
@@ -273,7 +199,7 @@ struct McDrainDetail {
   int out_buffers = 0;
 };
 
-// 确认 WebRTC 是否把 EncodedImage 送进本解码器：前 10 帧 + 之后每 30 帧打一条，避免刷屏。
+// 确认 WebRTC 是否�?EncodedImage 送进本解码器：前 10 �?+ 之后�?30 帧打一条，避免刷屏�?
 void LogMcDecodeIngress(const uint8_t* data,
                         size_t sz,
                         uint32_t rtp_ts,
@@ -304,71 +230,18 @@ struct AndroidMediaCodecVideoDecoder::Impl {
   std::thread thread_;
 
   AMediaCodec* codec_ = nullptr;
+  AImageReader* image_reader_ = nullptr;
+  ANativeWindow* output_window_ = nullptr;
 
   webrtc::DecodedImageCallback* callback_ = nullptr;
 
   int out_width_ = 0;
   int out_height_ = 0;
-  int y_stride_ = 0;
-  int slice_height_ = 0;
-  int32_t color_format_ = 0;
 
   std::vector<uint8_t> avcc_scratch_;
+  std::atomic<int32_t> pending_image_notifications_{0};
 
-  // 输入 PTS 使用单调递增时间戳；RTP 时间戳会回绕/乱序，易让 Codec2 PipelineWatcher 产生噪声告警。
-  int64_t next_input_pts_us_ = 0;
-
-  static constexpr int kPoolSlots = 6;
-  I420PoolSlot pool_[kPoolSlots];
-
-  struct PoolResult {
-    uint8_t* y; uint8_t* u; uint8_t* v;
-    int sy, su, sv;
-    size_t ou, ov;
-    std::shared_ptr<uint8_t> mem;
-    std::atomic<bool>* flag;
-  };
-
-  bool AcquirePoolSlot(int w, int h, PoolResult* r) {
-    const int sy = w, su = (w + 1) / 2, sv = su;
-    const int hh = (h + 1) / 2;
-    const size_t ou = static_cast<size_t>(sy) * h;
-    const size_t ov = ou + static_cast<size_t>(su) * hh;
-    const size_t total = ov + static_cast<size_t>(sv) * hh;
-    for (auto& s : pool_) {
-      if (!s.free.load(std::memory_order_acquire)) continue;
-      if (s.width == w && s.height == h && s.mem) {
-        s.free.store(false, std::memory_order_relaxed);
-        r->y = s.mem.get(); r->u = r->y + s.off_u; r->v = r->y + s.off_v;
-        r->sy = s.stride_y; r->su = s.stride_u; r->sv = s.stride_v;
-        r->ou = s.off_u; r->ov = s.off_v;
-        r->mem = s.mem; r->flag = &s.free;
-        return true;
-      }
-    }
-    for (auto& s : pool_) {
-      if (!s.free.load(std::memory_order_acquire)) continue;
-      s.mem.reset(new uint8_t[total], std::default_delete<uint8_t[]>());
-      s.width = w; s.height = h;
-      s.stride_y = sy; s.stride_u = su; s.stride_v = sv;
-      s.off_u = ou; s.off_v = ov;
-      s.free.store(false, std::memory_order_relaxed);
-      r->y = s.mem.get(); r->u = r->y + ou; r->v = r->y + ov;
-      r->sy = sy; r->su = su; r->sv = sv;
-      r->ou = ou; r->ov = ov;
-      r->mem = s.mem; r->flag = &s.free;
-      return true;
-    }
-    return false;
-  }
-
-  void ClearPool() {
-    for (auto& s : pool_) {
-      s.mem.reset();
-      s.width = s.height = 0;
-      s.free.store(true, std::memory_order_relaxed);
-    }
-  }
+  // 输入 PTS 使用单调递增时间戳；RTP 时间戳会回绕/乱序，易�?Codec2 PipelineWatcher 产生噪声告警�?  int64_t next_input_pts_us_ = 0;
 
   void WorkerLoop() {
     std::unique_lock<std::mutex> lk(mu_);
@@ -406,9 +279,19 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       AMediaCodec_delete(codec_);
       codec_ = nullptr;
     }
-    out_width_ = out_height_ = y_stride_ = slice_height_ = 0;
-    color_format_ = 0;
-    ClearPool();
+    if (image_reader_) {
+#if __ANDROID_API__ >= 26
+      DetachImageReaderListener();
+#endif
+      AImageReader_delete(image_reader_);
+      image_reader_ = nullptr;
+      output_window_ = nullptr;
+    } else {
+#if __ANDROID_API__ >= 26
+      ResetImageReaderState();
+#endif
+    }
+    out_width_ = out_height_ = 0;
   }
 
   void UpdateOutputFormat(AMediaFormat* fmt) {
@@ -417,18 +300,6 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     }
     AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &out_width_);
     AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, &out_height_);
-    if (!AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, &color_format_)) {
-      int32_t alt = 0;
-      if (AMediaFormat_getInt32(fmt, "android._color-format", &alt)) {
-        color_format_ = alt;
-      }
-    }
-    if (!AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_STRIDE, &y_stride_) || y_stride_ < out_width_) {
-      y_stride_ = out_width_;
-    }
-    if (!AMediaFormat_getInt32(fmt, "slice-height", &slice_height_) || slice_height_ < out_height_) {
-      slice_height_ = out_height_;
-    }
   }
 
   void RefreshOutputFormat() {
@@ -441,6 +312,95 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       AMediaFormat_delete(fmt);
     }
   }
+
+#if __ANDROID_API__ >= 26
+  static void OnImageAvailable(void* context, AImageReader* /*reader*/) {
+    auto* self = static_cast<Impl*>(context);
+    if (!self) {
+      return;
+    }
+    self->pending_image_notifications_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void ResetImageReaderState() {
+    pending_image_notifications_.store(0, std::memory_order_relaxed);
+  }
+
+  void DetachImageReaderListener() {
+    if (!image_reader_) {
+      ResetImageReaderState();
+      return;
+    }
+
+    AImageReader_ImageListener listener{};
+    listener.context = nullptr;
+    listener.onImageAvailable = nullptr;
+    AImageReader_setImageListener(image_reader_, &listener);
+    ResetImageReaderState();
+  }
+
+  bool InstallImageReaderListener() {
+    if (!image_reader_) {
+      return false;
+    }
+
+    AImageReader_ImageListener listener{};
+    listener.context = this;
+    listener.onImageAvailable = &Impl::OnImageAvailable;
+    const media_status_t st = AImageReader_setImageListener(image_reader_, &listener);
+    if (st != AMEDIA_OK) {
+      ALOGW("AImageReader_setImageListener failed: %d", static_cast<int>(st));
+      ResetImageReaderState();
+      return false;
+    }
+
+    ResetImageReaderState();
+    return true;
+  }
+
+  bool AcquireLatestOutputImage(AImage** out_image, int* out_sync_fence_fd) {
+    if (!image_reader_ || !out_image || !out_sync_fence_fd) {
+      return false;
+    }
+
+    *out_image = nullptr;
+    *out_sync_fence_fd = -1;
+    for (int attempt = 0; attempt < kAcquireLatestImageMaxAttempts; ++attempt) {
+      const media_status_t st =
+          AImageReader_acquireLatestImageAsync(image_reader_, out_image, out_sync_fence_fd);
+      if (st == AMEDIA_OK && *out_image) {
+        ResetImageReaderState();
+        return true;
+      }
+
+      if (*out_sync_fence_fd >= 0) {
+        close(*out_sync_fence_fd);
+        *out_sync_fence_fd = -1;
+      }
+
+      if (st != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
+        static std::atomic<int> acquire_warn_count{0};
+        if (acquire_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+          ALOGW("AImageReader_acquireLatestImageAsync failed: %d", static_cast<int>(st));
+        }
+        return false;
+      }
+
+      if (attempt + 1 >= kAcquireLatestImageMaxAttempts) {
+        break;
+      }
+
+      if (pending_image_notifications_.load(std::memory_order_relaxed) > 0) {
+        std::this_thread::yield();
+      } else {
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(kAcquireLatestImageRetryDelayUs));
+      }
+    }
+
+    return false;
+  }
+#endif
 
   bool ConfigureOnWorker(const webrtc::VideoDecoder::Settings& settings) {
     DestroyCodec();
@@ -463,23 +423,49 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     AMediaFormat_setInt32(format, kMediaFormatLowLatency, 1);
 #endif
 
-    media_status_t st = AMediaCodec_configure(codec_, format, nullptr, nullptr, 0);
+#if __ANDROID_API__ < 26
+    AMediaFormat_delete(format);
+    ALOGW("AHardwareBuffer decoder output requires Android API 26+");
+    AMediaCodec_delete(codec_);
+    codec_ = nullptr;
+    return false;
+#else
+    media_status_t st = AImageReader_newWithUsage(
+        w, h, AIMAGE_FORMAT_PRIVATE,
+        AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT,
+        kImageReaderMaxImages, &image_reader_);
+    if (st != AMEDIA_OK || !image_reader_) {
+      AMediaFormat_delete(format);
+      ALOGW("AImageReader_newWithUsage failed: %d", static_cast<int>(st));
+      AMediaCodec_delete(codec_);
+      codec_ = nullptr;
+      return false;
+    }
+    InstallImageReaderListener();
+    st = AImageReader_getWindow(image_reader_, &output_window_);
+    if (st != AMEDIA_OK || !output_window_) {
+      AMediaFormat_delete(format);
+      ALOGW("AImageReader_getWindow failed: %d", static_cast<int>(st));
+      DestroyCodec();
+      return false;
+    }
+
+    st = AMediaCodec_configure(codec_, format, output_window_, nullptr, 0);
     AMediaFormat_delete(format);
     if (st != AMEDIA_OK) {
       ALOGW("AMediaCodec_configure failed: %d", static_cast<int>(st));
-      AMediaCodec_delete(codec_);
-      codec_ = nullptr;
+      DestroyCodec();
       return false;
     }
+#endif
     st = AMediaCodec_start(codec_);
     if (st != AMEDIA_OK) {
       ALOGW("AMediaCodec_start failed: %d", static_cast<int>(st));
-      AMediaCodec_delete(codec_);
-      codec_ = nullptr;
+      DestroyCodec();
       return false;
     }
     next_input_pts_us_ = 0;
-    // 尽早拉取输出格式（部分 Codec2 在首帧 output 前不会单独触发 INFO，导致 out_width_ 一直为 0）
+    // 尽早拉取输出格式（部�?Codec2 在首�?output 前不会单独触�?INFO，导�?out_width_ 一直为 0�?
     RefreshOutputFormat();
     return true;
   }
@@ -500,7 +486,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       std::lock_guard<std::mutex> lk(mu_);
       cb = callback_;
     }
-    // 无论是否已注册 callback，都必须 dequeue 并 release output，否则会塞满管道 in=0 out=0、解码帧恒为 0
+    // 无论是否已注�?callback，都必须 dequeue �?release output，否则会塞满管道 in=0 out=0、解码帧恒为 0
 
     bool used_timeout = false;
     for (;;) {
@@ -534,111 +520,90 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         RefreshOutputFormat();
       }
 
-      if (info.size > 0 && out_width_ > 0 && out_height_ > 0 && cb &&
-          IsNv12FamilyOutput(color_format_)) {
-        size_t cap = 0;
-        int64_t t_gb0 = 0;
-        if (perf_detail) {
-          t_gb0 = McMonotonicUs();
-        }
-        uint8_t* out_buf = AMediaCodec_getOutputBuffer(codec_, static_cast<size_t>(out_idx), &cap);
-        if (perf_detail) {
-          perf_detail->get_out_buf_us += McMonotonicUs() - t_gb0;
-        }
-        if (out_buf && static_cast<size_t>(info.offset) + static_cast<size_t>(info.size) <= cap) {
-          int64_t t_c0 = 0;
-          if (perf_detail) {
-            t_c0 = McMonotonicUs();
-          }
-          webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
-          PoolResult pr{};
-          if (AcquirePoolSlot(out_width_, out_height_, &pr)) {
-            const bool ok =
-                FillI420FromNv12(out_buf, cap, info.offset, out_width_, out_height_,
-                                 y_stride_, slice_height_,
-                                 pr.y, pr.sy, pr.u, pr.su, pr.v, pr.sv) ||
-                FillI420FromNv12Tight(out_buf, cap, info.offset, out_width_, out_height_,
-                                      pr.y, pr.sy, pr.u, pr.su, pr.v, pr.sv);
-            if (ok) {
-              i420 = webrtc::scoped_refptr<PooledI420>(
-                  new PooledI420(pr.mem, out_width_, out_height_,
-                                 pr.sy, pr.su, pr.sv, pr.ou, pr.ov, pr.flag));
-            } else {
-              pr.flag->store(true, std::memory_order_release);
-            }
-          }
-          if (!i420) {
-            auto buf420 = webrtc::I420Buffer::Create(out_width_, out_height_);
-            if (buf420) {
-              const bool ok =
-                  FillI420FromNv12(out_buf, cap, info.offset, out_width_, out_height_,
-                                   y_stride_, slice_height_,
-                                   buf420->MutableDataY(), buf420->StrideY(),
-                                   buf420->MutableDataU(), buf420->StrideU(),
-                                   buf420->MutableDataV(), buf420->StrideV()) ||
-                  FillI420FromNv12Tight(out_buf, cap, info.offset, out_width_, out_height_,
-                                        buf420->MutableDataY(), buf420->StrideY(),
-                                        buf420->MutableDataU(), buf420->StrideU(),
-                                        buf420->MutableDataV(), buf420->StrideV());
-              if (ok) i420 = buf420;
-            }
-          }
-          if (perf_detail) {
-            perf_detail->nv12_i420_us += McMonotonicUs() - t_c0;
-          }
-          if (i420) {
-            webrtc::VideoFrame::Builder frame_builder;
-            frame_builder.set_video_frame_buffer(i420)
-                .set_rtp_timestamp(rtp_timestamp)
-                .set_timestamp_us(render_time_ms * 1000);
-            if (video_frame_tracking_id.has_value()) {
-              frame_builder.set_id(*video_frame_tracking_id);
-            }
-            webrtc::VideoFrame frame = frame_builder.build();
-            int64_t t_cb0 = 0;
-            if (perf_detail) {
-              t_cb0 = McMonotonicUs();
-            }
-            cb->Decoded(frame);
-            const int64_t t_after_decoded_cb = McMonotonicUs();
-            if (decode_wall_t0_us && video_frame_tracking_id.has_value() &&
-                webrtc_demo::ShouldLogTrackingTimedSampleById(
-                    static_cast<uint32_t>(*video_frame_tracking_id))) {
-              const int64_t e2e_us = t_after_decoded_cb - *decode_wall_t0_us;
-              ALOGI(
-                  "【耗时分析】硬件解码总耗时 McE2E tracking_id=%u rtp_ts=%u e2e=%lldus (Decode入口->Decoded返回; "
-                  "含入队等待+worker+MediaCodec+NV12->I420+cb; 不含WebRTC后续sink; 与 tracking_id mod 120 对齐)",
-                  static_cast<unsigned>(*video_frame_tracking_id), rtp_timestamp,
-                  static_cast<long long>(e2e_us));
-            }
-            // D→E：Decoded 返回时刻，供 sink 侧 OnFrame 计算 WebRTC 内部投递延迟。
-            DecodeSinkRecordAfterDecoded(rtp_timestamp, t_after_decoded_cb);
-            if (perf_detail) {
-              perf_detail->decoded_cb_us += t_after_decoded_cb - t_cb0;
-              ++perf_detail->out_buffers;
-            }
-            if (delivered_frames) {
-              ++(*delivered_frames);
-            }
-          } else {
-            ALOGW("NV12->I420 failed w=%d h=%d stride=%d slice=%d color=%d cap=%zu off=%d size=%d",
-                  out_width_, out_height_, y_stride_, slice_height_,
-                  static_cast<int>(color_format_), cap, info.offset, info.size);
-          }
-        }
-      } else if (info.size > 0 && out_width_ > 0 && out_height_ > 0 && cb) {
-        ALOGW("Unsupported color format %d (size=%d)", static_cast<int>(color_format_),
-              static_cast<int>(info.size));
-      }
+
+      const bool use_native_surface = cb && image_reader_;
 
       int64_t t_rel0 = 0;
       if (perf_detail) {
         t_rel0 = McMonotonicUs();
       }
-      AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(out_idx), false);
+      AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(out_idx), use_native_surface);
       if (perf_detail) {
         perf_detail->release_us += McMonotonicUs() - t_rel0;
       }
+
+#if __ANDROID_API__ >= 26
+      if (!use_native_surface) {
+        continue;
+      }
+
+      AImage* image = nullptr;
+      int sync_fence_fd = -1;
+      if (!AcquireLatestOutputImage(&image, &sync_fence_fd) || !image) {
+        continue;
+      }
+
+      AHardwareBuffer* hardware_buffer = nullptr;
+      media_status_t image_status = AImage_getHardwareBuffer(image, &hardware_buffer);
+      if (image_status != AMEDIA_OK || !hardware_buffer) {
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        ALOGW("AImage_getHardwareBuffer failed: %d", static_cast<int>(image_status));
+        continue;
+      }
+
+      int32_t image_width = out_width_;
+      int32_t image_height = out_height_;
+      AImage_getWidth(image, &image_width);
+      AImage_getHeight(image, &image_height);
+      if (image_width <= 0 || image_height <= 0) {
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        ALOGW("AImage dimensions invalid: %d x %d", image_width, image_height);
+        continue;
+      }
+
+      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer(
+          new AndroidHardwareBufferVideoFrameBuffer(image, hardware_buffer, sync_fence_fd,
+                                                   image_width, image_height));
+      webrtc::VideoFrame::Builder frame_builder;
+      frame_builder.set_video_frame_buffer(native_buffer)
+          .set_rtp_timestamp(rtp_timestamp)
+          .set_timestamp_us(render_time_ms * 1000);
+      if (video_frame_tracking_id.has_value()) {
+        frame_builder.set_id(*video_frame_tracking_id);
+      }
+
+      int64_t t_cb0 = 0;
+      if (perf_detail) {
+        t_cb0 = McMonotonicUs();
+      }
+      webrtc::VideoFrame decoded_frame = frame_builder.build();
+      cb->Decoded(decoded_frame);
+      const int64_t t_after_decoded_cb = McMonotonicUs();
+      if (decode_wall_t0_us && video_frame_tracking_id.has_value() &&
+          webrtc_demo::ShouldLogTrackingTimedSampleById(
+              static_cast<uint32_t>(*video_frame_tracking_id))) {
+        const int64_t e2e_us = t_after_decoded_cb - *decode_wall_t0_us;
+        ALOGI(
+            "McE2E native tracking_id=%u rtp_ts=%u e2e=%lldus "
+            "(Decode entry -> Decoded return; native AHardwareBuffer; excludes downstream sink)",
+            static_cast<unsigned>(*video_frame_tracking_id), rtp_timestamp,
+            static_cast<long long>(e2e_us));
+      }
+      DecodeSinkRecordAfterDecoded(rtp_timestamp, t_after_decoded_cb);
+      if (perf_detail) {
+        perf_detail->decoded_cb_us += t_after_decoded_cb - t_cb0;
+        ++perf_detail->out_buffers;
+      }
+      if (delivered_frames) {
+        ++(*delivered_frames);
+      }
+#endif
     }
     if (perf_detail) {
       perf_detail->total_us = McMonotonicUs() - t_wall_start;
@@ -666,7 +631,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     const uint8_t* feed_ptr = data.data();
     size_t feed_size = data.size();
     if (LooksLikeAnnexB(data.data(), data.size())) {
-      // 直接送 Annex B（与 McVideoDec 日志里 head16 一致）
+      // 直接�?Annex B（与 McVideoDec 日志�?head16 一致）
     } else {
       AnnexBToAvcc(data.data(), data.size(), &avcc_scratch_);
       if (avcc_scratch_.empty()) {
@@ -721,11 +686,11 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     }
     if (st != AMEDIA_OK) {
       ALOGW("queueInputBuffer failed: %d", static_cast<int>(st));
-      // 已 dequeue 的 input 必须归还，否则解码器内部状态会错乱并放大系统层 PipelineWatcher 告警。
+      // �?dequeue �?input 必须归还，否则解码器内部状态会错乱并放大系统层 PipelineWatcher 告警�?
       AMediaCodec_queueInputBuffer(codec_, static_cast<size_t>(in_idx), 0, 0, 0, 0);
       return;
     }
-    // 首段非阻塞 drain 已出帧时，不再做带超时的第二段，避免把最多 3ms 睡眠算进解码路径。
+    // 首段非阻�?drain 已出帧时，不再做带超时的第二段，避免把最�?3ms 睡眠算进解码路径�?
     McDrainDetail d0{};
     McDrainDetail d1{};
     int delivered0 = 0;
@@ -746,7 +711,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     //       "drain0: tot=%lld deq=%lld getbuf=%lld nv12_i420=%lld decoded_cb=%lld rel=%lld out=%d | "
     //       "drain1: tot=%lld deq=%lld getbuf=%lld nv12_i420=%lld decoded_cb=%lld rel=%lld out=%d | "
     //       "feed_sz=%zu key=%d "
-    //       "(UI平均解码含WebRTC适配器+回调链，非本行总和)",
+    //       "(UI平均解码含WebRTC适配�?回调链，非本行总和)",
     //       static_cast<unsigned long long>(pfn), static_cast<long long>(worker_total_us),
     //       static_cast<long long>(prep_us), static_cast<long long>(deq_in_us),
     //       static_cast<long long>(memcpy_in_us), static_cast<long long>(q_in_us),
@@ -780,7 +745,7 @@ bool AndroidMediaCodecVideoDecoder::Configure(const webrtc::VideoDecoder::Settin
     }
   }
 
-  // std::function 要求可拷贝；packaged_task 仅可移动，故用 shared_ptr 包一层。
+  // std::function 要求可拷贝；packaged_task 仅可移动，故�?shared_ptr 包一层�?
   auto pt = std::make_shared<std::packaged_task<bool()>>(
       [this, settings] { return impl_->ConfigureOnWorker(settings); });
   std::future<bool> fut = pt->get_future();
@@ -803,7 +768,7 @@ int32_t AndroidMediaCodecVideoDecoder::Decode(const webrtc::EncodedImage& input_
   if (sz == 0 || !input_image.data()) {
     static std::atomic<int> empty_ingress_warn{0};
     if (empty_ingress_warn.fetch_add(1) < 5) {
-      ALOGW("Decode called empty: sz=%zu data=%p (未进入 MediaCodec)", sz,
+      ALOGW("Decode called empty: sz=%zu data=%p (未进�?MediaCodec)", sz,
             static_cast<const void*>(input_image.data()));
     }
     return WEBRTC_VIDEO_CODEC_ERROR;
@@ -816,7 +781,7 @@ int32_t AndroidMediaCodecVideoDecoder::Decode(const webrtc::EncodedImage& input_
     webrtc_demo::RecordDecodePipelineStartForE2eIfSampled(
         static_cast<uint32_t>(*video_frame_tracking_id));
   }
-  // 端到端计时起点：与本帧 EncodedImage 对应（含后续排队、worker、Decoded 回调）。
+  // 端到端计时起点：与本�?EncodedImage 对应（含后续排队、worker、Decoded 回调）�?
   const int64_t decode_wall_t0_us = McMonotonicUs();
   LogMcDecodeIngress(input_image.data(), sz, rtp_ts, key, render_time_ms);
 
