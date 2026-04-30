@@ -83,6 +83,7 @@ class WebRTCVideoRenderer : public QQuickItem,
   struct LatestFrameSlot {
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
     int64_t queueStartMonoUs = 0;
+    int64_t guiUpdateDispatchMonoUs = 0;
     int frameId = -1;
     bool fromTracking = false;
     uint64_t generation = 0;
@@ -91,6 +92,7 @@ class WebRTCVideoRenderer : public QQuickItem,
   struct SyncFrameSlot {
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
     int64_t queueStartMonoUs = 0;
+    int64_t guiUpdateDispatchMonoUs = 0;
     int64_t syncStartMonoUs = 0;
     int frameId = -1;
     bool fromTracking = false;

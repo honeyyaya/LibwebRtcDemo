@@ -69,11 +69,13 @@ constexpr int64_t kDequeueInputTimeoutUs = 3000;
 constexpr int64_t kOutputDequeueTimeoutUs = 3000;
 constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
 constexpr int64_t kBackpressureLogIntervalUs = 500000;
+constexpr int64_t kOutputFrameAgeDropThresholdUs = 50 * 1000;
+constexpr int kPreDequeueDrainPasses = 1;
 // acquireLatestImageAsync() still needs headroom beyond the native render slots.
 // Even with a lower receiver playout target, the decoder and renderer can briefly
 // overlap several native frames, so keep some slack to avoid
 // AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED bursts under jitter.
-constexpr int32_t kImageReaderMaxImages = 12;
+constexpr int32_t kImageReaderMaxImages = 16;
 constexpr size_t kMaxPendingOutputMetadata = 128;
 
 int GetDeviceApiLevel() {
@@ -698,6 +700,25 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         continue;
       }
 
+      const int64_t now_us = McMonotonicUs();
+      if (frame_meta->decode_wall_t0_us > 0 &&
+          now_us - frame_meta->decode_wall_t0_us > kOutputFrameAgeDropThresholdUs) {
+        static std::atomic<int> drop_warn{0};
+        if (drop_warn.fetch_add(1, std::memory_order_relaxed) < 5) {
+          ALOGW("[P0 Drop][Output] frame too late, drop. age=%lldms rtp_ts=%u tracking=%u",
+                static_cast<long long>((now_us - frame_meta->decode_wall_t0_us) / 1000),
+                frame_meta->rtp_timestamp,
+                frame_meta->video_frame_tracking_id.has_value()
+                    ? static_cast<unsigned>(*frame_meta->video_frame_tracking_id)
+                    : 0u);
+        }
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        continue;
+      }
+
       const int64_t t_build0 = perf_detail ? McMonotonicUs() : int64_t{0};
       webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer(
           new AndroidHardwareBufferVideoFrameBuffer(image, hardware_buffer, sync_fence_fd,
@@ -955,6 +976,9 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       feed_size = avcc_scratch_.size();
     }
     const double prepare_ms = log_timing ? (McMonotonicUs() - t_prepare0) / 1000.0 : 0.0;
+    McDrainDetail pre_drain_detail;
+    const int pre_drain_delivered =
+        DrainOutputsBounded(0, kPreDequeueDrainPasses, log_timing ? &pre_drain_detail : nullptr);
     const int64_t t_deq_in0 = log_timing ? McMonotonicUs() : int64_t{0};
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(codec_, kDequeueInputTimeoutUs);
     const double deq_in_ms = log_timing ? (McMonotonicUs() - t_deq_in0) / 1000.0 : 0.0;
@@ -967,12 +991,13 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         const double total_ms = (McMonotonicUs() - decode_wall_t0_us) / 1000.0;
         ALOGI(
             "[Timing/DecodeDrop] tracking_id=%u rtp_ts=%u key=%d bytes=%zu annexb=%d "
-            "| worker_queue=%.3f ms | prepare=%.3f ms | deq_in=%.3f ms "
+            "| worker_queue=%.3f ms | pre_drain(total=%.3f out=%d) | prepare=%.3f ms | deq_in=%.3f ms "
             "| retry_drain(total=%.3f dq=%.3f rel=%.3f acq=%.3f ahb=%.3f dims=%.3f "
             "ts=%.3f meta=%.3f build=%.3f cb=%.3f out=%d) "
             "| delivered=%d | total=%.3f ms",
             tracking_id, rtp_timestamp, is_keyframe ? 1 : 0, feed_size, input_is_annexb ? 1 : 0,
-            worker_queue_ms, prepare_ms, deq_in_ms, retry_drain_detail.total_us / 1000.0,
+            worker_queue_ms, pre_drain_detail.total_us / 1000.0, pre_drain_delivered, prepare_ms,
+            deq_in_ms, retry_drain_detail.total_us / 1000.0,
             retry_drain_detail.dequeue_us / 1000.0, retry_drain_detail.release_us / 1000.0,
             retry_drain_detail.image_acquire_us / 1000.0,
             retry_drain_detail.image_hwbuffer_us / 1000.0,
@@ -1030,11 +1055,13 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       const double total_ms = (McMonotonicUs() - decode_wall_t0_us) / 1000.0;
       ALOGI(
           "[Timing/Decode] tracking_id=%u rtp_ts=%u key=%d bytes=%zu annexb=%d "
-          "| worker_queue=%.3f ms | prepare=%.3f ms | deq_in=%.3f ms | copy=%.3f ms | q_in=%.3f ms "
+          "| worker_queue=%.3f ms | pre_drain(total=%.3f out=%d) | prepare=%.3f ms | deq_in=%.3f ms "
+          "| copy=%.3f ms | q_in=%.3f ms "
           "| drain(total=%.3f dq=%.3f rel=%.3f acq=%.3f ahb=%.3f dims=%.3f ts=%.3f meta=%.3f "
           "build=%.3f cb=%.3f out=%d) | short_wait=%d | delivered=%d | total=%.3f ms",
           tracking_id, rtp_timestamp, is_keyframe ? 1 : 0, feed_size, input_is_annexb ? 1 : 0,
-          worker_queue_ms, prepare_ms, deq_in_ms, copy_ms, q_in_ms,
+          worker_queue_ms, pre_drain_detail.total_us / 1000.0, pre_drain_delivered, prepare_ms,
+          deq_in_ms, copy_ms, q_in_ms,
           drain_detail.total_us / 1000.0, drain_detail.dequeue_us / 1000.0,
           drain_detail.release_us / 1000.0, drain_detail.image_acquire_us / 1000.0,
           drain_detail.image_hwbuffer_us / 1000.0, drain_detail.image_dimensions_us / 1000.0,

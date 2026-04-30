@@ -114,7 +114,34 @@ constexpr int64_t kHighlightSignalThrottleUs = 200000;
 
 #if defined(WEBRTC_ANDROID)
 constexpr int kNativeTextureSlotCount = 6;
-constexpr size_t kMaxNativeImportedImageCacheEntries = 8;
+constexpr size_t kMaxNativeImportedImageCacheEntries = 16;
+
+enum class NativeImportCacheEvent {
+  None,
+  Hit,
+  MissCreated,
+  MissNoSpace,
+  MissCreateFailed,
+  MissNoClientBuffer,
+};
+
+const char* NativeImportCacheEventName(NativeImportCacheEvent event) {
+  switch (event) {
+    case NativeImportCacheEvent::Hit:
+      return "hit";
+    case NativeImportCacheEvent::MissCreated:
+      return "miss_create";
+    case NativeImportCacheEvent::MissNoSpace:
+      return "miss_no_space";
+    case NativeImportCacheEvent::MissCreateFailed:
+      return "miss_create_failed";
+    case NativeImportCacheEvent::MissNoClientBuffer:
+      return "miss_no_client_buffer";
+    case NativeImportCacheEvent::None:
+    default:
+      return "none";
+  }
+}
 
 struct NativeImportedImageCacheEntry {
   EGLImageKHR egl_image = EGL_NO_IMAGE_KHR;
@@ -128,6 +155,15 @@ struct NativeTextureSlot {
   AHardwareBuffer* bound_hardware_buffer = nullptr;
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> held_buffer;
   GLsync reuse_fence = nullptr;
+};
+
+struct NativeImportTrace {
+  NativeImportCacheEvent cache_event = NativeImportCacheEvent::None;
+  bool evicted = false;
+  bool slot_unavailable = false;
+  int slot_index = -1;
+  int cache_entries = 0;
+  qint64 egl_create_image_us = 0;
 };
 #endif
 
@@ -431,7 +467,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         ClearHeldFrame();
         m_heldBuffer = item->m_syncFrame.buffer;
         m_queueTraceStartMonoUs = item->m_syncFrame.queueStartMonoUs;
-        m_guiUpdateDispatchMonoUs = 0;
+        m_guiUpdateDispatchMonoUs = item->m_syncFrame.guiUpdateDispatchMonoUs;
         m_syncTraceStartMonoUs = item->m_syncFrame.syncStartMonoUs;
         m_currentFrameId = item->m_syncFrame.frameId;
         m_frameFromTracking = item->m_syncFrame.fromTracking;
@@ -446,6 +482,12 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       if (m_lastUploadPath == UploadPathKind::Native) {
         ResetNativeImportState(false);
       }
+      m_lastNativeImportTrace = {};
+      m_nativeCacheHitCount = 0;
+      m_nativeCacheCreateCount = 0;
+      m_nativeCacheFailCount = 0;
+      m_nativeCacheEvictionCount = 0;
+      m_nativeSlotUnavailableCount = 0;
 #endif
       ClearHeldFrame();
       m_lastConsumedFrameGeneration = 0;
@@ -589,12 +631,46 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
             haveDecodeToRender ? (afterDrawMonoUs - decodePipelineStartUs) / 1000.0 : -1.0;
         const QString decodeToRenderStr =
             haveDecodeToRender ? QString::number(decodeToRenderMs, 'f', 3) : QStringLiteral("N/A");
+        QString nativeCacheEvent = QStringLiteral("N/A");
+        QString nativeCreateImageMs = QStringLiteral("N/A");
+        QString nativeEvicted = QStringLiteral("N/A");
+        QString nativeSlot = QStringLiteral("N/A");
+        int nativeCacheEntries = -1;
+        int nativeCacheCapacity = -1;
+        qulonglong nativeCacheHitCount = 0;
+        qulonglong nativeCacheCreateCount = 0;
+        qulonglong nativeCacheFailCount = 0;
+        qulonglong nativeCacheEvictionCount = 0;
+        qulonglong nativeSlotUnavailableCount = 0;
+#if defined(WEBRTC_ANDROID)
+        nativeCacheEvent =
+            QString::fromLatin1(NativeImportCacheEventName(m_lastNativeImportTrace.cache_event));
+        if (m_lastNativeImportTrace.egl_create_image_us > 0) {
+          nativeCreateImageMs =
+              QString::number(m_lastNativeImportTrace.egl_create_image_us / 1000.0, 'f', 3);
+        }
+        nativeEvicted = m_lastNativeImportTrace.evicted ? QStringLiteral("yes")
+                                                        : QStringLiteral("no");
+        nativeSlot = m_lastNativeImportTrace.slot_index >= 0
+                         ? QString::number(m_lastNativeImportTrace.slot_index)
+                         : (m_lastNativeImportTrace.slot_unavailable ? QStringLiteral("miss")
+                                                                     : QStringLiteral("N/A"));
+        nativeCacheEntries = m_lastNativeImportTrace.cache_entries;
+        nativeCacheCapacity = static_cast<int>(kMaxNativeImportedImageCacheEntries);
+        nativeCacheHitCount = static_cast<qulonglong>(m_nativeCacheHitCount);
+        nativeCacheCreateCount = static_cast<qulonglong>(m_nativeCacheCreateCount);
+        nativeCacheFailCount = static_cast<qulonglong>(m_nativeCacheFailCount);
+        nativeCacheEvictionCount = static_cast<qulonglong>(m_nativeCacheEvictionCount);
+        nativeSlotUnavailableCount = static_cast<qulonglong>(m_nativeSlotUnavailableCount);
+#endif
 
         qDebug().noquote()
             << QString("[Timing/Render] tracking_id=%1 | path=%2 | post_to_gui=%3 ms | "
                        "gui_to_sync=%4 ms | sync_to_render=%5 ms | queue_wait=%6 ms | "
                        "fence_wait=%7 ms | import=%8 ms | upload=%9 ms | draw=%10 ms | "
-                       "upload+draw=%11 ms | wall(OnFrame->render)=%12 ms | total(Decode->render)=%13 ms")
+                       "upload+draw=%11 ms | wall(OnFrame->render)=%12 ms | total(Decode->render)=%13 ms | "
+                       "cache=%14 | create=%15 ms | evict=%16 | slot=%17 | cache_entries=%18/%19 | "
+                       "cache_totals(hit/create/fail/evict/slot_miss)=%20/%21/%22/%23/%24")
                    .arg(m_drawFrameTrace.frameId)
                    .arg(UploadPathKindName(m_frameFormat))
                    .arg(fmtStageMs(postToGuiUs))
@@ -607,7 +683,18 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
                    .arg(drawUs / 1000.0, 0, 'f', 3)
                    .arg(uploadAndDrawUs / 1000.0, 0, 'f', 3)
                    .arg(wallFromQueueUs / 1000.0, 0, 'f', 3)
-                   .arg(decodeToRenderStr);
+                   .arg(decodeToRenderStr)
+                   .arg(nativeCacheEvent)
+                   .arg(nativeCreateImageMs)
+                   .arg(nativeEvicted)
+                   .arg(nativeSlot)
+                   .arg(nativeCacheEntries)
+                   .arg(nativeCacheCapacity)
+                   .arg(nativeCacheHitCount)
+                   .arg(nativeCacheCreateCount)
+                   .arg(nativeCacheFailCount)
+                   .arg(nativeCacheEvictionCount)
+                   .arg(nativeSlotUnavailableCount);
 
         if (m_videoItem) {
           QMetaObject::invokeMethod(
@@ -773,6 +860,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     m_nextNativeTextureSlot = 0;
   }
 
+  void ResetNativeImportTrace() { m_lastNativeImportTrace = {}; }
+
   void TouchImportedImageCacheEntry(NativeImportedImageCache::iterator it) {
     if (it == m_importedImageCache.end()) {
       return;
@@ -806,6 +895,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       }
       const auto cache_it = m_importedImageCache.find(hardware_buffer);
       if (cache_it != m_importedImageCache.end()) {
+        m_lastNativeImportTrace.evicted = true;
+        ++m_nativeCacheEvictionCount;
         DestroyImportedImageCacheEntry(cache_it);
         return true;
       }
@@ -830,25 +921,39 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     const auto existing = m_importedImageCache.find(hardware_buffer);
     if (existing != m_importedImageCache.end()) {
       TouchImportedImageCacheEntry(existing);
+      m_lastNativeImportTrace.cache_event = NativeImportCacheEvent::Hit;
+      m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
+      ++m_nativeCacheHitCount;
       return &existing->second;
     }
 
-    EGLClientBuffer native_client_buffer =
-        m_eglGetNativeClientBufferANDROID(hardware_buffer);
+    EGLClientBuffer native_client_buffer = m_eglGetNativeClientBufferANDROID(hardware_buffer);
     if (!native_client_buffer) {
+      m_lastNativeImportTrace.cache_event = NativeImportCacheEvent::MissNoClientBuffer;
+      m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
+      ++m_nativeCacheFailCount;
       return nullptr;
     }
 
     if (m_importedImageCache.size() >= kMaxNativeImportedImageCacheEntries &&
         !EvictLeastRecentlyUsedImportedImageCacheEntry()) {
+      m_lastNativeImportTrace.cache_event = NativeImportCacheEvent::MissNoSpace;
+      m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
+      ++m_nativeCacheFailCount;
       return nullptr;
     }
 
     const EGLint attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_FALSE, EGL_NONE};
+    QElapsedTimer createTimer;
+    createTimer.start();
     EGLImageKHR egl_image = m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT,
                                                 EGL_NATIVE_BUFFER_ANDROID,
                                                 native_client_buffer, attrs);
+    m_lastNativeImportTrace.egl_create_image_us = createTimer.nsecsElapsed() / 1000;
     if (egl_image == EGL_NO_IMAGE_KHR) {
+      m_lastNativeImportTrace.cache_event = NativeImportCacheEvent::MissCreateFailed;
+      m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
+      ++m_nativeCacheFailCount;
       return nullptr;
     }
 
@@ -864,8 +969,14 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         m_eglDestroyImageKHR(m_eglDisplay, egl_image);
       }
       AHardwareBuffer_release(hardware_buffer);
+      m_lastNativeImportTrace.cache_event = NativeImportCacheEvent::MissCreateFailed;
+      m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
+      ++m_nativeCacheFailCount;
       return nullptr;
     }
+    m_lastNativeImportTrace.cache_event = NativeImportCacheEvent::MissCreated;
+    m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
+    ++m_nativeCacheCreateCount;
     return &insert_result.first->second;
   }
 #endif
@@ -1108,6 +1219,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
     m_lastNativeFenceWaitUs = 0;
     m_lastNativeImportUs = 0;
+    ResetNativeImportTrace();
 
     const int sync_fence_fd = buffer->ConsumeSyncFenceFd();
     QElapsedTimer fenceTimer;
@@ -1138,11 +1250,36 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     NativeImportedImageCacheEntry* const entry =
         FindOrCreateImportedImageCacheEntry(hardware_buffer);
     if (!entry) {
+      static int cache_import_warn_count = 0;
+      if (cache_import_warn_count < 8) {
+        ++cache_import_warn_count;
+        qWarning().noquote()
+            << QString("[WebRTCVideoRenderer] native import cache miss unresolved: event=%1 "
+                       "cache_entries=%2/%3 evicted=%4 create=%5 ms")
+                   .arg(NativeImportCacheEventName(m_lastNativeImportTrace.cache_event))
+                   .arg(m_lastNativeImportTrace.cache_entries)
+                   .arg(static_cast<int>(kMaxNativeImportedImageCacheEntries))
+                   .arg(m_lastNativeImportTrace.evicted ? QStringLiteral("yes")
+                                                        : QStringLiteral("no"))
+                   .arg(m_lastNativeImportTrace.egl_create_image_us / 1000.0, 0, 'f', 3);
+      }
       return false;
     }
 
     const int slot_index = FindReusableNativeTextureSlotIndex();
     if (slot_index < 0) {
+      m_lastNativeImportTrace.slot_unavailable = true;
+      m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
+      ++m_nativeSlotUnavailableCount;
+      static int slot_unavailable_warn_count = 0;
+      if (slot_unavailable_warn_count < 8) {
+        ++slot_unavailable_warn_count;
+        qWarning().noquote()
+            << QString("[WebRTCVideoRenderer] all native texture slots busy; dropping frame "
+                       "(cache_entries=%1/%2)")
+                   .arg(m_lastNativeImportTrace.cache_entries)
+                   .arg(static_cast<int>(kMaxNativeImportedImageCacheEntries));
+      }
       return false;
     }
 
@@ -1154,6 +1291,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       slot.bound_hardware_buffer = hardware_buffer;
     }
     slot.held_buffer = m_heldBuffer;
+    m_lastNativeImportTrace.slot_index = slot_index;
+    m_lastNativeImportTrace.cache_entries = static_cast<int>(m_importedImageCache.size());
     m_currentNativeTextureSlot = slot_index;
     m_nextNativeTextureSlot = (slot_index + 1) % kNativeTextureSlotCount;
     m_lastNativeImportUs = importTimer.nsecsElapsed() / 1000;
@@ -1329,6 +1468,14 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
   bool m_uploadStatsValidForLastFrame = false;
   qint64 m_lastNativeFenceWaitUs = 0;
   qint64 m_lastNativeImportUs = 0;
+#if defined(WEBRTC_ANDROID)
+  NativeImportTrace m_lastNativeImportTrace;
+  uint64_t m_nativeCacheHitCount = 0;
+  uint64_t m_nativeCacheCreateCount = 0;
+  uint64_t m_nativeCacheFailCount = 0;
+  uint64_t m_nativeCacheEvictionCount = 0;
+  uint64_t m_nativeSlotUnavailableCount = 0;
+#endif
 };
 
 WebRTCVideoRenderer::WebRTCVideoRenderer(QQuickItem* parent) : QQuickItem(parent) {
@@ -1420,6 +1567,7 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
 
     m_latestFrame.buffer = std::move(buffer);
     m_latestFrame.queueStartMonoUs = onFrameMonoUs;
+    m_latestFrame.guiUpdateDispatchMonoUs = 0;
     m_latestFrame.frameId = displayId;
     m_latestFrame.fromTracking = fromTracking;
     ++m_latestFrame.generation;
@@ -1494,6 +1642,15 @@ bool WebRTCVideoRenderer::hasEncodedIngressTracking() const {
 }
 
 void WebRTCVideoRenderer::RequestRenderPumpUpdate() {
+  const int64_t dispatchMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
+  {
+    QMutexLocker locker(&m_frameMutex);
+    if (m_latestFrame.buffer && m_latestFrame.generation != 0 &&
+        m_latestFrame.generation != m_syncFrame.generation &&
+        m_latestFrame.guiUpdateDispatchMonoUs == 0) {
+      m_latestFrame.guiUpdateDispatchMonoUs = dispatchMonoUs;
+    }
+  }
   update();
 }
 
@@ -1545,6 +1702,7 @@ void WebRTCVideoRenderer::OnBeforeSynchronizing() {
 
   m_syncFrame.buffer = m_latestFrame.buffer;
   m_syncFrame.queueStartMonoUs = m_latestFrame.queueStartMonoUs;
+  m_syncFrame.guiUpdateDispatchMonoUs = m_latestFrame.guiUpdateDispatchMonoUs;
   m_syncFrame.syncStartMonoUs = syncStartMonoUs;
   m_syncFrame.frameId = m_latestFrame.frameId;
   m_syncFrame.fromTracking = m_latestFrame.fromTracking;
