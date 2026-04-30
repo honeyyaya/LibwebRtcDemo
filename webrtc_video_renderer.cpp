@@ -34,6 +34,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2ext.h>
+#include <GLES3/gl3.h>
 #include <android/hardware_buffer.h>
 #include <errno.h>
 #include <poll.h>
@@ -109,6 +110,7 @@ struct NativeTextureSlot {
   GLuint texture_id = 0;
   AHardwareBuffer* bound_hardware_buffer = nullptr;
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> held_buffer;
+  GLsync reuse_fence = nullptr;
 };
 #endif
 
@@ -145,6 +147,17 @@ bool SupportsExternalOesSampling() {
     return false;
   }
   return ctx->hasExtension(QByteArrayLiteral("GL_OES_EGL_image_external"));
+}
+
+bool SupportsGpuReuseSync() {
+  QOpenGLContext* const ctx = QOpenGLContext::currentContext();
+  if (!ctx) {
+    return false;
+  }
+  if (!ctx->isOpenGLES()) {
+    return true;
+  }
+  return ctx->format().majorVersion() >= 3;
 }
 
 #if defined(WEBRTC_ANDROID)
@@ -505,6 +518,11 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#if defined(WEBRTC_ANDROID)
+    if (use_native_texture) {
+      ArmNativeTextureSlotReuseFence(m_currentNativeTextureSlot);
+    }
+#endif
 
     program->disableAttributeArray(0);
     program->disableAttributeArray(1);
@@ -572,6 +590,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     m_canUsePixelUnpackBuffer = SupportsPixelUnpackBuffer();
     m_canUseExternalOesSampling = SupportsExternalOesSampling();
 #if defined(WEBRTC_ANDROID)
+    m_canUseGpuReuseSync = SupportsGpuReuseSync();
     InitializeAndroidNativeInterop();
 #endif
     InitShaders();
@@ -622,13 +641,61 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     m_androidInteropInitialized = true;
   }
 
+  void DeleteNativeTextureSlotFence(NativeTextureSlot& slot) {
+    if (!slot.reuse_fence) {
+      return;
+    }
+    glDeleteSync(slot.reuse_fence);
+    slot.reuse_fence = nullptr;
+  }
+
+  bool IsNativeTextureSlotFenceReady(NativeTextureSlot& slot) {
+    if (!m_canUseGpuReuseSync || !slot.reuse_fence) {
+      return true;
+    }
+
+    const GLenum wait_result = glClientWaitSync(slot.reuse_fence, 0, 0);
+    if (wait_result == GL_ALREADY_SIGNALED || wait_result == GL_CONDITION_SATISFIED) {
+      DeleteNativeTextureSlotFence(slot);
+      return true;
+    }
+    if (wait_result == GL_WAIT_FAILED) {
+      DeleteNativeTextureSlotFence(slot);
+      static int fence_wait_failed_warn_count = 0;
+      if (fence_wait_failed_warn_count < 5) {
+        ++fence_wait_failed_warn_count;
+        qWarning().noquote()
+            << "[WebRTCVideoRenderer] native slot fence poll failed; reusing slot defensively";
+      }
+      return true;
+    }
+    return false;
+  }
+
   void ReleaseNativeTextureSlot(NativeTextureSlot& slot) {
+    DeleteNativeTextureSlotFence(slot);
     slot.bound_hardware_buffer = nullptr;
     slot.held_buffer = nullptr;
   }
 
   int FindReusableNativeTextureSlotIndex() {
-    return m_nextNativeTextureSlot;
+    for (int i = 0; i < kNativeTextureSlotCount; ++i) {
+      const int index = (m_nextNativeTextureSlot + i) % kNativeTextureSlotCount;
+      NativeTextureSlot& slot = m_nativeTextureSlots[static_cast<size_t>(index)];
+      if (IsNativeTextureSlotFenceReady(slot)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  void ArmNativeTextureSlotReuseFence(int slot_index) {
+    if (!m_canUseGpuReuseSync || slot_index < 0) {
+      return;
+    }
+    NativeTextureSlot& slot = m_nativeTextureSlots[static_cast<size_t>(slot_index)];
+    DeleteNativeTextureSlotFence(slot);
+    slot.reuse_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
   }
 
   bool IsHardwareBufferBoundToAnySlot(AHardwareBuffer* hardware_buffer) const {
@@ -1145,6 +1212,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 #if defined(WEBRTC_ANDROID)
   bool m_androidInteropInitialized = false;
   bool m_canImportHardwareBuffer = false;
+  bool m_canUseGpuReuseSync = false;
   EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
   PFNEGLCREATEIMAGEKHRPROC m_eglCreateImageKHR = nullptr;
   PFNEGLDESTROYIMAGEKHRPROC m_eglDestroyImageKHR = nullptr;

@@ -40,6 +40,10 @@
 
 namespace {
 
+constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.05;
+constexpr int kReceiverForcedPlayoutDelayMs = 50;
+constexpr int kReceiverMaxDecodeQueueSize = 3;
+
 webrtc::SdpType SdpTypeFromOfferAnswerString(const std::string &t) {
   auto opt = webrtc::SdpTypeFromString(t);
   if (opt)
@@ -400,6 +404,11 @@ class WebRTCReceiverClient::PeerConnectionObserverImpl : public webrtc::PeerConn
     // 将抖动缓冲最小播放延迟设为 0 s（下限）；实际延迟仍可能 >0（重排序、拥塞控制等）。
     receiver->SetJitterBufferMinimumDelay(std::optional<double>(0.0));
     qDebug() << "[P2pPlayer] RtpReceiver SetJitterBufferMinimumDelay(0.0) 已应用 (video)";
+    receiver->SetJitterBufferMinimumDelay(
+        std::optional<double>(kReceiverVideoJitterBufferMinDelaySeconds));
+    qDebug().noquote()
+        << QString("[P2pPlayer] video jitter min delay fixed to %1 ms")
+               .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1);
     auto track = receiver->track();
     if (!track || track->kind() != std::string(webrtc::MediaStreamTrackInterface::kVideoKind))
       return;
@@ -592,8 +601,10 @@ void WebRTCReceiverClient::createPeerConnection()
   // g_field_trials_storage +="WebRTC-Pacer-KeyframeFlushing/Enabled/";
   // g_field_trials_storage +="WebRTC-Pacer-FastRetransmissions/Enabled/";
 
-  static std::string g_field_trials_storage = "WebRTC-ZeroPlayoutDelay/min_pacing:1ms,max_decode_queue_size:4/";
-    g_field_trials_storage +="WebRTC-Pacer-KeyframeFlushing/Enabled/";
+  static std::string g_field_trials_storage =
+      "WebRTC-ForcePlayoutDelay/min_ms:50,max_ms:50/";
+  g_field_trials_storage += "WebRTC-ZeroPlayoutDelay/min_pacing:1ms,max_decode_queue_size:3/";
+  g_field_trials_storage += "WebRTC-Pacer-KeyframeFlushing/Enabled/";
   static bool field_trials_inited = false;
   if (!field_trials_inited) {
       webrtc::field_trial::InitFieldTrialsFromString(g_field_trials_storage.c_str());
@@ -607,9 +618,16 @@ void WebRTCReceiverClient::createPeerConnection()
                         .arg(QString::fromStdString(full))
                         .arg(on ? "true" : "false"));
   };
+  log_trial("WebRTC-ForcePlayoutDelay");
   log_trial("WebRTC-VideoFrameTrackingIdAdvertised");
   log_trial("WebRTC-FlexFEC-03-Advertised");
   log_trial("WebRTC-FlexFEC-03");
+  qDebug().noquote()
+      << QString("[Pipeline/Config] playout_fixed=%1 ms | jitter_min=%2 ms | "
+                 "max_decode_queue=%3")
+             .arg(kReceiverForcedPlayoutDelayMs)
+             .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1)
+             .arg(kReceiverMaxDecodeQueueSize);
 
   initWebRTC();
   if (!m_factory) {
@@ -958,8 +976,8 @@ void WebRTCReceiverClient::startStatsTimer()
                                                                : codecMime) +
                       (hasCodecPayloadType ? QString(" pt=%1").arg(codecPayloadType) : QString());
                   qDebug().noquote() << QString(
-                      "[DecodeDiag] %1x%2 | decoder=%3 | codec=%4 | fps=%5 | "
-                      "decoded=+%6 total=%7 | dropped=+%8 total=%9 | jb=%10 ms | recv=%11 KB")
+                      "[Pipeline/Video] %1x%2 | decoder=%3 | codec=%4 | fps=%5 | "
+                      "decoded=+%6 total=%7 | dropped=+%8 total=%9 | recv=%10 KB")
                       .arg(frameWidth)
                       .arg(frameHeight)
                       .arg(QString::fromStdString(decoderImpl))
@@ -969,16 +987,20 @@ void WebRTCReceiverClient::startStatsTimer()
                       .arg(framesDecoded)
                       .arg(deltaDropped)
                       .arg(framesDropped)
-                      .arg(avgJitterMs, 0, 'f', 1)
                       .arg(bytesReceived / 1024);
                   qDebug().noquote() << QString(
-                      "[DecodeTiming] avg_decode=%1 ms | avg_processing=%2 ms | avg_assembly=%3 ms")
+                      "[Pipeline/Latency] jb_avg=%1 ms | decode_avg=%2 ms | "
+                      "processing_avg=%3 ms | assembly_avg=%4 ms | playout_fixed=%5 ms | "
+                      "jitter_min=%6 ms")
+                      .arg(avgJitterMs, 0, 'f', 1)
                       .arg(avgDecodeMs, 0, 'f', 2)
                       .arg(avgProcessingMs, 0, 'f', 2)
-                      .arg(avgAssemblyMs, 0, 'f', 2);
+                      .arg(avgAssemblyMs, 0, 'f', 2)
+                      .arg(kReceiverForcedPlayoutDelayMs)
+                      .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1);
                   if (!codecFmtp.empty()) {
                     qDebug().noquote()
-                        << QString("[DecodeCodec] fmtp=%1")
+                        << QString("[Pipeline/Codec] fmtp=%1")
                                .arg(QString::fromStdString(codecFmtp));
                   }
 
@@ -1013,6 +1035,19 @@ void WebRTCReceiverClient::startStatsTimer()
                       .arg(pliCount)
                       .arg(firCount)
                       .arg(fec_packets_received);
+                  qDebug().noquote() << QString(
+                      "[Pipeline/Net] rtt=%1 ms | rtt_avg=%2 ms | jitter=%3 ms | "
+                      "loss=%4% (%5/%6) | nack=%7 | pli=%8 | fir=%9 | fec=%10")
+                      .arg(rttCurrentMs, 0, 'f', 1)
+                      .arg(avgRttMs, 0, 'f', 1)
+                      .arg(jitter * 1000.0, 0, 'f', 1)
+                      .arg(lossRate, 0, 'f', 2)
+                      .arg(packetsLost)
+                      .arg(packetsReceived)
+                      .arg(nackCount)
+                      .arg(pliCount)
+                      .arg(firCount)
+                      .arg(fec_packets_received);
                 },
                 Qt::QueuedConnection);
 
@@ -1030,6 +1065,7 @@ void WebRTCReceiverClient::startStatsTimer()
     m_peerConnection->GetStats(cb.get());
   });
   m_statsTimer->start();
+  qDebug() << "[Pipeline/Stats] stats timer started (3s)";
   qDebug() << "[DecodeStats] 统计定时器已启动 (每 3s)";
 }
 
@@ -1041,6 +1077,7 @@ void WebRTCReceiverClient::stopStatsTimer()
     m_statsTimer = nullptr;
     qDebug() << "[DecodeStats] 统计定时器已停止";
   }
+  qDebug() << "[Pipeline/Stats] stats timer stopped";
   resetConnectionStats();
 }
 

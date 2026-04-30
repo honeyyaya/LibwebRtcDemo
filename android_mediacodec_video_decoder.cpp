@@ -60,12 +60,18 @@ namespace {
 
 // 涓?Java MediaFormat.KEY_LOW_LATENCY 涓€鑷达紱閮ㄥ垎璁惧鍦?API 30+ 涓婂彲闄嶄綆瑙ｇ爜鍣ㄥ唴閮ㄦ帓闃熴€?
 constexpr char kMediaFormatLowLatency[] = "low-latency";
+#if __ANDROID_API__ >= 30
+constexpr int kCodecLowLatencyEnabled = 1;
+#else
+constexpr int kCodecLowLatencyEnabled = 0;
+#endif
 
 // queue 鍚?drain锛氬厛闈為樆濉炴竻绌哄凡灏辩华甯э紝鍐嶅崟娆＄煭闃诲鍚告敹銆屽垰瀹屾垚銆嶇殑 output銆?
 // 鍘熷厛鍗曢樁娈?first_timeout=35ms 浼氬湪 worker 涓婁覆琛屽爢鍙狅紝涓昏寤惰繜杩滃ぇ浜庤蒋瑙ｃ€?
 constexpr int64_t kDequeueInputTimeoutUs = 3000;
 constexpr int64_t kOutputDequeueTimeoutUs = 3000;
 constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
+constexpr int64_t kBackpressureLogIntervalUs = 500000;
 // acquireLatestImageAsync() needs headroom beyond the native render slots.
 // With 6 native texture slots, renderer-side pending/held buffers can keep 2
 // more AImages alive at the same time, so maxImages must stay above 8 to let
@@ -261,6 +267,9 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 
   int64_t next_input_pts_us_ = 0;
   size_t pending_decode_tasks_ = 0;
+  uint32_t dequeue_input_fail_burst_ = 0;
+  uint64_t dequeue_input_fail_total_ = 0;
+  int64_t last_backpressure_log_us_ = 0;
 
   void WorkerLoop() {
     std::unique_lock<std::mutex> lk(mu_);
@@ -293,6 +302,45 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     if (thread_.joinable()) {
       thread_.join();
     }
+  }
+
+  void ResetInputBackpressureBurst() {
+    std::lock_guard<std::mutex> lk(mu_);
+    dequeue_input_fail_burst_ = 0;
+  }
+
+  void MaybeLogInputBackpressure(ssize_t in_idx) {
+    const int64_t now_us = McMonotonicUs();
+    size_t pending_decode_tasks = 0;
+    size_t pending_output_metadata = 0;
+    uint32_t burst = 0;
+    uint64_t total = 0;
+    bool should_log = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++dequeue_input_fail_burst_;
+      ++dequeue_input_fail_total_;
+      burst = dequeue_input_fail_burst_;
+      total = dequeue_input_fail_total_;
+      pending_decode_tasks = pending_decode_tasks_;
+      pending_output_metadata = pending_output_metadata_.size();
+      should_log =
+          burst <= 3 || (now_us - last_backpressure_log_us_) >= kBackpressureLogIntervalUs;
+      if (should_log) {
+        last_backpressure_log_us_ = now_us;
+      }
+    }
+
+    if (!should_log) {
+      return;
+    }
+
+    ALOGW(
+        "[McBackpressure] dequeueInputBuffer=%zd burst=%u total=%llu pending_tasks=%zu "
+        "pending_meta=%zu pending_images=%d out=%dx%d",
+        in_idx, burst, static_cast<unsigned long long>(total), pending_decode_tasks,
+        pending_output_metadata, pending_image_notifications_.load(std::memory_order_relaxed),
+        out_width_, out_height_);
   }
 
   void DestroyCodec() {
@@ -703,6 +751,14 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       return false;
     }
     next_input_pts_us_ = 0;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      dequeue_input_fail_burst_ = 0;
+      dequeue_input_fail_total_ = 0;
+      last_backpressure_log_us_ = 0;
+    }
+    ALOGI("[McConfig] codec=video/avc size=%dx%d max_images=%d low_latency=%d", w, h,
+          static_cast<int>(kImageReaderMaxImages), kCodecLowLatencyEnabled);
     // 灏芥棭鎷夊彇杈撳嚭鏍煎紡锛堥儴鍒?Codec2 鍦ㄩ甯?output 鍓嶄笉浼氬崟鐙Е鍙?INFO锛屽鑷?out_width_ 涓€鐩翠负 0锛?
     RefreshOutputFormat();
     return true;
@@ -825,10 +881,11 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     }
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(codec_, kDequeueInputTimeoutUs);
     if (in_idx < 0) {
-      ALOGW("dequeueInputBuffer failed: %zd", in_idx);
+      MaybeLogInputBackpressure(in_idx);
       DrainOutputsBounded(kOutputDequeueTimeoutUs, 3);
       return;
     }
+    ResetInputBackpressureBurst();
 
     size_t in_cap = 0;
     uint8_t* in_buf = AMediaCodec_getInputBuffer(codec_, static_cast<size_t>(in_idx), &in_cap);
