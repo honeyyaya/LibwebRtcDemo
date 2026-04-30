@@ -72,7 +72,8 @@ class WebRTCVideoRenderer : public QQuickItem,
                                           double wallOnFrameToRenderMs);
 
   bool takeFrame(webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& outBuffer,
-                 int64_t& outQueueStartMonoUs, int& outFrameId, bool& outFromTracking);
+                 int64_t& outQueueStartMonoUs, int64_t& outGuiUpdateDispatchMonoUs,
+                 int& outFrameId, bool& outFromTracking);
 
  protected:
   void timerEvent(QTimerEvent* event) override;
@@ -99,8 +100,11 @@ class WebRTCVideoRenderer : public QQuickItem,
   int m_traceTargetFrameId = -1;
 
   int64_t m_pendingGlQueueTraceStartMonoUs = 0;
+  int64_t m_pendingGuiUpdateDispatchMonoUs = 0;
   int m_pendingGlQueueTraceFrameId = -1;
   bool m_pendingGlQueueTraceFromTracking = false;
+  int64_t m_inFlightGuiUpdateDispatchMonoUs = 0;
+  int64_t m_lastHighlightSignalMonoUs = 0;
 
   int m_sampledHighlightFrameId = -1;
   double m_sampledDecodeToRenderMs = -1.0;

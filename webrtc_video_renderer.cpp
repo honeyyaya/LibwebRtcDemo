@@ -109,6 +109,9 @@ const char* UploadPathKindName(UploadPathKind kind) {
   }
 }
 
+constexpr int kEncodedIngressPollIntervalMs = 250;
+constexpr int64_t kHighlightSignalThrottleUs = 200000;
+
 #if defined(WEBRTC_ANDROID)
 constexpr int kNativeTextureSlotCount = 6;
 constexpr size_t kMaxNativeImportedImageCacheEntries = 8;
@@ -423,9 +426,12 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
     int64_t queueStartMonoUs = 0;
+    int64_t guiUpdateDispatchMonoUs = 0;
     int frameId = -1;
     bool fromTracking = false;
-    if (!item->takeFrame(buffer, queueStartMonoUs, frameId, fromTracking) || !buffer) {
+    if (!item->takeFrame(buffer, queueStartMonoUs, guiUpdateDispatchMonoUs, frameId,
+                         fromTracking) ||
+        !buffer) {
       if (!item->hasVideo()) {
         m_hasData = false;
 #if defined(WEBRTC_ANDROID)
@@ -442,6 +448,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     ClearHeldFrame();
     m_heldBuffer = std::move(buffer);
     m_queueTraceStartMonoUs = queueStartMonoUs;
+    m_guiUpdateDispatchMonoUs = guiUpdateDispatchMonoUs;
+    m_syncTraceStartMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
     m_currentFrameId = frameId;
     m_frameFromTracking = fromTracking;
     m_haveFrameTrace = true;
@@ -552,7 +560,28 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         const qint64 queueWaitUs =
             m_lastUploadStartMonoUs > 0 ? (m_lastUploadStartMonoUs - m_drawFrameTrace.queueStartMonoUs)
                                         : -1;
+        const qint64 postToGuiUs =
+            m_drawFrameTrace.guiUpdateDispatchMonoUs > 0
+                ? std::max<qint64>(0, m_drawFrameTrace.guiUpdateDispatchMonoUs -
+                                                 m_drawFrameTrace.queueStartMonoUs)
+                : -1;
+        const int64_t syncWaitStartUs =
+            m_drawFrameTrace.guiUpdateDispatchMonoUs > 0
+                ? std::max(m_drawFrameTrace.queueStartMonoUs,
+                           m_drawFrameTrace.guiUpdateDispatchMonoUs)
+                : m_drawFrameTrace.queueStartMonoUs;
+        const qint64 guiToSyncUs =
+            m_drawFrameTrace.syncStartMonoUs > 0
+                ? (m_drawFrameTrace.syncStartMonoUs - syncWaitStartUs)
+                : -1;
+        const qint64 syncToRenderUs =
+            (m_lastUploadStartMonoUs > 0 && m_drawFrameTrace.syncStartMonoUs > 0)
+                ? (m_lastUploadStartMonoUs - m_drawFrameTrace.syncStartMonoUs)
+                : -1;
         const qint64 uploadAndDrawUs = m_lastUploadUs + drawUs;
+        const auto fmtStageMs = [](qint64 us) {
+          return us >= 0 ? QString::number(us / 1000.0, 'f', 3) : QStringLiteral("N/A");
+        };
 
         int64_t decodePipelineStartUs = 0;
         const bool haveDecodeToRender =
@@ -563,12 +592,16 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
             haveDecodeToRender ? QString::number(decodeToRenderMs, 'f', 3) : QStringLiteral("N/A");
 
         qDebug().noquote()
-            << QString("[Timing/Render] tracking_id=%1 | path=%2 | queue_wait=%3 ms | "
-                       "fence_wait=%4 ms | import=%5 ms | upload=%6 ms | draw=%7 ms | "
-                       "upload+draw=%8 ms | wall(OnFrame->render)=%9 ms | total(Decode->render)=%10 ms")
+            << QString("[Timing/Render] tracking_id=%1 | path=%2 | post_to_gui=%3 ms | "
+                       "gui_to_sync=%4 ms | sync_to_render=%5 ms | queue_wait=%6 ms | "
+                       "fence_wait=%7 ms | import=%8 ms | upload=%9 ms | draw=%10 ms | "
+                       "upload+draw=%11 ms | wall(OnFrame->render)=%12 ms | total(Decode->render)=%13 ms")
                    .arg(m_drawFrameTrace.frameId)
                    .arg(UploadPathKindName(m_frameFormat))
-                   .arg(queueWaitUs / 1000.0, 0, 'f', 3)
+                   .arg(fmtStageMs(postToGuiUs))
+                   .arg(fmtStageMs(guiToSyncUs))
+                   .arg(fmtStageMs(syncToRenderUs))
+                   .arg(fmtStageMs(queueWaitUs))
                    .arg(m_lastNativeFenceWaitUs / 1000.0, 0, 'f', 3)
                    .arg(m_lastNativeImportUs / 1000.0, 0, 'f', 3)
                    .arg(m_lastUploadUs / 1000.0, 0, 'f', 3)
@@ -595,6 +628,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
  private:
   struct FrameTrace {
     int64_t queueStartMonoUs = 0;
+    int64_t guiUpdateDispatchMonoUs = 0;
+    int64_t syncStartMonoUs = 0;
     int frameId = -1;
     bool fromTracking = false;
   };
@@ -1174,7 +1209,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         m_hasData = true;
         m_readyFrameTrace = {};
         m_haveReadyFrameTrace = false;
-        m_drawFrameTrace = {m_queueTraceStartMonoUs, m_currentFrameId, m_frameFromTracking};
+        m_drawFrameTrace = {m_queueTraceStartMonoUs, m_guiUpdateDispatchMonoUs,
+                            m_syncTraceStartMonoUs, m_currentFrameId, m_frameFromTracking};
         m_haveDrawFrameTrace = m_haveFrameTrace;
       } else {
         m_uploadStatsValidForLastFrame = false;
@@ -1213,14 +1249,16 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         m_drawFrameTrace = m_readyFrameTrace;
         m_haveDrawFrameTrace = true;
       } else {
-        m_drawFrameTrace = {m_queueTraceStartMonoUs, m_currentFrameId, m_frameFromTracking};
+        m_drawFrameTrace = {m_queueTraceStartMonoUs, m_guiUpdateDispatchMonoUs,
+                            m_syncTraceStartMonoUs, m_currentFrameId, m_frameFromTracking};
         m_haveDrawFrameTrace = m_haveFrameTrace;
       }
     } else {
       m_haveDrawFrameTrace = false;
     }
     if (upload.staged) {
-      m_readyFrameTrace = {m_queueTraceStartMonoUs, m_currentFrameId, m_frameFromTracking};
+      m_readyFrameTrace = {m_queueTraceStartMonoUs, m_guiUpdateDispatchMonoUs,
+                           m_syncTraceStartMonoUs, m_currentFrameId, m_frameFromTracking};
       m_haveReadyFrameTrace = m_haveFrameTrace;
     }
     ClearHeldFrame();
@@ -1276,6 +1314,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> m_heldBuffer;
   int64_t m_queueTraceStartMonoUs = 0;
+  int64_t m_guiUpdateDispatchMonoUs = 0;
+  int64_t m_syncTraceStartMonoUs = 0;
   int m_currentFrameId = -1;
   bool m_frameFromTracking = false;
   bool m_haveFrameTrace = false;
@@ -1293,7 +1333,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
 WebRTCVideoRenderer::WebRTCVideoRenderer(QQuickItem* parent) : QQuickItem(parent) {
   setFlag(ItemHasContents, true);
-  startTimer(1000 / 60);
+  startTimer(kEncodedIngressPollIntervalMs);
 }
 
 WebRTCVideoRenderer::~WebRTCVideoRenderer() {
@@ -1379,17 +1419,24 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
 
     m_pendingBuffer = std::move(buffer);
     m_pendingValid = true;
-    m_pendingGlQueueTraceStartMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
+    m_pendingGlQueueTraceStartMonoUs = onFrameMonoUs;
+    m_pendingGuiUpdateDispatchMonoUs = m_updatePending ? m_inFlightGuiUpdateDispatchMonoUs : 0;
     m_pendingGlQueueTraceFrameId = displayId;
     m_pendingGlQueueTraceFromTracking = fromTracking;
     if (!m_updatePending) {
       m_updatePending = true;
+      m_inFlightGuiUpdateDispatchMonoUs = 0;
+      m_pendingGuiUpdateDispatchMonoUs = 0;
       shouldRequestUpdate = true;
     }
     if (m_highlightFrameId != displayId || m_frameIdFromTracking != fromTracking) {
       m_highlightFrameId = displayId;
       m_frameIdFromTracking = fromTracking;
-      idChanged = true;
+      if (m_lastHighlightSignalMonoUs == 0 ||
+          (onFrameMonoUs - m_lastHighlightSignalMonoUs) >= kHighlightSignalThrottleUs) {
+        idChanged = true;
+        m_lastHighlightSignalMonoUs = onFrameMonoUs;
+      }
     }
     handoffUs = handoffTimer.nsecsElapsed() / 1000;
   }
@@ -1404,7 +1451,23 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
   }
 
   if (shouldRequestUpdate) {
-    QMetaObject::invokeMethod(this, [this]() { update(); }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(
+        this,
+        [this]() {
+          const int64_t guiDispatchMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
+          {
+            QMutexLocker locker(&m_frameMutex);
+            if (!m_updatePending) {
+              return;
+            }
+            m_inFlightGuiUpdateDispatchMonoUs = guiDispatchMonoUs;
+            if (m_pendingValid) {
+              m_pendingGuiUpdateDispatchMonoUs = guiDispatchMonoUs;
+            }
+          }
+          update();
+        },
+        Qt::QueuedConnection);
   }
 
   ++m_frameCount;
@@ -1447,20 +1510,24 @@ bool WebRTCVideoRenderer::hasEncodedIngressTracking() const {
 }
 
 bool WebRTCVideoRenderer::takeFrame(webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& outBuffer,
-                                    int64_t& outQueueStartMonoUs, int& outFrameId,
+                                    int64_t& outQueueStartMonoUs,
+                                    int64_t& outGuiUpdateDispatchMonoUs, int& outFrameId,
                                     bool& outFromTracking) {
   QMutexLocker locker(&m_frameMutex);
   m_updatePending = false;
+  m_inFlightGuiUpdateDispatchMonoUs = 0;
   if (!m_pendingValid || !m_pendingBuffer) {
     return false;
   }
 
   outBuffer = m_pendingBuffer;
   outQueueStartMonoUs = m_pendingGlQueueTraceStartMonoUs;
+  outGuiUpdateDispatchMonoUs = m_pendingGuiUpdateDispatchMonoUs;
   outFrameId = m_pendingGlQueueTraceFrameId;
   outFromTracking = m_pendingGlQueueTraceFromTracking;
   m_pendingBuffer = nullptr;
   m_pendingValid = false;
+  m_pendingGuiUpdateDispatchMonoUs = 0;
   return true;
 }
 
@@ -1555,10 +1622,13 @@ void WebRTCVideoRenderer::clearVideoTrack() {
     m_updatePending = false;
     m_highlightFrameId = -1;
     m_frameIdFromTracking = false;
+    m_lastHighlightSignalMonoUs = 0;
     m_localPreviewSeq = 0;
     m_pendingGlQueueTraceFrameId = -1;
     m_pendingGlQueueTraceStartMonoUs = 0;
+    m_pendingGuiUpdateDispatchMonoUs = 0;
     m_pendingGlQueueTraceFromTracking = false;
+    m_inFlightGuiUpdateDispatchMonoUs = 0;
   }
 
   const bool hadVideo = m_hasVideo.exchange(false, std::memory_order_acq_rel);

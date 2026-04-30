@@ -22,7 +22,7 @@ Window {
 
     Timer {
         id: titleClockTimer
-        interval: 33
+        interval: 1000
         running: true
         repeat: true
         triggeredOnStart: true
