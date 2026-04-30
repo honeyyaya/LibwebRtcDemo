@@ -92,6 +92,8 @@ private:
 
     uint32_t m_prevFramesDecoded = 0;
     double m_prevTotalDecodeTime = 0.0;
+    double m_prevTotalProcessingDelay = 0.0;
+    double m_prevTotalAssemblyTime = 0.0;
     uint32_t m_prevFramesReceived = 0;
     uint32_t m_prevFramesDropped = 0;
     double m_prevJitterBufferDelay = 0.0;

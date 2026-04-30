@@ -3,6 +3,7 @@
 #include "webrtc_video_renderer.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -11,6 +12,7 @@
 #include <QDebug>
 #include <QMetaObject>
 #include <QPointer>
+#include <QStringList>
 #include <QThread>
 
 #include "api/jsep.h"
@@ -23,6 +25,7 @@
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtc_stats_report.h"
 #include "api/stats/rtcstats_objects.h"
+#include "api/video_codecs/h264_profile_level_id.h"
 #include "system_wrappers/include/field_trial.h"
 
 #ifdef Q_OS_ANDROID
@@ -118,6 +121,190 @@ class StatsCallback : public webrtc::RTCStatsCollectorCallback {
  private:
   std::function<void(const webrtc::scoped_refptr<const webrtc::RTCStatsReport> &)> fn_;
 };
+
+template <typename MapT>
+QString CodecParametersToQString(const MapT& parameters) {
+  QStringList parts;
+  for (const auto& entry : parameters) {
+    parts.push_back(QString("%1=%2")
+                        .arg(QString::fromStdString(entry.first),
+                             QString::fromStdString(entry.second)));
+  }
+  return parts.join(';');
+}
+
+QString H264ProfileToQString(webrtc::H264Profile profile) {
+  switch (profile) {
+    case webrtc::H264Profile::kProfileBaseline:
+      return "baseline";
+    case webrtc::H264Profile::kProfileConstrainedBaseline:
+      return "constrained-baseline";
+    case webrtc::H264Profile::kProfileMain:
+      return "main";
+    case webrtc::H264Profile::kProfileConstrainedHigh:
+      return "constrained-high";
+    case webrtc::H264Profile::kProfileHigh:
+      return "high";
+    case webrtc::H264Profile::kProfilePredictiveHigh444:
+      return "predictive-high-444";
+  }
+  return "unknown";
+}
+
+QString DescribeCodecCapability(const webrtc::RtpCodecCapability& codec) {
+  QStringList parts;
+  parts.push_back(codec.IsMediaCodec() ? "media" : "aux");
+  parts.push_back(QString::fromStdString(codec.name));
+  if (codec.preferred_payload_type.has_value()) {
+    parts.push_back(QString("pt=%1").arg(*codec.preferred_payload_type));
+  }
+  if (!codec.parameters.empty()) {
+    parts.push_back(QString("fmtp=%1").arg(CodecParametersToQString(codec.parameters)));
+  }
+  if (codec.name == "H264") {
+    const std::optional<webrtc::H264ProfileLevelId> profile =
+        webrtc::ParseSdpForH264ProfileLevelId(codec.parameters);
+    if (profile.has_value()) {
+      parts.push_back(QString("profile=%1").arg(H264ProfileToQString(profile->profile)));
+    } else {
+      parts.push_back("profile=parse-failed");
+    }
+  }
+  return parts.join(" | ");
+}
+
+void LogCodecCapabilityList(const char* tag,
+                            const std::vector<webrtc::RtpCodecCapability>& codecs) {
+  qDebug().noquote() << QString("[%1] codec_count=%2").arg(tag).arg(codecs.size());
+  int index = 0;
+  for (const auto& codec : codecs) {
+    qDebug().noquote()
+        << QString("[%1] #%2 %3").arg(tag).arg(index++).arg(DescribeCodecCapability(codec));
+  }
+}
+
+void LogReceiverVideoCapabilities(const webrtc::RtpCapabilities& capabilities) {
+  std::vector<webrtc::RtpCodecCapability> video_codecs;
+  for (const auto& codec : capabilities.codecs) {
+    if (codec.kind == webrtc::MediaType::VIDEO) {
+      video_codecs.push_back(codec);
+    }
+  }
+  LogCodecCapabilityList("CodecCaps", video_codecs);
+}
+
+void LogVideoSdpSummary(const char* tag, const std::string& sdp) {
+  const QStringList lines =
+      QString::fromStdString(sdp).split('\n', Qt::SkipEmptyParts);
+  bool in_video_section = false;
+  int emitted = 0;
+  qDebug().noquote() << QString("[%1] ===== video sdp summary begin =====").arg(tag);
+  for (const QString& raw_line : lines) {
+    const QString line = raw_line.trimmed();
+    if (line.startsWith("m=")) {
+      in_video_section = line.startsWith("m=video ");
+      if (in_video_section) {
+        qDebug().noquote() << QString("[%1] %2").arg(tag, line);
+        ++emitted;
+      }
+      continue;
+    }
+    if (!in_video_section) {
+      continue;
+    }
+    if (line.startsWith("a=rtpmap:") || line.startsWith("a=fmtp:") ||
+        line.startsWith("a=rtcp-fb:") || line.startsWith("a=mid:") ||
+        line.startsWith("a=rtcp-mux") || line.startsWith("a=rtcp-rsize") ||
+        line == "a=recvonly" || line == "a=sendrecv" || line == "a=sendonly" ||
+        line == "a=inactive") {
+      qDebug().noquote() << QString("[%1] %2").arg(tag, line);
+      ++emitted;
+    }
+  }
+  if (emitted == 0) {
+    qDebug().noquote() << QString("[%1] no video section found").arg(tag);
+  }
+  qDebug().noquote() << QString("[%1] ===== video sdp summary end =====").arg(tag);
+}
+
+bool IsLowLatencyH264Capability(const webrtc::RtpCodecCapability& codec) {
+  if (codec.kind != webrtc::MediaType::VIDEO || codec.name != "H264") {
+    return false;
+  }
+  const std::optional<webrtc::H264ProfileLevelId> profile =
+      webrtc::ParseSdpForH264ProfileLevelId(codec.parameters);
+  if (!profile.has_value()) {
+    return false;
+  }
+  return profile->profile == webrtc::H264Profile::kProfileConstrainedBaseline ||
+         profile->profile == webrtc::H264Profile::kProfileBaseline;
+}
+
+std::vector<webrtc::RtpCodecCapability> BuildLowLatencyVideoCodecPreferences(
+    const webrtc::RtpCapabilities& capabilities) {
+  std::vector<webrtc::RtpCodecCapability> preferred_h264_codecs;
+  std::vector<webrtc::RtpCodecCapability> compatible_h264_codecs;
+  std::vector<webrtc::RtpCodecCapability> fallback_media_codecs;
+  std::vector<webrtc::RtpCodecCapability> auxiliary_codecs;
+  std::vector<int> allowed_payload_types;
+
+  for (const auto& codec : capabilities.codecs) {
+    if (codec.kind != webrtc::MediaType::VIDEO) {
+      continue;
+    }
+    if (codec.IsMediaCodec()) {
+      if (IsLowLatencyH264Capability(codec)) {
+        preferred_h264_codecs.push_back(codec);
+      } else if (codec.name == "H264") {
+        compatible_h264_codecs.push_back(codec);
+      } else {
+        fallback_media_codecs.push_back(codec);
+      }
+      continue;
+    }
+    auxiliary_codecs.push_back(codec);
+  }
+
+  if (preferred_h264_codecs.empty() && compatible_h264_codecs.empty()) {
+    return {};
+  }
+
+  for (const auto& codec : preferred_h264_codecs) {
+    if (codec.preferred_payload_type.has_value()) {
+      allowed_payload_types.push_back(*codec.preferred_payload_type);
+    }
+  }
+  for (const auto& codec : compatible_h264_codecs) {
+    if (codec.preferred_payload_type.has_value()) {
+      allowed_payload_types.push_back(*codec.preferred_payload_type);
+    }
+  }
+  for (const auto& codec : fallback_media_codecs) {
+    if (codec.preferred_payload_type.has_value()) {
+      allowed_payload_types.push_back(*codec.preferred_payload_type);
+    }
+  }
+
+  std::vector<webrtc::RtpCodecCapability> result = preferred_h264_codecs;
+  result.insert(result.end(), compatible_h264_codecs.begin(), compatible_h264_codecs.end());
+  result.insert(result.end(), fallback_media_codecs.begin(), fallback_media_codecs.end());
+  for (const auto& codec : auxiliary_codecs) {
+    if (codec.name == "rtx") {
+      const auto apt_it = codec.parameters.find("apt");
+      if (apt_it == codec.parameters.end()) {
+        continue;
+      }
+      const int apt = std::atoi(apt_it->second.c_str());
+      if (std::find(allowed_payload_types.begin(), allowed_payload_types.end(), apt) ==
+          allowed_payload_types.end()) {
+        continue;
+      }
+    }
+    result.push_back(codec);
+  }
+
+  return result;
+}
 
 }  // namespace
 
@@ -458,6 +645,7 @@ void WebRTCReceiverClient::handleOffer(const std::string &type, const std::strin
 {
   Q_EMIT statusChanged("收到 Offer，正在创建 Answer...");
 
+  LogVideoSdpSummary("OfferSDP", sdp);
   m_pendingRemoteIce.clear();
   m_remoteDescriptionApplied = false;
   m_pendingSetRemoteObserver = nullptr;
@@ -516,6 +704,34 @@ void WebRTCReceiverClient::doCreateAnswerAfterSetRemote()
   if (!m_peerConnection)
     return;
 
+  if (m_factory) {
+    const webrtc::RtpCapabilities capabilities =
+        m_factory->GetRtpReceiverCapabilities(webrtc::MediaType::VIDEO);
+    LogReceiverVideoCapabilities(capabilities);
+    std::vector<webrtc::RtpCodecCapability> preferred_codecs =
+        BuildLowLatencyVideoCodecPreferences(capabilities);
+    if (preferred_codecs.empty()) {
+      qWarning() << "[CodecPrefs] preferred list empty; SetCodecPreferences skipped";
+    } else {
+      LogCodecCapabilityList("CodecPrefs", preferred_codecs);
+    }
+    if (!preferred_codecs.empty()) {
+      for (const auto& transceiver : m_peerConnection->GetTransceivers()) {
+        if (!transceiver || transceiver->media_type() != webrtc::MediaType::VIDEO) {
+          continue;
+        }
+        qDebug() << "[CodecPrefs] applying to video transceiver";
+        const webrtc::RTCError error = transceiver->SetCodecPreferences(preferred_codecs);
+        if (!error.ok()) {
+          qWarning() << "[P2pPlayer] SetCodecPreferences failed:"
+                     << QString::fromStdString(error.message());
+        } else {
+          qDebug() << "[CodecPrefs] SetCodecPreferences OK";
+        }
+      }
+    }
+  }
+
   m_pendingCreateAnswerObserver = webrtc::make_ref_counted<CreateAnswerObserver>(
       [this](webrtc::RTCError e, std::unique_ptr<webrtc::SessionDescriptionInterface> desc) {
         m_pendingCreateAnswerObserver = nullptr;
@@ -538,6 +754,7 @@ void WebRTCReceiverClient::doCreateAnswerAfterSetRemote()
         }
         qDebug() << "[P2pPlayer] CreateAnswer OK, sdp 字节=" << static_cast<int>(answer_sdp.size());
 
+        LogVideoSdpSummary("AnswerSDP", answer_sdp);
         m_pendingSetLocalObserver = webrtc::make_ref_counted<SetLocalDescObserver>(
             [this, answer_sdp]() {
               m_pendingSetLocalObserver = nullptr;
@@ -633,6 +850,8 @@ void WebRTCReceiverClient::startStatsTimer()
     return;
   m_prevFramesDecoded = 0;
   m_prevTotalDecodeTime = 0.0;
+  m_prevTotalProcessingDelay = 0.0;
+  m_prevTotalAssemblyTime = 0.0;
   m_prevFramesReceived = 0;
   m_prevFramesDropped = 0;
   m_prevJitterBufferDelay = 0.0;
@@ -669,6 +888,8 @@ void WebRTCReceiverClient::startStatsTimer()
 
             uint32_t framesDecoded = inb->frames_decoded.value_or(0);
             double totalDecodeTime = inb->total_decode_time.value_or(0.0);
+            double totalProcessingDelay = inb->total_processing_delay.value_or(0.0);
+            double totalAssemblyTime = inb->total_assembly_time.value_or(0.0);
             double fps = inb->frames_per_second.value_or(0.0);
             uint32_t framesReceived = inb->frames_received.value_or(0);
             uint32_t framesDropped = inb->frames_dropped.value_or(0);
@@ -685,9 +906,30 @@ void WebRTCReceiverClient::startStatsTimer()
             int64_t pliCount = inb->pli_count.value_or(0);
             int64_t firCount = inb->fir_count.value_or(0);
             int64_t fec_packets_received = inb->fec_packets_received.value_or(0);
+            std::string codecMime;
+            std::string codecFmtp;
+            uint32_t codecPayloadType = 0;
+            bool hasCodecPayloadType = false;
+            if (inb->codec_id.has_value() && !inb->codec_id->empty()) {
+              if (const auto* codec =
+                      report->GetAs<webrtc::RTCCodecStats>(*inb->codec_id)) {
+                codecMime = codec->mime_type.value_or("");
+                codecFmtp = codec->sdp_fmtp_line.value_or("");
+                if (codec->payload_type.has_value()) {
+                  codecPayloadType = *codec->payload_type;
+                  hasCodecPayloadType = true;
+                }
+              }
+            }
             uint32_t deltaFrames = framesDecoded - m_prevFramesDecoded;
             double deltaTime = totalDecodeTime - m_prevTotalDecodeTime;
             double avgDecodeMs = (deltaFrames > 0) ? (deltaTime / deltaFrames * 1000.0) : 0.0;
+            double deltaProcessingDelay = totalProcessingDelay - m_prevTotalProcessingDelay;
+            double avgProcessingMs =
+                (deltaFrames > 0) ? (deltaProcessingDelay / deltaFrames * 1000.0) : 0.0;
+            double deltaAssemblyTime = totalAssemblyTime - m_prevTotalAssemblyTime;
+            double avgAssemblyMs =
+                (deltaFrames > 0) ? (deltaAssemblyTime / deltaFrames * 1000.0) : 0.0;
             uint32_t deltaDropped = framesDropped - m_prevFramesDropped;
 
             uint64_t deltaJbEmitted = jitterBufferEmitted - m_prevJitterBufferEmitted;
@@ -710,6 +952,35 @@ void WebRTCReceiverClient::startStatsTimer()
                   m_jitterBufferMs = avgJitterMs;
                   m_hasConnectionStats = true;
                   Q_EMIT connectionStatsChanged();
+
+                  const QString codecLabel =
+                      QString::fromStdString(codecMime.empty() ? std::string("unknown")
+                                                               : codecMime) +
+                      (hasCodecPayloadType ? QString(" pt=%1").arg(codecPayloadType) : QString());
+                  qDebug().noquote() << QString(
+                      "[DecodeDiag] %1x%2 | decoder=%3 | codec=%4 | fps=%5 | "
+                      "decoded=+%6 total=%7 | dropped=+%8 total=%9 | jb=%10 ms | recv=%11 KB")
+                      .arg(frameWidth)
+                      .arg(frameHeight)
+                      .arg(QString::fromStdString(decoderImpl))
+                      .arg(codecLabel)
+                      .arg(fps, 0, 'f', 1)
+                      .arg(deltaFrames)
+                      .arg(framesDecoded)
+                      .arg(deltaDropped)
+                      .arg(framesDropped)
+                      .arg(avgJitterMs, 0, 'f', 1)
+                      .arg(bytesReceived / 1024);
+                  qDebug().noquote() << QString(
+                      "[DecodeTiming] avg_decode=%1 ms | avg_processing=%2 ms | avg_assembly=%3 ms")
+                      .arg(avgDecodeMs, 0, 'f', 2)
+                      .arg(avgProcessingMs, 0, 'f', 2)
+                      .arg(avgAssemblyMs, 0, 'f', 2);
+                  if (!codecFmtp.empty()) {
+                    qDebug().noquote()
+                        << QString("[DecodeCodec] fmtp=%1")
+                               .arg(QString::fromStdString(codecFmtp));
+                  }
 
                   qDebug().noquote() << QString(
                       "[DecodeStats] %1x%2 | 解码器: %3 | fps: %4 | "
@@ -747,6 +1018,8 @@ void WebRTCReceiverClient::startStatsTimer()
 
             m_prevFramesDecoded = framesDecoded;
             m_prevTotalDecodeTime = totalDecodeTime;
+            m_prevTotalProcessingDelay = totalProcessingDelay;
+            m_prevTotalAssemblyTime = totalAssemblyTime;
             m_prevFramesReceived = framesReceived;
             m_prevFramesDropped = framesDropped;
             m_prevJitterBufferDelay = jitterBufferDelay;
@@ -776,6 +1049,14 @@ void WebRTCReceiverClient::resetConnectionStats()
   m_rttCurrentMs = 0.0;
   m_rttAvgMs = 0.0;
   m_jitterBufferMs = 0.0;
+  m_prevFramesDecoded = 0;
+  m_prevTotalDecodeTime = 0.0;
+  m_prevTotalProcessingDelay = 0.0;
+  m_prevTotalAssemblyTime = 0.0;
+  m_prevFramesReceived = 0;
+  m_prevFramesDropped = 0;
+  m_prevJitterBufferDelay = 0.0;
+  m_prevJitterBufferEmitted = 0;
   if (m_hasConnectionStats) {
     m_hasConnectionStats = false;
     Q_EMIT connectionStatsChanged();
