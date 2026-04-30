@@ -2,8 +2,10 @@
 #define WEBRTC_VIDEO_RENDERER_H
 
 #include <atomic>
+#include <cstdint>
 
 #include <QElapsedTimer>
+#include <QMetaObject>
 #include <QMutex>
 #include <QQuickItem>
 #include <QString>
@@ -16,6 +18,7 @@
 #include "api/video/video_sink_interface.h"
 
 class QSGNode;
+class QQuickWindow;
 class WebRTCVideoRenderNode;
 
 class WebRTCVideoRenderer : public QQuickItem,
@@ -71,23 +74,44 @@ class WebRTCVideoRenderer : public QQuickItem,
   Q_INVOKABLE void applySampledPipelineUi(int glTraceFrameId, double decodeToRenderTotalMs,
                                           double wallOnFrameToRenderMs);
 
-  bool takeFrame(webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& outBuffer,
-                 int64_t& outQueueStartMonoUs, int64_t& outGuiUpdateDispatchMonoUs,
-                 int& outFrameId, bool& outFromTracking);
-
  protected:
   void timerEvent(QTimerEvent* event) override;
   QSGNode* updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData* data) override;
   void geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) override;
 
  private:
+  struct LatestFrameSlot {
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
+    int64_t queueStartMonoUs = 0;
+    int frameId = -1;
+    bool fromTracking = false;
+    uint64_t generation = 0;
+  };
+
+  struct SyncFrameSlot {
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
+    int64_t queueStartMonoUs = 0;
+    int64_t syncStartMonoUs = 0;
+    int frameId = -1;
+    bool fromTracking = false;
+    uint64_t generation = 0;
+  };
+
+  void RequestRenderPumpUpdate();
+  void EnsureRenderPumpRunning();
+  void StopRenderPump();
+  void OnWindowChanged(QQuickWindow* window);
+  void OnBeforeSynchronizing();
+  void OnFrameSwapped();
+
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> m_track;
   std::atomic<bool> m_hasVideo{false};
+  std::atomic<bool> m_renderPumpRunning{false};
+  std::atomic<bool> m_renderPumpStartPending{false};
 
   mutable QMutex m_frameMutex;
-  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> m_pendingBuffer;
-  bool m_pendingValid = false;
-  bool m_updatePending = false;
+  LatestFrameSlot m_latestFrame;
+  SyncFrameSlot m_syncFrame;
 
   int m_highlightFrameId = -1;
   bool m_frameIdFromTracking = false;
@@ -99,12 +123,9 @@ class WebRTCVideoRenderer : public QQuickItem,
   int m_lastPolledEncodedIngressId = -1;
   int m_traceTargetFrameId = -1;
 
-  int64_t m_pendingGlQueueTraceStartMonoUs = 0;
-  int64_t m_pendingGuiUpdateDispatchMonoUs = 0;
-  int m_pendingGlQueueTraceFrameId = -1;
-  bool m_pendingGlQueueTraceFromTracking = false;
-  int64_t m_inFlightGuiUpdateDispatchMonoUs = 0;
   int64_t m_lastHighlightSignalMonoUs = 0;
+  QMetaObject::Connection m_beforeSynchronizingConnection;
+  QMetaObject::Connection m_frameSwappedConnection;
 
   int m_sampledHighlightFrameId = -1;
   double m_sampledDecodeToRenderMs = -1.0;
