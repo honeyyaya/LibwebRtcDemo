@@ -95,6 +95,20 @@ enum class UploadPathKind {
   NV12,
 };
 
+const char* UploadPathKindName(UploadPathKind kind) {
+  switch (kind) {
+    case UploadPathKind::Native:
+      return "AHardwareBuffer";
+    case UploadPathKind::NV12:
+      return "NV12";
+    case UploadPathKind::I420:
+      return "I420";
+    case UploadPathKind::None:
+    default:
+      return "None";
+  }
+}
+
 #if defined(WEBRTC_ANDROID)
 constexpr int kNativeTextureSlotCount = 6;
 constexpr size_t kMaxNativeImportedImageCacheEntries = 8;
@@ -535,6 +549,9 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       if (webrtc_demo::ShouldLogTrackingTimedSampleById(tid)) {
         const int64_t afterDrawMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
         const qint64 wallFromQueueUs = afterDrawMonoUs - m_drawFrameTrace.queueStartMonoUs;
+        const qint64 queueWaitUs =
+            m_lastUploadStartMonoUs > 0 ? (m_lastUploadStartMonoUs - m_drawFrameTrace.queueStartMonoUs)
+                                        : -1;
         const qint64 uploadAndDrawUs = m_lastUploadUs + drawUs;
 
         int64_t decodePipelineStartUs = 0;
@@ -546,9 +563,14 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
             haveDecodeToRender ? QString::number(decodeToRenderMs, 'f', 3) : QStringLiteral("N/A");
 
         qDebug().noquote()
-            << QString("[RenderPerf] frame_id=%1 | upload=%2 ms | draw=%3 ms | upload+draw=%4 ms | "
-                       "wall(OnFrame->render)=%5 ms | total(Decode->render)=%6 ms")
+            << QString("[Timing/Render] tracking_id=%1 | path=%2 | queue_wait=%3 ms | "
+                       "fence_wait=%4 ms | import=%5 ms | upload=%6 ms | draw=%7 ms | "
+                       "upload+draw=%8 ms | wall(OnFrame->render)=%9 ms | total(Decode->render)=%10 ms")
                    .arg(m_drawFrameTrace.frameId)
+                   .arg(UploadPathKindName(m_frameFormat))
+                   .arg(queueWaitUs / 1000.0, 0, 'f', 3)
+                   .arg(m_lastNativeFenceWaitUs / 1000.0, 0, 'f', 3)
+                   .arg(m_lastNativeImportUs / 1000.0, 0, 'f', 3)
                    .arg(m_lastUploadUs / 1000.0, 0, 'f', 3)
                    .arg(drawUs / 1000.0, 0, 'f', 3)
                    .arg(uploadAndDrawUs / 1000.0, 0, 'f', 3)
@@ -1050,9 +1072,15 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       return false;
     }
 
+    m_lastNativeFenceWaitUs = 0;
+    m_lastNativeImportUs = 0;
+
     const int sync_fence_fd = buffer->ConsumeSyncFenceFd();
+    QElapsedTimer fenceTimer;
+    fenceTimer.start();
     const NativeFenceWaitStatus fence_status =
         WaitForNativeFenceFd(sync_fence_fd, kNativeFenceWaitTimeoutMs);
+    m_lastNativeFenceWaitUs = fenceTimer.nsecsElapsed() / 1000;
     if (fence_status == NativeFenceWaitStatus::Pending) {
       return false;
     }
@@ -1071,6 +1099,8 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       return false;
     }
 
+    QElapsedTimer importTimer;
+    importTimer.start();
     NativeImportedImageCacheEntry* const entry =
         FindOrCreateImportedImageCacheEntry(hardware_buffer);
     if (!entry) {
@@ -1092,6 +1122,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     slot.held_buffer = m_heldBuffer;
     m_currentNativeTextureSlot = slot_index;
     m_nextNativeTextureSlot = (slot_index + 1) % kNativeTextureSlotCount;
+    m_lastNativeImportUs = importTimer.nsecsElapsed() / 1000;
     return true;
   }
 #endif
@@ -1103,6 +1134,11 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
     QElapsedTimer uploadTimer;
     uploadTimer.start();
+    m_lastUploadStartMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
+#if defined(WEBRTC_ANDROID)
+    m_lastNativeFenceWaitUs = 0;
+    m_lastNativeImportUs = 0;
+#endif
 
     PlanePipelineResult upload;
     const auto type = m_heldBuffer->type();
@@ -1248,8 +1284,11 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
   FrameTrace m_drawFrameTrace;
   bool m_haveDrawFrameTrace = false;
 
+  int64_t m_lastUploadStartMonoUs = 0;
   qint64 m_lastUploadUs = 0;
   bool m_uploadStatsValidForLastFrame = false;
+  qint64 m_lastNativeFenceWaitUs = 0;
+  qint64 m_lastNativeImportUs = 0;
 };
 
 WebRTCVideoRenderer::WebRTCVideoRenderer(QQuickItem* parent) : QQuickItem(parent) {
@@ -1277,17 +1316,12 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
   const int64_t onFrameMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
   const uint32_t rtpTs = frame.rtp_timestamp();
   int64_t afterDecodedUs = 0;
+  bool haveDecodedToOnFrame = false;
+  double decodedToOnFrameMs = -1.0;
   if (webrtc_demo::DecodeSinkTakeDecodedReturn(rtpTs, &afterDecodedUs)) {
     const int64_t decodeToSinkUs = onFrameMonoUs - afterDecodedUs;
-    const uint16_t fid = frame.id();
-    if (fid != webrtc::VideoFrame::kNotSetId &&
-        webrtc_demo::ShouldLogTrackingTimedSampleById(static_cast<uint32_t>(fid))) {
-      qDebug().noquote()
-          << QString("[RenderPerf] Decoded->OnFrame tracking_id=%1 rtp_ts=%2 us=%3")
-                 .arg(static_cast<uint>(fid))
-                 .arg(rtpTs)
-                 .arg(static_cast<qint64>(decodeToSinkUs));
-    }
+    haveDecodedToOnFrame = true;
+    decodedToOnFrameMs = decodeToSinkUs / 1000.0;
   }
 
   static int onFrameCalls = 0;
@@ -1379,9 +1413,12 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
   if (fromTrackingForLog &&
       webrtc_demo::ShouldLogTrackingTimedSampleById(static_cast<uint32_t>(displayIdForLog))) {
     qDebug().noquote()
-        << QString("[RenderPerf] OnFrame tracking_id=%1 | handoff=%2 ms | frame_interval=%3 ms | "
-                   "buffer=%4 | bytes=%5 KB | total=%6 ms")
+        << QString("[Timing/OnFrame] tracking_id=%1 | rtp_ts=%2 | decoded_to_onframe=%3 ms | "
+                   "handoff=%4 ms | frame_interval=%5 ms | buffer=%6 | bytes=%7 KB | total=%8 ms")
                .arg(displayIdForLog)
+               .arg(rtpTs)
+               .arg(haveDecodedToOnFrame ? QString::number(decodedToOnFrameMs, 'f', 3)
+                                         : QStringLiteral("N/A"))
                .arg(handoffUs / 1000.0, 0, 'f', 3)
                .arg(intervalUs / 1000.0, 0, 'f', 2)
                .arg(webrtc::VideoFrameBufferTypeToString(originalType))

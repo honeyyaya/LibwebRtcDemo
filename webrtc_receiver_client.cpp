@@ -7,6 +7,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include <QDebug>
@@ -40,9 +41,11 @@
 
 namespace {
 
-constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.05;
-constexpr int kReceiverForcedPlayoutDelayMs = 50;
-constexpr int kReceiverMaxDecodeQueueSize = 3;
+// Keep a small jitter-buffer floor, but let WebRTC adapt instead of pinning
+// playout to a fixed 100 ms delay.
+constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.03;
+constexpr int kReceiverForcedPlayoutDelayMs = 0;
+constexpr int kReceiverMaxDecodeQueueSize = 4;
 
 webrtc::SdpType SdpTypeFromOfferAnswerString(const std::string &t) {
   auto opt = webrtc::SdpTypeFromString(t);
@@ -401,13 +404,11 @@ class WebRTCReceiverClient::PeerConnectionObserverImpl : public webrtc::PeerConn
     auto receiver = transceiver->receiver();
     if (!receiver)
       return;
-    // 将抖动缓冲最小播放延迟设为 0 s（下限）；实际延迟仍可能 >0（重排序、拥塞控制等）。
-    receiver->SetJitterBufferMinimumDelay(std::optional<double>(0.0));
-    qDebug() << "[P2pPlayer] RtpReceiver SetJitterBufferMinimumDelay(0.0) 已应用 (video)";
+    // Keep a small playout cushion while allowing the receiver to adapt.
     receiver->SetJitterBufferMinimumDelay(
         std::optional<double>(kReceiverVideoJitterBufferMinDelaySeconds));
     qDebug().noquote()
-        << QString("[P2pPlayer] video jitter min delay fixed to %1 ms")
+        << QString("[P2pPlayer] video jitter min delay target set to %1 ms")
                .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1);
     auto track = receiver->track();
     if (!track || track->kind() != std::string(webrtc::MediaStreamTrackInterface::kVideoKind))
@@ -596,15 +597,23 @@ void WebRTCReceiverClient::createPeerConnection()
   // 须在 CreatePeerConnectionFactory 之前注册；全局至多一次（见 field_trial.h）。
   // 与发送端保持一致：FrameTracking（RTP 扩展协商）+ FlexFEC-03（SDP 中带 flexfec-03，且启用 FEC 收包；可与 NACK 并存）。
   // static std::string g_field_trials_storage ="WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
-  // g_field_trials_storage +="WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:0/";
-  // g_field_trials_storage += "WebRTC-ZeroPlayoutDelay/min_pacing:0ms,max_decode_queue_size:4/";
+  // g_field_trials_storage +="WebRTC-ForcePlayoutDelay/min_ms:100,max_ms:100/";
+  // g_field_trials_storage += "WebRTC-ZeroPlayoutDelay/min_pacing:4ms,max_decode_queue_size:6/";
   // g_field_trials_storage +="WebRTC-Pacer-KeyframeFlushing/Enabled/";
   // g_field_trials_storage +="WebRTC-Pacer-FastRetransmissions/Enabled/";
 
-  static std::string g_field_trials_storage =
-      "WebRTC-ForcePlayoutDelay/min_ms:50,max_ms:50/";
-  g_field_trials_storage += "WebRTC-ZeroPlayoutDelay/min_pacing:1ms,max_decode_queue_size:3/";
-  g_field_trials_storage += "WebRTC-Pacer-KeyframeFlushing/Enabled/";
+  static const std::string g_field_trials_storage = [] {
+    std::string s = "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
+    if (kReceiverForcedPlayoutDelayMs > 0) {
+      s += "WebRTC-ForcePlayoutDelay/min_ms:" +
+           std::to_string(kReceiverForcedPlayoutDelayMs) + ",max_ms:" +
+           std::to_string(kReceiverForcedPlayoutDelayMs) + "/";
+    }
+    s += "WebRTC-ZeroPlayoutDelay/min_pacing:4ms,max_decode_queue_size:" +
+         std::to_string(kReceiverMaxDecodeQueueSize) + "/";
+    s += "WebRTC-Pacer-KeyframeFlushing/Enabled/";
+    return s;
+  }();
   static bool field_trials_inited = false;
   if (!field_trials_inited) {
       webrtc::field_trial::InitFieldTrialsFromString(g_field_trials_storage.c_str());
@@ -622,10 +631,14 @@ void WebRTCReceiverClient::createPeerConnection()
   log_trial("WebRTC-VideoFrameTrackingIdAdvertised");
   log_trial("WebRTC-FlexFEC-03-Advertised");
   log_trial("WebRTC-FlexFEC-03");
+  const QString playoutMode =
+      kReceiverForcedPlayoutDelayMs > 0
+          ? QString("fixed-%1ms").arg(kReceiverForcedPlayoutDelayMs)
+          : QStringLiteral("dynamic");
   qDebug().noquote()
-      << QString("[Pipeline/Config] playout_fixed=%1 ms | jitter_min=%2 ms | "
+      << QString("[Pipeline/Config] playout_mode=%1 | jitter_min=%2 ms | "
                  "max_decode_queue=%3")
-             .arg(kReceiverForcedPlayoutDelayMs)
+             .arg(playoutMode)
              .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1)
              .arg(kReceiverMaxDecodeQueueSize);
 
@@ -990,13 +1003,15 @@ void WebRTCReceiverClient::startStatsTimer()
                       .arg(bytesReceived / 1024);
                   qDebug().noquote() << QString(
                       "[Pipeline/Latency] jb_avg=%1 ms | decode_avg=%2 ms | "
-                      "processing_avg=%3 ms | assembly_avg=%4 ms | playout_fixed=%5 ms | "
+                      "processing_avg=%3 ms | assembly_avg=%4 ms | playout_mode=%5 | "
                       "jitter_min=%6 ms")
                       .arg(avgJitterMs, 0, 'f', 1)
                       .arg(avgDecodeMs, 0, 'f', 2)
                       .arg(avgProcessingMs, 0, 'f', 2)
                       .arg(avgAssemblyMs, 0, 'f', 2)
-                      .arg(kReceiverForcedPlayoutDelayMs)
+                      .arg(kReceiverForcedPlayoutDelayMs > 0
+                               ? QString("fixed-%1ms").arg(kReceiverForcedPlayoutDelayMs)
+                               : QStringLiteral("dynamic"))
                       .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1);
                   if (!codecFmtp.empty()) {
                     qDebug().noquote()

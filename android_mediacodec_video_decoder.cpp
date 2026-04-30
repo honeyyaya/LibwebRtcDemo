@@ -4,6 +4,7 @@
 #include "video_decode_sink_timing_bridge.h"
 
 #include "api/video/encoded_image.h"
+#include <android/api-level.h>
 #include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <android/native_window.h>
@@ -60,11 +61,7 @@ namespace {
 
 // 涓?Java MediaFormat.KEY_LOW_LATENCY 涓€鑷达紱閮ㄥ垎璁惧鍦?API 30+ 涓婂彲闄嶄綆瑙ｇ爜鍣ㄥ唴閮ㄦ帓闃熴€?
 constexpr char kMediaFormatLowLatency[] = "low-latency";
-#if __ANDROID_API__ >= 30
-constexpr int kCodecLowLatencyEnabled = 1;
-#else
-constexpr int kCodecLowLatencyEnabled = 0;
-#endif
+constexpr int kCodecLowLatencyMinApi = 30;
 
 // queue 鍚?drain锛氬厛闈為樆濉炴竻绌哄凡灏辩华甯э紝鍐嶅崟娆＄煭闃诲鍚告敹銆屽垰瀹屾垚銆嶇殑 output銆?
 // 鍘熷厛鍗曢樁娈?first_timeout=35ms 浼氬湪 worker 涓婁覆琛屽爢鍙狅紝涓昏寤惰繜杩滃ぇ浜庤蒋瑙ｃ€?
@@ -73,11 +70,21 @@ constexpr int64_t kOutputDequeueTimeoutUs = 3000;
 constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
 constexpr int64_t kBackpressureLogIntervalUs = 500000;
 // acquireLatestImageAsync() needs headroom beyond the native render slots.
-// With 6 native texture slots, renderer-side pending/held buffers can keep 2
-// more AImages alive at the same time, so maxImages must stay above 8 to let
-// ImageReader discard stale buffers and still hand us the newest image.
-constexpr int32_t kImageReaderMaxImages = 10;
+// With 100 ms receiver playout buffering at 60 fps, WebRTC can hold about
+// 6 decoded frames while the renderer keeps up to 6 native texture slots plus
+// short-lived pending refs, so maxImages needs enough slack to avoid
+// AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED bursts.
+constexpr int32_t kImageReaderMaxImages = 16;
 constexpr size_t kMaxPendingOutputMetadata = 128;
+
+int GetDeviceApiLevel() {
+  const int api_level = android_get_device_api_level();
+  return api_level > 0 ? api_level : __ANDROID_API__;
+}
+
+bool ShouldRequestLowLatencyCodec() {
+  return GetDeviceApiLevel() >= kCodecLowLatencyMinApi;
+}
 
 // WebRTC H264 鎺ユ敹璺緞澶氫负 Annex B锛?0 00 01 / 00 00 00 01锛夈€侰odec2 瑙ｇ爜鍣ㄩ€氬父瑕佽繖绉嶈緭鍏ワ紱
 // 鑻ヨ杞垚 AVCC锛? 瀛楄妭闀垮害鍓嶇紑锛夛紝閮ㄥ垎鏈哄瀷浼氬悆婊?input 浣嗘案杩滀笉鍑?output锛坒ps=0锛夈€?
@@ -204,10 +211,35 @@ struct McDrainDetail {
   int64_t dequeue_us = 0;
   int64_t get_out_buf_us = 0;
   int64_t nv12_i420_us = 0;
+  int64_t image_acquire_us = 0;
+  int64_t image_hwbuffer_us = 0;
+  int64_t image_dimensions_us = 0;
+  int64_t image_timestamp_us = 0;
+  int64_t image_metadata_us = 0;
+  int64_t frame_build_us = 0;
   int64_t decoded_cb_us = 0;
   int64_t release_us = 0;
   int out_buffers = 0;
 };
+
+void AccumulateDrainDetail(McDrainDetail* total, const McDrainDetail& pass) {
+  if (!total) {
+    return;
+  }
+  total->total_us += pass.total_us;
+  total->dequeue_us += pass.dequeue_us;
+  total->get_out_buf_us += pass.get_out_buf_us;
+  total->nv12_i420_us += pass.nv12_i420_us;
+  total->image_acquire_us += pass.image_acquire_us;
+  total->image_hwbuffer_us += pass.image_hwbuffer_us;
+  total->image_dimensions_us += pass.image_dimensions_us;
+  total->image_timestamp_us += pass.image_timestamp_us;
+  total->image_metadata_us += pass.image_metadata_us;
+  total->frame_build_us += pass.frame_build_us;
+  total->decoded_cb_us += pass.decoded_cb_us;
+  total->release_us += pass.release_us;
+  total->out_buffers += pass.out_buffers;
+}
 
 // 纭 WebRTC 鏄惁鎶?EncodedImage 閫佽繘鏈В鐮佸櫒锛氬墠 10 甯?+ 涔嬪悗姣?30 甯ф墦涓€鏉★紝閬垮厤鍒峰睆銆?
 void LogMcDecodeIngress(const uint8_t* data,
@@ -563,7 +595,8 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       close(*out_sync_fence_fd);
       *out_sync_fence_fd = -1;
     }
-    if (st == AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
+    if (st == AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE ||
+        st == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED) {
       ResetImageReaderState();
       return false;
     }
@@ -592,12 +625,20 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 
       AImage* image = nullptr;
       int sync_fence_fd = -1;
+      const int64_t t_acquire0 = perf_detail ? McMonotonicUs() : int64_t{0};
       if (!AcquireLatestOutputImage(&image, &sync_fence_fd) || !image) {
         return;
       }
+      if (perf_detail) {
+        perf_detail->image_acquire_us += McMonotonicUs() - t_acquire0;
+      }
 
+      const int64_t t_hwbuf0 = perf_detail ? McMonotonicUs() : int64_t{0};
       AHardwareBuffer* hardware_buffer = nullptr;
       const media_status_t image_status = AImage_getHardwareBuffer(image, &hardware_buffer);
+      if (perf_detail) {
+        perf_detail->image_hwbuffer_us += McMonotonicUs() - t_hwbuf0;
+      }
       if (image_status != AMEDIA_OK || !hardware_buffer) {
         if (sync_fence_fd >= 0) {
           close(sync_fence_fd);
@@ -607,10 +648,14 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         continue;
       }
 
+      const int64_t t_dims0 = perf_detail ? McMonotonicUs() : int64_t{0};
       int32_t image_width = out_width_;
       int32_t image_height = out_height_;
       AImage_getWidth(image, &image_width);
       AImage_getHeight(image, &image_height);
+      if (perf_detail) {
+        perf_detail->image_dimensions_us += McMonotonicUs() - t_dims0;
+      }
       if (image_width <= 0 || image_height <= 0) {
         if (sync_fence_fd >= 0) {
           close(sync_fence_fd);
@@ -620,10 +665,14 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         continue;
       }
 
+      const int64_t t_ts0 = perf_detail ? McMonotonicUs() : int64_t{0};
       int64_t image_timestamp_ns = 0;
       const media_status_t timestamp_status = AImage_getTimestamp(image, &image_timestamp_ns);
       const int64_t image_pts_us =
           timestamp_status == AMEDIA_OK ? image_timestamp_ns / 1000 : 0;
+      if (perf_detail) {
+        perf_detail->image_timestamp_us += McMonotonicUs() - t_ts0;
+      }
       if (timestamp_status != AMEDIA_OK) {
         if (sync_fence_fd >= 0) {
           close(sync_fence_fd);
@@ -636,8 +685,12 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         continue;
       }
 
+      const int64_t t_meta0 = perf_detail ? McMonotonicUs() : int64_t{0};
       const std::optional<OutputFrameMetadata> frame_meta =
           TakeOutputMetadataForPtsUs(image_pts_us);
+      if (perf_detail) {
+        perf_detail->image_metadata_us += McMonotonicUs() - t_meta0;
+      }
       if (!frame_meta.has_value()) {
         if (sync_fence_fd >= 0) {
           close(sync_fence_fd);
@@ -646,6 +699,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         continue;
       }
 
+      const int64_t t_build0 = perf_detail ? McMonotonicUs() : int64_t{0};
       webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer(
           new AndroidHardwareBufferVideoFrameBuffer(image, hardware_buffer, sync_fence_fd,
                                                    image_width, image_height));
@@ -656,12 +710,15 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       if (frame_meta->video_frame_tracking_id.has_value()) {
         frame_builder.set_id(*frame_meta->video_frame_tracking_id);
       }
+      webrtc::VideoFrame decoded_frame = frame_builder.build();
+      if (perf_detail) {
+        perf_detail->frame_build_us += McMonotonicUs() - t_build0;
+      }
 
       int64_t t_cb0 = 0;
       if (perf_detail) {
         t_cb0 = McMonotonicUs();
       }
-      webrtc::VideoFrame decoded_frame = frame_builder.build();
       cb->Decoded(decoded_frame);
       const int64_t t_after_decoded_cb = McMonotonicUs();
       if (frame_meta->decode_wall_t0_us > 0 &&
@@ -705,9 +762,10 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, w);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, h);
-#if __ANDROID_API__ >= 30
-    AMediaFormat_setInt32(format, kMediaFormatLowLatency, 1);
-#endif
+    const bool request_low_latency = ShouldRequestLowLatencyCodec();
+    if (request_low_latency) {
+      AMediaFormat_setInt32(format, kMediaFormatLowLatency, 1);
+    }
 
 #if __ANDROID_API__ < 26
     AMediaFormat_delete(format);
@@ -757,8 +815,9 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       dequeue_input_fail_total_ = 0;
       last_backpressure_log_us_ = 0;
     }
-    ALOGI("[McConfig] codec=video/avc size=%dx%d max_images=%d low_latency=%d", w, h,
-          static_cast<int>(kImageReaderMaxImages), kCodecLowLatencyEnabled);
+    ALOGI("[McConfig] codec=video/avc size=%dx%d max_images=%d low_latency=%d api=%d", w, h,
+          static_cast<int>(kImageReaderMaxImages), request_low_latency ? 1 : 0,
+          GetDeviceApiLevel());
     // 灏芥棭鎷夊彇杈撳嚭鏍煎紡锛堥儴鍒?Codec2 鍦ㄩ甯?output 鍓嶄笉浼氬崟鐙Е鍙?INFO锛屽鑷?out_width_ 涓€鐩翠负 0锛?
     RefreshOutputFormat();
     return true;
@@ -840,12 +899,18 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     }
   }
 
-  int DrainOutputsBounded(int64_t first_dequeue_timeout_us, int max_passes) {
+  int DrainOutputsBounded(int64_t first_dequeue_timeout_us,
+                          int max_passes,
+                          McDrainDetail* total_detail = nullptr) {
     int total_delivered = 0;
     bool first_pass = true;
     for (int i = 0; i < max_passes; ++i) {
       int delivered_this_pass = 0;
-      DrainOutputs(first_pass ? first_dequeue_timeout_us : 0, nullptr, &delivered_this_pass);
+      McDrainDetail pass_detail;
+      DrainOutputs(first_pass ? first_dequeue_timeout_us : 0,
+                   total_detail ? &pass_detail : nullptr,
+                   &delivered_this_pass);
+      AccumulateDrainDetail(total_detail, pass_detail);
       total_delivered += delivered_this_pass;
       if (delivered_this_pass == 0) {
         break;
@@ -867,6 +932,17 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       return;
     }
 
+    const bool have_tracking = video_frame_tracking_id.has_value();
+    const uint32_t tracking_id =
+        have_tracking ? static_cast<uint32_t>(*video_frame_tracking_id) : 0u;
+    const bool log_timing =
+        have_tracking && webrtc_demo::ShouldLogTrackingTimedSampleById(tracking_id);
+    const int64_t worker_start_us = log_timing ? McMonotonicUs() : int64_t{0};
+    const double worker_queue_ms =
+        log_timing ? (worker_start_us - decode_wall_t0_us) / 1000.0 : 0.0;
+
+    const bool input_is_annexb = LooksLikeAnnexB(data->data(), data_size);
+    const int64_t t_prepare0 = log_timing ? McMonotonicUs() : int64_t{0};
     const uint8_t* feed_ptr = data->data();
     size_t feed_size = data_size;
     if (LooksLikeAnnexB(data->data(), data_size)) {
@@ -879,10 +955,35 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       feed_ptr = avcc_scratch_.data();
       feed_size = avcc_scratch_.size();
     }
+    const double prepare_ms = log_timing ? (McMonotonicUs() - t_prepare0) / 1000.0 : 0.0;
+    const int64_t t_deq_in0 = log_timing ? McMonotonicUs() : int64_t{0};
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(codec_, kDequeueInputTimeoutUs);
+    const double deq_in_ms = log_timing ? (McMonotonicUs() - t_deq_in0) / 1000.0 : 0.0;
     if (in_idx < 0) {
       MaybeLogInputBackpressure(in_idx);
-      DrainOutputsBounded(kOutputDequeueTimeoutUs, 3);
+      McDrainDetail retry_drain_detail;
+      const int retry_delivered = DrainOutputsBounded(kOutputDequeueTimeoutUs, 3,
+                                                      log_timing ? &retry_drain_detail : nullptr);
+      if (log_timing) {
+        const double total_ms = (McMonotonicUs() - decode_wall_t0_us) / 1000.0;
+        ALOGI(
+            "[Timing/DecodeDrop] tracking_id=%u rtp_ts=%u key=%d bytes=%zu annexb=%d "
+            "| worker_queue=%.3f ms | prepare=%.3f ms | deq_in=%.3f ms "
+            "| retry_drain(total=%.3f dq=%.3f rel=%.3f acq=%.3f ahb=%.3f dims=%.3f "
+            "ts=%.3f meta=%.3f build=%.3f cb=%.3f out=%d) "
+            "| delivered=%d | total=%.3f ms",
+            tracking_id, rtp_timestamp, is_keyframe ? 1 : 0, feed_size, input_is_annexb ? 1 : 0,
+            worker_queue_ms, prepare_ms, deq_in_ms, retry_drain_detail.total_us / 1000.0,
+            retry_drain_detail.dequeue_us / 1000.0, retry_drain_detail.release_us / 1000.0,
+            retry_drain_detail.image_acquire_us / 1000.0,
+            retry_drain_detail.image_hwbuffer_us / 1000.0,
+            retry_drain_detail.image_dimensions_us / 1000.0,
+            retry_drain_detail.image_timestamp_us / 1000.0,
+            retry_drain_detail.image_metadata_us / 1000.0,
+            retry_drain_detail.frame_build_us / 1000.0,
+            retry_drain_detail.decoded_cb_us / 1000.0, retry_drain_detail.out_buffers,
+            retry_delivered, total_ms);
+      }
       return;
     }
     ResetInputBackpressureBurst();
@@ -894,7 +995,9 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       AMediaCodec_queueInputBuffer(codec_, static_cast<size_t>(in_idx), 0, 0, 0, 0);
       return;
     }
+    const int64_t t_copy0 = log_timing ? McMonotonicUs() : int64_t{0};
     memcpy(in_buf, feed_ptr, feed_size);
+    const double copy_ms = log_timing ? (McMonotonicUs() - t_copy0) / 1000.0 : 0.0;
 
     uint32_t flags = 0;
     if (is_keyframe) {
@@ -904,8 +1007,10 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     RecordOutputMetadata(pts_us, render_time_ms, rtp_timestamp, decode_wall_t0_us,
                          video_frame_tracking_id);
 
+    const int64_t t_qin0 = log_timing ? McMonotonicUs() : int64_t{0};
     media_status_t st = AMediaCodec_queueInputBuffer(codec_, static_cast<size_t>(in_idx), 0,
                                                       feed_size, pts_us, flags);
+    const double q_in_ms = log_timing ? (McMonotonicUs() - t_qin0) / 1000.0 : 0.0;
     if (st != AMEDIA_OK) {
       ALOGW("queueInputBuffer failed: %d", static_cast<int>(st));
       RemoveOutputMetadata(pts_us);
@@ -913,9 +1018,30 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       AMediaCodec_queueInputBuffer(codec_, static_cast<size_t>(in_idx), 0, 0, 0, 0);
       return;
     }
-    const int delivered_frames = DrainOutputsBounded(0, 3);
+    McDrainDetail drain_detail;
+    int delivered_frames =
+        DrainOutputsBounded(0, 3, log_timing ? &drain_detail : nullptr);
+    bool used_short_wait = false;
     if (delivered_frames == 0) {
-      DrainOutputsBounded(kDrainAfterQueueShortWaitUs, 3);
+      used_short_wait = true;
+      delivered_frames +=
+          DrainOutputsBounded(kDrainAfterQueueShortWaitUs, 3, log_timing ? &drain_detail : nullptr);
+    }
+    if (log_timing) {
+      const double total_ms = (McMonotonicUs() - decode_wall_t0_us) / 1000.0;
+      ALOGI(
+          "[Timing/Decode] tracking_id=%u rtp_ts=%u key=%d bytes=%zu annexb=%d "
+          "| worker_queue=%.3f ms | prepare=%.3f ms | deq_in=%.3f ms | copy=%.3f ms | q_in=%.3f ms "
+          "| drain(total=%.3f dq=%.3f rel=%.3f acq=%.3f ahb=%.3f dims=%.3f ts=%.3f meta=%.3f "
+          "build=%.3f cb=%.3f out=%d) | short_wait=%d | delivered=%d | total=%.3f ms",
+          tracking_id, rtp_timestamp, is_keyframe ? 1 : 0, feed_size, input_is_annexb ? 1 : 0,
+          worker_queue_ms, prepare_ms, deq_in_ms, copy_ms, q_in_ms,
+          drain_detail.total_us / 1000.0, drain_detail.dequeue_us / 1000.0,
+          drain_detail.release_us / 1000.0, drain_detail.image_acquire_us / 1000.0,
+          drain_detail.image_hwbuffer_us / 1000.0, drain_detail.image_dimensions_us / 1000.0,
+          drain_detail.image_timestamp_us / 1000.0, drain_detail.image_metadata_us / 1000.0,
+          drain_detail.frame_build_us / 1000.0, drain_detail.decoded_cb_us / 1000.0,
+          drain_detail.out_buffers, used_short_wait ? 1 : 0, delivered_frames, total_ms);
     }
     // if (log_perf) {
     //   const int64_t worker_total_us = McMonotonicUs() - t_pf0;
