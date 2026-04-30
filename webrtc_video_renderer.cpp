@@ -22,6 +22,7 @@
 #include <QSurfaceFormat>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <utility>
@@ -91,6 +92,21 @@ enum class UploadPathKind {
   NV12,
 };
 
+#if defined(WEBRTC_ANDROID)
+constexpr int kNativeTextureSlotCount = 3;
+
+struct NativeImportedImageCacheEntry {
+  AHardwareBuffer* hardware_buffer = nullptr;
+  EGLImageKHR egl_image = EGL_NO_IMAGE_KHR;
+};
+
+struct NativeTextureSlot {
+  GLuint texture_id = 0;
+  AHardwareBuffer* bound_hardware_buffer = nullptr;
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> held_buffer;
+};
+#endif
+
 bool SupportsUnpackRowLength() {
   QOpenGLContext* const ctx = QOpenGLContext::currentContext();
   if (!ctx) {
@@ -147,11 +163,17 @@ bool HasExtensionToken(const char* extensions, const char* needle) {
   return false;
 }
 
-constexpr int kNativeFenceWaitTimeoutMs = 8;
+constexpr int kNativeFenceWaitTimeoutMs = 0;
 
-bool WaitForNativeFenceFd(int fenceFd, int timeoutMs) {
+enum class NativeFenceWaitStatus {
+  Ready,
+  Pending,
+  Failed,
+};
+
+NativeFenceWaitStatus WaitForNativeFenceFd(int fenceFd, int timeoutMs) {
   if (fenceFd < 0) {
-    return true;
+    return NativeFenceWaitStatus::Ready;
   }
 
   pollfd pfd{};
@@ -164,7 +186,13 @@ bool WaitForNativeFenceFd(int fenceFd, int timeoutMs) {
   } while (poll_result < 0 && errno == EINTR);
 
   close(fenceFd);
-  return poll_result > 0 && (pfd.revents & POLLNVAL) == 0;
+  if (poll_result == 0) {
+    return NativeFenceWaitStatus::Pending;
+  }
+  if (poll_result > 0 && (pfd.revents & POLLNVAL) == 0) {
+    return NativeFenceWaitStatus::Ready;
+  }
+  return NativeFenceWaitStatus::Failed;
 }
 #endif
 
@@ -370,7 +398,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         m_hasData = false;
 #if defined(WEBRTC_ANDROID)
         if (m_lastUploadPath == UploadPathKind::Native) {
-          DestroyImportedEglImage();
+          ResetNativeImportState();
         }
 #endif
         ClearHeldFrame();
@@ -421,8 +449,9 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       mvp *= *nodeMatrix;
     }
 
-    const bool use_native_texture =
-        m_frameFormat == UploadPathKind::Native && m_oesProgram.isLinked();
+    const bool use_native_texture = m_frameFormat == UploadPathKind::Native &&
+                                    m_oesProgram.isLinked() &&
+                                    m_currentNativeTextureSlot >= 0;
     QOpenGLShaderProgram* program = nullptr;
     if (use_native_texture) {
       program = &m_oesProgram;
@@ -444,7 +473,9 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
     if (use_native_texture) {
       glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_importTextureId);
+      glBindTexture(GL_TEXTURE_EXTERNAL_OES,
+                    m_nativeTextureSlots[static_cast<size_t>(m_currentNativeTextureSlot)]
+                        .texture_id);
       program->setUniformValue("tex", 0);
     } else {
       glActiveTexture(GL_TEXTURE0);
@@ -586,13 +617,61 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     m_androidInteropInitialized = true;
   }
 
-  void DestroyImportedEglImage() {
-    if (m_currentEglImage != EGL_NO_IMAGE_KHR && m_eglDestroyImageKHR &&
-        m_eglDisplay != EGL_NO_DISPLAY) {
-      m_eglDestroyImageKHR(m_eglDisplay, m_currentEglImage);
+  void ResetNativeImportState() {
+    for (auto& slot : m_nativeTextureSlots) {
+      slot.bound_hardware_buffer = nullptr;
+      slot.held_buffer = nullptr;
     }
-    m_currentEglImage = EGL_NO_IMAGE_KHR;
-    m_nativeDrawBuffer = nullptr;
+    m_currentNativeTextureSlot = -1;
+    m_nextNativeTextureSlot = 0;
+  }
+
+  void DestroyImportedImageCache() {
+    if (m_eglDestroyImageKHR && m_eglDisplay != EGL_NO_DISPLAY) {
+      for (auto& entry : m_importedImageCache) {
+        if (entry.egl_image != EGL_NO_IMAGE_KHR) {
+          m_eglDestroyImageKHR(m_eglDisplay, entry.egl_image);
+        }
+      }
+    }
+    for (auto& entry : m_importedImageCache) {
+      if (entry.hardware_buffer) {
+        AHardwareBuffer_release(entry.hardware_buffer);
+      }
+    }
+    m_importedImageCache.clear();
+  }
+
+  NativeImportedImageCacheEntry* FindOrCreateImportedImageCacheEntry(
+      AHardwareBuffer* hardware_buffer) {
+    if (!hardware_buffer || !m_eglCreateImageKHR || !m_eglGetNativeClientBufferANDROID ||
+        m_eglDisplay == EGL_NO_DISPLAY) {
+      return nullptr;
+    }
+
+    for (auto& entry : m_importedImageCache) {
+      if (entry.hardware_buffer == hardware_buffer) {
+        return &entry;
+      }
+    }
+
+    EGLClientBuffer native_client_buffer =
+        m_eglGetNativeClientBufferANDROID(hardware_buffer);
+    if (!native_client_buffer) {
+      return nullptr;
+    }
+
+    const EGLint attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_FALSE, EGL_NONE};
+    EGLImageKHR egl_image = m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT,
+                                                EGL_NATIVE_BUFFER_ANDROID,
+                                                native_client_buffer, attrs);
+    if (egl_image == EGL_NO_IMAGE_KHR) {
+      return nullptr;
+    }
+
+    AHardwareBuffer_acquire(hardware_buffer);
+    m_importedImageCache.push_back({hardware_buffer, egl_image});
+    return &m_importedImageCache.back();
   }
 #endif
 
@@ -671,13 +750,17 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     }
 
 #if defined(WEBRTC_ANDROID)
-    if (m_canUseExternalOesSampling && m_importTextureId == 0) {
-      glGenTextures(1, &m_importTextureId);
-      glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_importTextureId);
-      glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (m_canUseExternalOesSampling && m_nativeTextureSlots[0].texture_id == 0) {
+      GLuint nativeTexIds[kNativeTextureSlotCount] = {0, 0, 0};
+      glGenTextures(kNativeTextureSlotCount, nativeTexIds);
+      for (int i = 0; i < kNativeTextureSlotCount; ++i) {
+        m_nativeTextureSlots[static_cast<size_t>(i)].texture_id = nativeTexIds[i];
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, nativeTexIds[i]);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      }
     }
 #endif
   }
@@ -696,11 +779,16 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     m_texV = 0;
     m_texUV = 0;
 #if defined(WEBRTC_ANDROID)
-    DestroyImportedEglImage();
-    if (m_importTextureId != 0) {
-      glDeleteTextures(1, &m_importTextureId);
-      m_importTextureId = 0;
+    ResetNativeImportState();
+    for (auto& slot : m_nativeTextureSlots) {
+      if (slot.texture_id != 0) {
+        glDeleteTextures(1, &slot.texture_id);
+        slot.texture_id = 0;
+      }
+      slot.bound_hardware_buffer = nullptr;
+      slot.held_buffer = nullptr;
     }
+    DestroyImportedImageCache();
 #endif
     m_glInitialized = false;
   }
@@ -819,13 +907,18 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
 #if defined(WEBRTC_ANDROID)
   bool ImportHardwareBuffer(const webrtc_demo::AndroidHardwareBufferVideoFrameBuffer* buffer) {
-    if (!buffer || !m_canImportHardwareBuffer || m_importTextureId == 0 ||
+    if (!buffer || !m_canImportHardwareBuffer || m_nativeTextureSlots[0].texture_id == 0 ||
         m_eglDisplay == EGL_NO_DISPLAY) {
       return false;
     }
 
     const int sync_fence_fd = buffer->ConsumeSyncFenceFd();
-    if (!WaitForNativeFenceFd(sync_fence_fd, kNativeFenceWaitTimeoutMs)) {
+    const NativeFenceWaitStatus fence_status =
+        WaitForNativeFenceFd(sync_fence_fd, kNativeFenceWaitTimeoutMs);
+    if (fence_status == NativeFenceWaitStatus::Pending) {
+      return false;
+    }
+    if (fence_status == NativeFenceWaitStatus::Failed) {
       static int fence_wait_warn_count = 0;
       if (fence_wait_warn_count < 5) {
         ++fence_wait_warn_count;
@@ -840,29 +933,23 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
       return false;
     }
 
-    EGLClientBuffer native_client_buffer =
-        m_eglGetNativeClientBufferANDROID(hardware_buffer);
-    if (!native_client_buffer) {
+    NativeImportedImageCacheEntry* const entry =
+        FindOrCreateImportedImageCacheEntry(hardware_buffer);
+    if (!entry) {
       return false;
     }
 
-    const EGLint attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_FALSE, EGL_NONE};
-    EGLImageKHR new_image = m_eglCreateImageKHR(m_eglDisplay, EGL_NO_CONTEXT,
-                                                EGL_NATIVE_BUFFER_ANDROID,
-                                                native_client_buffer, attrs);
-    if (new_image == EGL_NO_IMAGE_KHR) {
-      return false;
+    NativeTextureSlot& slot =
+        m_nativeTextureSlots[static_cast<size_t>(m_nextNativeTextureSlot)];
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, slot.texture_id);
+    if (slot.bound_hardware_buffer != hardware_buffer) {
+      m_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES,
+                                     reinterpret_cast<GLeglImageOES>(entry->egl_image));
+      slot.bound_hardware_buffer = hardware_buffer;
     }
-
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_importTextureId);
-    m_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES,
-                                   reinterpret_cast<GLeglImageOES>(new_image));
-
-    if (m_currentEglImage != EGL_NO_IMAGE_KHR && m_eglDestroyImageKHR) {
-      m_eglDestroyImageKHR(m_eglDisplay, m_currentEglImage);
-    }
-    m_currentEglImage = new_image;
-    m_nativeDrawBuffer = m_heldBuffer;
+    slot.held_buffer = m_heldBuffer;
+    m_currentNativeTextureSlot = m_nextNativeTextureSlot;
+    m_nextNativeTextureSlot = (m_nextNativeTextureSlot + 1) % kNativeTextureSlotCount;
     return true;
   }
 #endif
@@ -885,7 +972,7 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     if (nextPath != m_lastUploadPath) {
 #if defined(WEBRTC_ANDROID)
       if (m_lastUploadPath == UploadPathKind::Native && nextPath != UploadPathKind::Native) {
-        DestroyImportedEglImage();
+        ResetNativeImportState();
       }
 #endif
       if (nextPath != UploadPathKind::Native) {
@@ -984,12 +1071,14 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
   bool m_androidInteropInitialized = false;
   bool m_canImportHardwareBuffer = false;
   EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
-  EGLImageKHR m_currentEglImage = EGL_NO_IMAGE_KHR;
   PFNEGLCREATEIMAGEKHRPROC m_eglCreateImageKHR = nullptr;
   PFNEGLDESTROYIMAGEKHRPROC m_eglDestroyImageKHR = nullptr;
   PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC m_eglGetNativeClientBufferANDROID = nullptr;
   PFNGLEGLIMAGETARGETTEXTURE2DOESPROC m_glEGLImageTargetTexture2DOES = nullptr;
-  GLuint m_importTextureId = 0;
+  std::array<NativeTextureSlot, kNativeTextureSlotCount> m_nativeTextureSlots;
+  std::vector<NativeImportedImageCacheEntry> m_importedImageCache;
+  int m_currentNativeTextureSlot = -1;
+  int m_nextNativeTextureSlot = 0;
 #endif
 
   PlaneTextureCache m_cacheY;
@@ -1006,9 +1095,6 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
   std::vector<uint8_t> m_tightUV;
 
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> m_heldBuffer;
-#if defined(WEBRTC_ANDROID)
-  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> m_nativeDrawBuffer;
-#endif
   int64_t m_queueTraceStartMonoUs = 0;
   int m_currentFrameId = -1;
   bool m_frameFromTracking = false;

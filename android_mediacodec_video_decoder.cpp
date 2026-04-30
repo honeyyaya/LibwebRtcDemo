@@ -23,7 +23,6 @@
 #include <deque>
 #include <functional>
 #include <future>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -64,10 +63,11 @@ constexpr char kMediaFormatLowLatency[] = "low-latency";
 
 // queue 鍚?drain锛氬厛闈為樆濉炴竻绌哄凡灏辩华甯э紝鍐嶅崟娆＄煭闃诲鍚告敹銆屽垰瀹屾垚銆嶇殑 output銆?
 // 鍘熷厛鍗曢樁娈?first_timeout=35ms 浼氬湪 worker 涓婁覆琛屽爢鍙狅紝涓昏寤惰繜杩滃ぇ浜庤蒋瑙ｃ€?
-constexpr int64_t kDequeueInputTimeoutUs = 1000;
+constexpr int64_t kDequeueInputTimeoutUs = 3000;
 constexpr int64_t kOutputDequeueTimeoutUs = 3000;
-constexpr int32_t kImageReaderMaxImages = 2;
-constexpr size_t kMaxPendingDecodeTasks = 3;
+constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
+constexpr int32_t kImageReaderMaxImages = 4;
+constexpr size_t kMaxPendingOutputMetadata = 128;
 constexpr int kAcquireLatestImageMaxAttempts = 4;
 constexpr int64_t kAcquireLatestImageRetryDelayUs = 100;
 
@@ -226,11 +226,15 @@ void LogMcDecodeIngress(const uint8_t* data,
 
 struct AndroidMediaCodecVideoDecoder::Impl {
   struct OutputFrameMetadata {
-    bool valid = false;
     int64_t render_time_ms = 0;
     uint32_t rtp_timestamp = 0;
     int64_t decode_wall_t0_us = 0;
     std::optional<uint16_t> video_frame_tracking_id;
+  };
+
+  struct PendingOutputFrameMetadata {
+    int64_t pts_us = 0;
+    OutputFrameMetadata metadata;
   };
 
   std::mutex mu_;
@@ -238,8 +242,6 @@ struct AndroidMediaCodecVideoDecoder::Impl {
   std::deque<std::function<void()>> tasks_;
   bool running_ = false;
   std::thread thread_;
-  bool output_running_ = false;
-  std::thread output_thread_;
 
   AMediaCodec* codec_ = nullptr;
   AImageReader* image_reader_ = nullptr;
@@ -251,7 +253,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
   int out_height_ = 0;
 
   std::vector<uint8_t> avcc_scratch_;
-  std::map<int64_t, OutputFrameMetadata> pending_output_metadata_;
+  std::deque<PendingOutputFrameMetadata> pending_output_metadata_;
   std::atomic<int32_t> pending_image_notifications_{0};
 
   int64_t next_input_pts_us_ = 0;
@@ -276,39 +278,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     }
   }
 
-  void OutputLoop() {
-    while (true) {
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!output_running_) {
-          break;
-        }
-      }
-      DrainOutputs(kOutputDequeueTimeoutUs, nullptr, nullptr);
-    }
-  }
-
-  void StartOutputThread() {
-    StopOutputThread();
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      output_running_ = true;
-    }
-    output_thread_ = std::thread([this] { OutputLoop(); });
-  }
-
-  void StopOutputThread() {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      output_running_ = false;
-    }
-    if (output_thread_.joinable()) {
-      output_thread_.join();
-    }
-  }
-
   void StopWorker() {
-    StopOutputThread();
     {
       std::lock_guard<std::mutex> lk(mu_);
       running_ = false;
@@ -383,46 +353,67 @@ struct AndroidMediaCodecVideoDecoder::Impl {
                             const std::optional<uint16_t>& video_frame_tracking_id) {
     std::lock_guard<std::mutex> lk(mu_);
     OutputFrameMetadata meta;
-    meta.valid = true;
     meta.render_time_ms = render_time_ms;
     meta.rtp_timestamp = rtp_timestamp;
     meta.decode_wall_t0_us = decode_wall_t0_us;
     meta.video_frame_tracking_id = video_frame_tracking_id;
-    pending_output_metadata_[pts_us] = meta;
-    while (pending_output_metadata_.size() > 128) {
-      pending_output_metadata_.erase(pending_output_metadata_.begin());
+    pending_output_metadata_.push_back({pts_us, meta});
+    while (pending_output_metadata_.size() > kMaxPendingOutputMetadata) {
+      pending_output_metadata_.pop_front();
     }
   }
 
   void RemoveOutputMetadata(int64_t pts_us) {
     std::lock_guard<std::mutex> lk(mu_);
-    pending_output_metadata_.erase(pts_us);
+    if (!pending_output_metadata_.empty() && pending_output_metadata_.back().pts_us == pts_us) {
+      pending_output_metadata_.pop_back();
+      return;
+    }
+    for (auto it = pending_output_metadata_.begin(); it != pending_output_metadata_.end(); ++it) {
+      if (it->pts_us == pts_us) {
+        pending_output_metadata_.erase(it);
+        break;
+      }
+    }
   }
 
-  OutputFrameMetadata TakeOutputMetadata(int64_t pts_us) {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = pending_output_metadata_.find(pts_us);
-    if (it != pending_output_metadata_.end()) {
-      OutputFrameMetadata meta = it->second;
-      pending_output_metadata_.erase(it);
-      return meta;
+  void DiscardOutputMetadataUpToPtsUsLocked(int64_t pts_us) {
+    while (!pending_output_metadata_.empty() &&
+           pending_output_metadata_.front().pts_us <= pts_us) {
+      pending_output_metadata_.pop_front();
     }
-    if (!pending_output_metadata_.empty()) {
-      static std::atomic<int> fallback_warn_count{0};
-      if (fallback_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
-        ALOGW("output pts metadata miss: pts=%lld, using oldest metadata",
+  }
+
+  std::optional<OutputFrameMetadata> TakeOutputMetadataForPtsUs(int64_t pts_us) {
+    std::lock_guard<std::mutex> lk(mu_);
+    static std::atomic<int> stale_warn_count{0};
+    while (!pending_output_metadata_.empty() &&
+           pending_output_metadata_.front().pts_us < pts_us) {
+      if (stale_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+        ALOGW("drop stale output metadata: expected pts=%lld got newer pts=%lld",
+              static_cast<long long>(pending_output_metadata_.front().pts_us),
               static_cast<long long>(pts_us));
       }
-      it = pending_output_metadata_.begin();
-      OutputFrameMetadata meta = it->second;
-      pending_output_metadata_.erase(it);
+      pending_output_metadata_.pop_front();
+    }
+
+    if (!pending_output_metadata_.empty() &&
+        pending_output_metadata_.front().pts_us == pts_us) {
+      OutputFrameMetadata meta = pending_output_metadata_.front().metadata;
+      pending_output_metadata_.pop_front();
       return meta;
     }
+
     static std::atomic<int> missing_warn_count{0};
     if (missing_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
       ALOGW("output pts metadata missing: pts=%lld", static_cast<long long>(pts_us));
     }
-    return {};
+    return std::nullopt;
+  }
+
+  void DiscardOutputMetadataUpToPtsUs(int64_t pts_us) {
+    std::lock_guard<std::mutex> lk(mu_);
+    DiscardOutputMetadataUpToPtsUsLocked(pts_us);
   }
 
 #if __ANDROID_API__ >= 26
@@ -515,7 +506,6 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 #endif
 
   bool ConfigureOnWorker(const webrtc::VideoDecoder::Settings& settings) {
-    StopOutputThread();
     DestroyCodec();
     ClearOutputMetadata();
     int w = 1920;
@@ -581,7 +571,6 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     next_input_pts_us_ = 0;
     // 灏芥棭鎷夊彇杈撳嚭鏍煎紡锛堥儴鍒?Codec2 鍦ㄩ甯?output 鍓嶄笉浼氬崟鐙Е鍙?INFO锛屽鑷?out_width_ 涓€鐩翠负 0锛?
     RefreshOutputFormat();
-    StartOutputThread();
     return true;
   }
 
@@ -622,8 +611,6 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         break;
       }
 
-      const OutputFrameMetadata frame_meta = TakeOutputMetadata(info.presentationTimeUs);
-
       if (info.size > 0 && (out_width_ <= 0 || out_height_ <= 0)) {
         RefreshOutputFormat();
       }
@@ -647,6 +634,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 
 #if __ANDROID_API__ >= 26
       if (!use_native_surface) {
+        DiscardOutputMetadataUpToPtsUs(info.presentationTimeUs);
         continue;
       }
 
@@ -679,16 +667,29 @@ struct AndroidMediaCodecVideoDecoder::Impl {
         ALOGW("AImage dimensions invalid: %d x %d", image_width, image_height);
         continue;
       }
+      int64_t image_timestamp_ns = 0;
+      const media_status_t timestamp_status = AImage_getTimestamp(image, &image_timestamp_ns);
+      const int64_t image_pts_us =
+          timestamp_status == AMEDIA_OK ? image_timestamp_ns / 1000 : info.presentationTimeUs;
+      const std::optional<OutputFrameMetadata> frame_meta =
+          TakeOutputMetadataForPtsUs(image_pts_us);
+      if (!frame_meta.has_value()) {
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        continue;
+      }
 
       webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer(
           new AndroidHardwareBufferVideoFrameBuffer(image, hardware_buffer, sync_fence_fd,
                                                    image_width, image_height));
       webrtc::VideoFrame::Builder frame_builder;
       frame_builder.set_video_frame_buffer(native_buffer)
-          .set_rtp_timestamp(frame_meta.rtp_timestamp)
-          .set_timestamp_us(frame_meta.render_time_ms * 1000);
-      if (frame_meta.video_frame_tracking_id.has_value()) {
-        frame_builder.set_id(*frame_meta.video_frame_tracking_id);
+          .set_rtp_timestamp(frame_meta->rtp_timestamp)
+          .set_timestamp_us(frame_meta->render_time_ms * 1000);
+      if (frame_meta->video_frame_tracking_id.has_value()) {
+        frame_builder.set_id(*frame_meta->video_frame_tracking_id);
       }
 
       int64_t t_cb0 = 0;
@@ -698,18 +699,18 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       webrtc::VideoFrame decoded_frame = frame_builder.build();
       cb->Decoded(decoded_frame);
       const int64_t t_after_decoded_cb = McMonotonicUs();
-      if (frame_meta.valid && frame_meta.decode_wall_t0_us > 0 &&
-          frame_meta.video_frame_tracking_id.has_value() &&
+      if (frame_meta->decode_wall_t0_us > 0 &&
+          frame_meta->video_frame_tracking_id.has_value() &&
           webrtc_demo::ShouldLogTrackingTimedSampleById(
-              static_cast<uint32_t>(*frame_meta.video_frame_tracking_id))) {
-        const int64_t e2e_us = t_after_decoded_cb - frame_meta.decode_wall_t0_us;
+              static_cast<uint32_t>(*frame_meta->video_frame_tracking_id))) {
+        const int64_t e2e_us = t_after_decoded_cb - frame_meta->decode_wall_t0_us;
         ALOGI(
             "McE2E native tracking_id=%u rtp_ts=%u e2e=%lldus "
             "(Decode entry -> Decoded return; native AHardwareBuffer; excludes downstream sink)",
-            static_cast<unsigned>(*frame_meta.video_frame_tracking_id), frame_meta.rtp_timestamp,
+            static_cast<unsigned>(*frame_meta->video_frame_tracking_id), frame_meta->rtp_timestamp,
             static_cast<long long>(e2e_us));
       }
-      DecodeSinkRecordAfterDecoded(frame_meta.rtp_timestamp, t_after_decoded_cb);
+      DecodeSinkRecordAfterDecoded(frame_meta->rtp_timestamp, t_after_decoded_cb);
       if (perf_detail) {
         perf_detail->decoded_cb_us += t_after_decoded_cb - t_cb0;
         ++perf_detail->out_buffers;
@@ -722,6 +723,21 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     if (perf_detail) {
       perf_detail->total_us = McMonotonicUs() - t_wall_start;
     }
+  }
+
+  int DrainOutputsBounded(int64_t first_dequeue_timeout_us, int max_passes) {
+    int total_delivered = 0;
+    bool first_pass = true;
+    for (int i = 0; i < max_passes; ++i) {
+      int delivered_this_pass = 0;
+      DrainOutputs(first_pass ? first_dequeue_timeout_us : 0, nullptr, &delivered_this_pass);
+      total_delivered += delivered_this_pass;
+      if (delivered_this_pass == 0) {
+        break;
+      }
+      first_pass = false;
+    }
+    return total_delivered;
   }
 
   void ProcessOneFrame(
@@ -751,6 +767,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(codec_, kDequeueInputTimeoutUs);
     if (in_idx < 0) {
       ALOGW("dequeueInputBuffer failed: %zd", in_idx);
+      DrainOutputsBounded(kOutputDequeueTimeoutUs, 3);
       return;
     }
 
@@ -779,6 +796,10 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       // 宸?dequeue 鐨?input 蹇呴』褰掕繕锛屽惁鍒欒В鐮佸櫒鍐呴儴鐘舵€佷細閿欎贡骞舵斁澶х郴缁熷眰 PipelineWatcher 鍛婅銆?
       AMediaCodec_queueInputBuffer(codec_, static_cast<size_t>(in_idx), 0, 0, 0, 0);
       return;
+    }
+    const int delivered_frames = DrainOutputsBounded(0, 3);
+    if (delivered_frames == 0) {
+      DrainOutputsBounded(kDrainAfterQueueShortWaitUs, 3);
     }
     // if (log_perf) {
     //   const int64_t worker_total_us = McMonotonicUs() - t_pf0;
@@ -877,14 +898,6 @@ int32_t AndroidMediaCodecVideoDecoder::Decode(const webrtc::EncodedImage& input_
     if (!impl_->running_) {
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
-    if (impl_->pending_decode_tasks_ >= kMaxPendingDecodeTasks && !key) {
-      static std::atomic<int> decode_drop_warn_count{0};
-      if (decode_drop_warn_count.fetch_add(1, std::memory_order_relaxed) < 10) {
-        ALOGW("drop decode frame on backlog: pending=%zu rtp_ts=%u",
-              impl_->pending_decode_tasks_, rtp_ts);
-      }
-      return WEBRTC_VIDEO_CODEC_OK;
-    }
     ++impl_->pending_decode_tasks_;
     impl_->tasks_.push_back([this, encoded_buffer = std::move(encoded_buffer), render_time_ms,
                              encoded_size = sz, rtp_ts, key, decode_wall_t0_us,
@@ -923,7 +936,6 @@ int32_t AndroidMediaCodecVideoDecoder::Release() {
   std::future<void> fut;
   {
     pt = std::make_shared<std::packaged_task<void()>>([this] {
-      impl_->StopOutputThread();
       impl_->DestroyCodec();
       impl_->ClearOutputMetadata();
     });
@@ -943,7 +955,6 @@ int32_t AndroidMediaCodecVideoDecoder::Release() {
   if (wait_for_destroy) {
     fut.wait();
   } else {
-    impl_->StopOutputThread();
     impl_->DestroyCodec();
     impl_->ClearOutputMetadata();
   }
