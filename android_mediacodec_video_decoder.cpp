@@ -69,7 +69,7 @@ constexpr int64_t kDequeueInputTimeoutUs = 3000;
 constexpr int64_t kOutputDequeueTimeoutUs = 3000;
 constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
 constexpr int64_t kBackpressureLogIntervalUs = 500000;
-constexpr int64_t kOutputFrameAgeDropThresholdUs = 50 * 1000;
+constexpr int64_t kOutputFrameAgeDropThresholdUs = 60 * 1000;
 constexpr int kPreDequeueDrainPasses = 1;
 // acquireLatestImageAsync() still needs headroom beyond the native render slots.
 // Even with a lower receiver playout target, the decoder and renderer can briefly

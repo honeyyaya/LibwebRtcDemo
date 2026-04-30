@@ -100,16 +100,19 @@ class WebRTCVideoRenderer : public QQuickItem,
   };
 
   void RequestRenderPumpUpdate();
+  void QueueRenderPumpUpdate();
   void EnsureRenderPumpRunning();
   void StopRenderPump();
   void OnWindowChanged(QQuickWindow* window);
   void OnBeforeSynchronizing();
   void OnFrameSwapped();
+  bool HasUndeliveredFrame() const;
 
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> m_track;
   std::atomic<bool> m_hasVideo{false};
   std::atomic<bool> m_renderPumpRunning{false};
   std::atomic<bool> m_renderPumpStartPending{false};
+  std::atomic<bool> m_renderUpdatePending{false};
 
   mutable QMutex m_frameMutex;
   LatestFrameSlot m_latestFrame;

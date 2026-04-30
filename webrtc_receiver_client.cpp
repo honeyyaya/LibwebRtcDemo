@@ -43,9 +43,11 @@ namespace {
 
 // Keep a small jitter-buffer floor, but let WebRTC adapt instead of pinning
 // playout to a fixed 100 ms delay.
-constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.02;
+constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.015;
 constexpr int kReceiverForcedPlayoutDelayMs = 0;
-constexpr int kReceiverMaxDecodeQueueSize = 3;
+constexpr int kReceiverZeroPlayoutMinPacingMs = 2;
+constexpr int kReceiverMaxDecodeQueueSize = 2;
+constexpr bool kReceiverEnablePacerFastRetransmissions = true;
 
 webrtc::SdpType SdpTypeFromOfferAnswerString(const std::string &t) {
   auto opt = webrtc::SdpTypeFromString(t);
@@ -609,9 +611,14 @@ void WebRTCReceiverClient::createPeerConnection()
            std::to_string(kReceiverForcedPlayoutDelayMs) + ",max_ms:" +
            std::to_string(kReceiverForcedPlayoutDelayMs) + "/";
     }
-    s += "WebRTC-ZeroPlayoutDelay/min_pacing:4ms,max_decode_queue_size:" +
+    s += "WebRTC-ZeroPlayoutDelay/min_pacing:" +
+         std::to_string(kReceiverZeroPlayoutMinPacingMs) +
+         "ms,max_decode_queue_size:" +
          std::to_string(kReceiverMaxDecodeQueueSize) + "/";
     s += "WebRTC-Pacer-KeyframeFlushing/Enabled/";
+    if (kReceiverEnablePacerFastRetransmissions) {
+      s += "WebRTC-Pacer-FastRetransmissions/Enabled/";
+    }
     return s;
   }();
   static bool field_trials_inited = false;
@@ -631,16 +638,23 @@ void WebRTCReceiverClient::createPeerConnection()
   log_trial("WebRTC-VideoFrameTrackingIdAdvertised");
   log_trial("WebRTC-FlexFEC-03-Advertised");
   log_trial("WebRTC-FlexFEC-03");
+  log_trial("WebRTC-Pacer-KeyframeFlushing");
+  log_trial("WebRTC-Pacer-FastRetransmissions");
+  VERIFY_LOG("2", QString("FieldTrial WebRTC-ZeroPlayoutDelay: fullName=\"%1\"")
+                      .arg(QString::fromStdString(
+                          webrtc::field_trial::FindFullName("WebRTC-ZeroPlayoutDelay"))));
   const QString playoutMode =
       kReceiverForcedPlayoutDelayMs > 0
           ? QString("fixed-%1ms").arg(kReceiverForcedPlayoutDelayMs)
           : QStringLiteral("dynamic");
   qDebug().noquote()
       << QString("[Pipeline/Config] playout_mode=%1 | jitter_min=%2 ms | "
-                 "max_decode_queue=%3")
+                 "min_pacing=%3 ms | max_decode_queue=%4 | fast_retx=%5")
              .arg(playoutMode)
              .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1)
-             .arg(kReceiverMaxDecodeQueueSize);
+             .arg(kReceiverZeroPlayoutMinPacingMs)
+             .arg(kReceiverMaxDecodeQueueSize)
+             .arg(kReceiverEnablePacerFastRetransmissions ? "on" : "off");
 
   initWebRTC();
   if (!m_factory) {
