@@ -66,10 +66,11 @@ constexpr char kMediaFormatLowLatency[] = "low-latency";
 constexpr int64_t kDequeueInputTimeoutUs = 3000;
 constexpr int64_t kOutputDequeueTimeoutUs = 3000;
 constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
-constexpr int32_t kImageReaderMaxImages = 4;
+// acquireLatestImageAsync() needs headroom beyond the number of native render
+// slots, otherwise ImageReader runs out of locked buffers before it can
+// discard stale images and hand us the newest one.
+constexpr int32_t kImageReaderMaxImages = 8;
 constexpr size_t kMaxPendingOutputMetadata = 128;
-constexpr int kAcquireLatestImageMaxAttempts = 4;
-constexpr int64_t kAcquireLatestImageRetryDelayUs = 100;
 
 // WebRTC H264 鎺ユ敹璺緞澶氫负 Annex B锛?0 00 01 / 00 00 00 01锛夈€侰odec2 瑙ｇ爜鍣ㄩ€氬父瑕佽繖绉嶈緭鍏ワ紱
 // 鑻ヨ杞垚 AVCC锛? 瀛楄妭闀垮害鍓嶇紑锛夛紝閮ㄥ垎鏈哄瀷浼氬悆婊?input 浣嗘案杩滀笉鍑?output锛坒ps=0锛夈€?
@@ -242,6 +243,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
   std::deque<std::function<void()>> tasks_;
   bool running_ = false;
   std::thread thread_;
+  bool image_drain_task_posted_ = false;
 
   AMediaCodec* codec_ = nullptr;
   AImageReader* image_reader_ = nullptr;
@@ -284,6 +286,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       running_ = false;
       tasks_.clear();
       pending_decode_tasks_ = 0;
+      image_drain_task_posted_ = false;
     }
     cv_.notify_all();
     if (thread_.joinable()) {
@@ -335,6 +338,37 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     std::lock_guard<std::mutex> lk(mu_);
     pending_output_metadata_.clear();
   }
+
+#if __ANDROID_API__ >= 26
+  void RunQueuedImageDrainTask() {
+    DrainReadyImages(nullptr, nullptr);
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      image_drain_task_posted_ = false;
+    }
+
+    if (pending_image_notifications_.load(std::memory_order_relaxed) > 0) {
+      QueueImageDrainTask();
+    }
+  }
+
+  void QueueImageDrainTask() {
+    bool should_notify = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!running_ || image_drain_task_posted_) {
+        return;
+      }
+      image_drain_task_posted_ = true;
+      tasks_.push_back([this] { RunQueuedImageDrainTask(); });
+      should_notify = true;
+    }
+    if (should_notify) {
+      cv_.notify_one();
+    }
+  }
+#endif
 
   int64_t AllocateInputPtsUs() {
     const int64_t now_us = McMonotonicUs();
@@ -423,6 +457,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       return;
     }
     self->pending_image_notifications_.fetch_add(1, std::memory_order_relaxed);
+    self->QueueImageDrainTask();
   }
 
   void ResetImageReaderState() {
@@ -468,40 +503,138 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 
     *out_image = nullptr;
     *out_sync_fence_fd = -1;
-    for (int attempt = 0; attempt < kAcquireLatestImageMaxAttempts; ++attempt) {
-      const media_status_t st =
-          AImageReader_acquireLatestImageAsync(image_reader_, out_image, out_sync_fence_fd);
-      if (st == AMEDIA_OK && *out_image) {
-        ResetImageReaderState();
-        return true;
-      }
-
-      if (*out_sync_fence_fd >= 0) {
-        close(*out_sync_fence_fd);
-        *out_sync_fence_fd = -1;
-      }
-
-      if (st != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
-        static std::atomic<int> acquire_warn_count{0};
-        if (acquire_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
-          ALOGW("AImageReader_acquireLatestImageAsync failed: %d", static_cast<int>(st));
-        }
-        return false;
-      }
-
-      if (attempt + 1 >= kAcquireLatestImageMaxAttempts) {
-        break;
-      }
-
-      if (pending_image_notifications_.load(std::memory_order_relaxed) > 0) {
-        std::this_thread::yield();
-      } else {
-        std::this_thread::sleep_for(
-            std::chrono::microseconds(kAcquireLatestImageRetryDelayUs));
-      }
+    const media_status_t st =
+        AImageReader_acquireLatestImageAsync(image_reader_, out_image, out_sync_fence_fd);
+    if (st == AMEDIA_OK && *out_image) {
+      ResetImageReaderState();
+      return true;
     }
 
+    if (*out_sync_fence_fd >= 0) {
+      close(*out_sync_fence_fd);
+      *out_sync_fence_fd = -1;
+    }
+    if (st == AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) {
+      ResetImageReaderState();
+      return false;
+    }
+
+    static std::atomic<int> acquire_warn_count{0};
+    if (acquire_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+      ALOGW("AImageReader_acquireLatestImageAsync failed: %d", static_cast<int>(st));
+    }
     return false;
+  }
+
+  void DrainReadyImages(McDrainDetail* perf_detail, int* delivered_frames) {
+    if (!image_reader_) {
+      return;
+    }
+
+    for (;;) {
+      webrtc::DecodedImageCallback* cb = nullptr;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        cb = callback_;
+      }
+      if (!cb) {
+        return;
+      }
+
+      AImage* image = nullptr;
+      int sync_fence_fd = -1;
+      if (!AcquireLatestOutputImage(&image, &sync_fence_fd) || !image) {
+        return;
+      }
+
+      AHardwareBuffer* hardware_buffer = nullptr;
+      const media_status_t image_status = AImage_getHardwareBuffer(image, &hardware_buffer);
+      if (image_status != AMEDIA_OK || !hardware_buffer) {
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        ALOGW("AImage_getHardwareBuffer failed: %d", static_cast<int>(image_status));
+        continue;
+      }
+
+      int32_t image_width = out_width_;
+      int32_t image_height = out_height_;
+      AImage_getWidth(image, &image_width);
+      AImage_getHeight(image, &image_height);
+      if (image_width <= 0 || image_height <= 0) {
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        ALOGW("AImage dimensions invalid: %d x %d", image_width, image_height);
+        continue;
+      }
+
+      int64_t image_timestamp_ns = 0;
+      const media_status_t timestamp_status = AImage_getTimestamp(image, &image_timestamp_ns);
+      const int64_t image_pts_us =
+          timestamp_status == AMEDIA_OK ? image_timestamp_ns / 1000 : 0;
+      if (timestamp_status != AMEDIA_OK) {
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        static std::atomic<int> timestamp_warn_count{0};
+        if (timestamp_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+          ALOGW("AImage_getTimestamp failed: %d", static_cast<int>(timestamp_status));
+        }
+        continue;
+      }
+
+      const std::optional<OutputFrameMetadata> frame_meta =
+          TakeOutputMetadataForPtsUs(image_pts_us);
+      if (!frame_meta.has_value()) {
+        if (sync_fence_fd >= 0) {
+          close(sync_fence_fd);
+        }
+        AImage_delete(image);
+        continue;
+      }
+
+      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer(
+          new AndroidHardwareBufferVideoFrameBuffer(image, hardware_buffer, sync_fence_fd,
+                                                   image_width, image_height));
+      webrtc::VideoFrame::Builder frame_builder;
+      frame_builder.set_video_frame_buffer(native_buffer)
+          .set_rtp_timestamp(frame_meta->rtp_timestamp)
+          .set_timestamp_us(frame_meta->render_time_ms * 1000);
+      if (frame_meta->video_frame_tracking_id.has_value()) {
+        frame_builder.set_id(*frame_meta->video_frame_tracking_id);
+      }
+
+      int64_t t_cb0 = 0;
+      if (perf_detail) {
+        t_cb0 = McMonotonicUs();
+      }
+      webrtc::VideoFrame decoded_frame = frame_builder.build();
+      cb->Decoded(decoded_frame);
+      const int64_t t_after_decoded_cb = McMonotonicUs();
+      if (frame_meta->decode_wall_t0_us > 0 &&
+          frame_meta->video_frame_tracking_id.has_value() &&
+          webrtc_demo::ShouldLogTrackingTimedSampleById(
+              static_cast<uint32_t>(*frame_meta->video_frame_tracking_id))) {
+        const int64_t e2e_us = t_after_decoded_cb - frame_meta->decode_wall_t0_us;
+        ALOGI(
+            "McE2E native tracking_id=%u rtp_ts=%u e2e=%lldus "
+            "(Decode entry -> Decoded return; native AHardwareBuffer; excludes downstream sink)",
+            static_cast<unsigned>(*frame_meta->video_frame_tracking_id), frame_meta->rtp_timestamp,
+            static_cast<long long>(e2e_us));
+      }
+      DecodeSinkRecordAfterDecoded(frame_meta->rtp_timestamp, t_after_decoded_cb);
+      if (perf_detail) {
+        perf_detail->decoded_cb_us += t_after_decoded_cb - t_cb0;
+        ++perf_detail->out_buffers;
+      }
+      if (delivered_frames) {
+        ++(*delivered_frames);
+      }
+    }
   }
 #endif
 
@@ -584,6 +717,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     // 鏃犺鏄惁宸叉敞鍐?callback锛岄兘蹇呴』 dequeue 骞?release output锛屽惁鍒欎細濉炴弧绠￠亾 in=0 out=0銆佽В鐮佸抚鎭掍负 0
 
     bool used_timeout = false;
+    bool released_to_native_surface = false;
     for (;;) {
       AMediaCodecBufferInfo info;
       const int64_t t_us = (!used_timeout) ? first_dequeue_timeout_us : 0;
@@ -622,6 +756,7 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       }
 
       const bool use_native_surface = cb && image_reader_;
+      released_to_native_surface = released_to_native_surface || use_native_surface;
 
       int64_t t_rel0 = 0;
       if (perf_detail) {
@@ -635,91 +770,14 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 #if __ANDROID_API__ >= 26
       if (!use_native_surface) {
         DiscardOutputMetadataUpToPtsUs(info.presentationTimeUs);
-        continue;
-      }
-
-      AImage* image = nullptr;
-      int sync_fence_fd = -1;
-      if (!AcquireLatestOutputImage(&image, &sync_fence_fd) || !image) {
-        continue;
-      }
-
-      AHardwareBuffer* hardware_buffer = nullptr;
-      media_status_t image_status = AImage_getHardwareBuffer(image, &hardware_buffer);
-      if (image_status != AMEDIA_OK || !hardware_buffer) {
-        if (sync_fence_fd >= 0) {
-          close(sync_fence_fd);
-        }
-        AImage_delete(image);
-        ALOGW("AImage_getHardwareBuffer failed: %d", static_cast<int>(image_status));
-        continue;
-      }
-
-      int32_t image_width = out_width_;
-      int32_t image_height = out_height_;
-      AImage_getWidth(image, &image_width);
-      AImage_getHeight(image, &image_height);
-      if (image_width <= 0 || image_height <= 0) {
-        if (sync_fence_fd >= 0) {
-          close(sync_fence_fd);
-        }
-        AImage_delete(image);
-        ALOGW("AImage dimensions invalid: %d x %d", image_width, image_height);
-        continue;
-      }
-      int64_t image_timestamp_ns = 0;
-      const media_status_t timestamp_status = AImage_getTimestamp(image, &image_timestamp_ns);
-      const int64_t image_pts_us =
-          timestamp_status == AMEDIA_OK ? image_timestamp_ns / 1000 : info.presentationTimeUs;
-      const std::optional<OutputFrameMetadata> frame_meta =
-          TakeOutputMetadataForPtsUs(image_pts_us);
-      if (!frame_meta.has_value()) {
-        if (sync_fence_fd >= 0) {
-          close(sync_fence_fd);
-        }
-        AImage_delete(image);
-        continue;
-      }
-
-      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer(
-          new AndroidHardwareBufferVideoFrameBuffer(image, hardware_buffer, sync_fence_fd,
-                                                   image_width, image_height));
-      webrtc::VideoFrame::Builder frame_builder;
-      frame_builder.set_video_frame_buffer(native_buffer)
-          .set_rtp_timestamp(frame_meta->rtp_timestamp)
-          .set_timestamp_us(frame_meta->render_time_ms * 1000);
-      if (frame_meta->video_frame_tracking_id.has_value()) {
-        frame_builder.set_id(*frame_meta->video_frame_tracking_id);
-      }
-
-      int64_t t_cb0 = 0;
-      if (perf_detail) {
-        t_cb0 = McMonotonicUs();
-      }
-      webrtc::VideoFrame decoded_frame = frame_builder.build();
-      cb->Decoded(decoded_frame);
-      const int64_t t_after_decoded_cb = McMonotonicUs();
-      if (frame_meta->decode_wall_t0_us > 0 &&
-          frame_meta->video_frame_tracking_id.has_value() &&
-          webrtc_demo::ShouldLogTrackingTimedSampleById(
-              static_cast<uint32_t>(*frame_meta->video_frame_tracking_id))) {
-        const int64_t e2e_us = t_after_decoded_cb - frame_meta->decode_wall_t0_us;
-        ALOGI(
-            "McE2E native tracking_id=%u rtp_ts=%u e2e=%lldus "
-            "(Decode entry -> Decoded return; native AHardwareBuffer; excludes downstream sink)",
-            static_cast<unsigned>(*frame_meta->video_frame_tracking_id), frame_meta->rtp_timestamp,
-            static_cast<long long>(e2e_us));
-      }
-      DecodeSinkRecordAfterDecoded(frame_meta->rtp_timestamp, t_after_decoded_cb);
-      if (perf_detail) {
-        perf_detail->decoded_cb_us += t_after_decoded_cb - t_cb0;
-        ++perf_detail->out_buffers;
-      }
-      if (delivered_frames) {
-        ++(*delivered_frames);
       }
 #endif
     }
+#if __ANDROID_API__ >= 26
+    if (released_to_native_surface) {
+      DrainReadyImages(perf_detail, delivered_frames);
+    }
+#endif
     if (perf_detail) {
       perf_detail->total_us = McMonotonicUs() - t_wall_start;
     }
@@ -850,6 +908,7 @@ bool AndroidMediaCodecVideoDecoder::Configure(const webrtc::VideoDecoder::Settin
     std::lock_guard<std::mutex> lk(impl_->mu_);
     impl_->tasks_.clear();
     impl_->pending_decode_tasks_ = 0;
+    impl_->image_drain_task_posted_ = false;
     impl_->tasks_.push_front([pt]() { (*pt)(); });
   }
   impl_->cv_.notify_one();
@@ -947,6 +1006,7 @@ int32_t AndroidMediaCodecVideoDecoder::Release() {
     if (impl_->running_) {
       impl_->tasks_.clear();
       impl_->pending_decode_tasks_ = 0;
+      impl_->image_drain_task_posted_ = false;
       impl_->tasks_.push_front([pt]() { (*pt)(); });
       wait_for_destroy = true;
     }

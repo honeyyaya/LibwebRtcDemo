@@ -20,13 +20,9 @@ AndroidHardwareBufferVideoFrameBuffer::AndroidHardwareBufferVideoFrameBuffer(
   if (hardware_buffer_) {
     AHardwareBuffer_acquire(hardware_buffer_);
   }
-  // Release the ImageReader slot immediately after taking our own hardware-buffer ref.
-  // Keeping the AImage alive here causes maxImages exhaustion even though rendering only
-  // needs the AHardwareBuffer + sync fence afterward.
-  if (image_) {
-    AImage_delete(image_);
-    image_ = nullptr;
-  }
+  // Keep the AImage acquired until the GL consumer releases the frame.
+  // Releasing it immediately lets ImageReader/MediaCodec recycle the slot
+  // while the external texture may still be in use by the GPU.
 }
 
 AndroidHardwareBufferVideoFrameBuffer::~AndroidHardwareBufferVideoFrameBuffer() {
