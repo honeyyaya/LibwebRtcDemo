@@ -69,12 +69,11 @@ constexpr int64_t kDequeueInputTimeoutUs = 3000;
 constexpr int64_t kOutputDequeueTimeoutUs = 3000;
 constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
 constexpr int64_t kBackpressureLogIntervalUs = 500000;
-// acquireLatestImageAsync() needs headroom beyond the native render slots.
-// With 100 ms receiver playout buffering at 60 fps, WebRTC can hold about
-// 6 decoded frames while the renderer keeps up to 6 native texture slots plus
-// short-lived pending refs, so maxImages needs enough slack to avoid
-// AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED bursts.
-constexpr int32_t kImageReaderMaxImages = 16;
+// acquireLatestImageAsync() still needs headroom beyond the native render slots.
+// Even with a lower receiver playout target, the decoder and renderer can briefly
+// overlap several native frames, so keep some slack to avoid
+// AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED bursts under jitter.
+constexpr int32_t kImageReaderMaxImages = 12;
 constexpr size_t kMaxPendingOutputMetadata = 128;
 
 int GetDeviceApiLevel() {

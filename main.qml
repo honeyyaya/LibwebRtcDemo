@@ -22,7 +22,8 @@ Window {
 
     Timer {
         id: titleClockTimer
-        interval: 1000
+        // 毫秒位需高频刷新；1000ms 只会每秒改一次，看起来像“表坏了”
+        interval: 33
         running: true
         repeat: true
         triggeredOnStart: true

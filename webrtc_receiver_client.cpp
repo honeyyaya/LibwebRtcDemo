@@ -43,9 +43,9 @@ namespace {
 
 // Keep a small jitter-buffer floor, but let WebRTC adapt instead of pinning
 // playout to a fixed 100 ms delay.
-constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.03;
+constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.02;
 constexpr int kReceiverForcedPlayoutDelayMs = 0;
-constexpr int kReceiverMaxDecodeQueueSize = 4;
+constexpr int kReceiverMaxDecodeQueueSize = 3;
 
 webrtc::SdpType SdpTypeFromOfferAnswerString(const std::string &t) {
   auto opt = webrtc::SdpTypeFromString(t);
