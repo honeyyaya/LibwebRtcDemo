@@ -66,10 +66,11 @@ constexpr char kMediaFormatLowLatency[] = "low-latency";
 constexpr int64_t kDequeueInputTimeoutUs = 3000;
 constexpr int64_t kOutputDequeueTimeoutUs = 3000;
 constexpr int64_t kDrainAfterQueueShortWaitUs = 1000;
-// acquireLatestImageAsync() needs headroom beyond the number of native render
-// slots, otherwise ImageReader runs out of locked buffers before it can
-// discard stale images and hand us the newest one.
-constexpr int32_t kImageReaderMaxImages = 8;
+// acquireLatestImageAsync() needs headroom beyond the native render slots.
+// With 6 native texture slots, renderer-side pending/held buffers can keep 2
+// more AImages alive at the same time, so maxImages must stay above 8 to let
+// ImageReader discard stale buffers and still hand us the newest image.
+constexpr int32_t kImageReaderMaxImages = 10;
 constexpr size_t kMaxPendingOutputMetadata = 128;
 
 // WebRTC H264 鎺ユ敹璺緞澶氫负 Annex B锛?0 00 01 / 00 00 00 01锛夈€侰odec2 瑙ｇ爜鍣ㄩ€氬父瑕佽繖绉嶈緭鍏ワ紱
