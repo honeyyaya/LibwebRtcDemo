@@ -113,7 +113,7 @@ const char* UploadPathKindName(UploadPathKind kind) {
 constexpr int kEncodedIngressPollIntervalMs = 250;
 constexpr int64_t kHighlightSignalThrottleUs = 200000;
 constexpr int64_t kNominalVsyncIntervalUs = 16666;
-constexpr int64_t kStaleMailboxFrameDropUs = 2 * kNominalVsyncIntervalUs;
+constexpr int64_t kStaleMailboxFrameDropUs = kNominalVsyncIntervalUs + 4000;
 
 #if defined(WEBRTC_ANDROID)
 constexpr int kNativeTextureSlotCount = 6;
