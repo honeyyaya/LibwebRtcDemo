@@ -20,6 +20,7 @@
 #include <QSGRenderNode>
 #include <QSGRendererInterface>
 #include <QSurfaceFormat>
+#include <QThread>
 
 #include <algorithm>
 #include <array>
@@ -1665,7 +1666,6 @@ bool WebRTCVideoRenderer::hasEncodedIngressTracking() const {
 }
 
 void WebRTCVideoRenderer::RequestRenderPumpUpdate() {
-  m_renderUpdatePending.store(false, std::memory_order_release);
   const int64_t dispatchMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
   {
     QMutexLocker locker(&m_frameMutex);
@@ -1682,6 +1682,10 @@ void WebRTCVideoRenderer::QueueRenderPumpUpdate() {
   if (m_renderUpdatePending.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
+  if (QThread::currentThread() == thread()) {
+    RequestRenderPumpUpdate();
+    return;
+  }
   QMetaObject::invokeMethod(this, [this]() { RequestRenderPumpUpdate(); }, Qt::QueuedConnection);
 }
 
@@ -1691,7 +1695,7 @@ void WebRTCVideoRenderer::EnsureRenderPumpRunning() {
     return;
   }
   m_renderPumpRunning.store(true, std::memory_order_release);
-  RequestRenderPumpUpdate();
+  QueueRenderPumpUpdate();
 }
 
 void WebRTCVideoRenderer::StopRenderPump() {
@@ -1709,6 +1713,9 @@ void WebRTCVideoRenderer::OnWindowChanged(QQuickWindow* currentWindow) {
     return;
   }
 
+  currentWindow->setPersistentGraphics(true);
+  currentWindow->setPersistentSceneGraph(true);
+
   m_beforeSynchronizingConnection = connect(currentWindow, &QQuickWindow::beforeSynchronizing, this,
                                             &WebRTCVideoRenderer::OnBeforeSynchronizing,
                                             Qt::DirectConnection);
@@ -1716,7 +1723,7 @@ void WebRTCVideoRenderer::OnWindowChanged(QQuickWindow* currentWindow) {
       connect(currentWindow, &QQuickWindow::frameSwapped, this, &WebRTCVideoRenderer::OnFrameSwapped,
               Qt::QueuedConnection);
   if (m_renderPumpRunning.load(std::memory_order_acquire)) {
-    RequestRenderPumpUpdate();
+    QueueRenderPumpUpdate();
   }
 }
 
@@ -1748,13 +1755,14 @@ bool WebRTCVideoRenderer::HasUndeliveredFrame() const {
 }
 
 void WebRTCVideoRenderer::OnFrameSwapped() {
+  m_renderUpdatePending.store(false, std::memory_order_release);
   if (!m_renderPumpRunning.load(std::memory_order_acquire) || !hasVideo()) {
     return;
   }
-  if (m_renderUpdatePending.load(std::memory_order_acquire) || !HasUndeliveredFrame()) {
+  if (!HasUndeliveredFrame()) {
     return;
   }
-  RequestRenderPumpUpdate();
+  QueueRenderPumpUpdate();
 }
 
 void WebRTCVideoRenderer::setTraceTargetFrameId(int id) {
