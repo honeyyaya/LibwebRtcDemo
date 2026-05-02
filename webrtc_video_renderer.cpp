@@ -112,6 +112,8 @@ const char* UploadPathKindName(UploadPathKind kind) {
 
 constexpr int kEncodedIngressPollIntervalMs = 250;
 constexpr int64_t kHighlightSignalThrottleUs = 200000;
+constexpr int64_t kNominalVsyncIntervalUs = 16666;
+constexpr int64_t kStaleMailboxFrameDropUs = 2 * kNominalVsyncIntervalUs;
 
 #if defined(WEBRTC_ANDROID)
 constexpr int kNativeTextureSlotCount = 6;
@@ -471,6 +473,10 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         m_queueTraceStartMonoUs = item->m_renderFrame.queueStartMonoUs;
         m_guiUpdateDispatchMonoUs = item->m_renderFrame.guiUpdateDispatchMonoUs;
         m_syncTraceStartMonoUs = item->m_renderFrame.syncStartMonoUs;
+        m_mailboxAgeUs = item->m_renderFrame.mailboxAgeUs;
+        m_pacerWaitUs = item->m_renderFrame.pacerWaitUs;
+        m_droppedMailboxFrames = item->m_renderFrame.droppedMailboxFrames;
+        m_droppedMailboxFramesTotal = item->m_renderFrame.droppedMailboxFramesTotal;
         m_nodeSyncTraceMonoUs = nodeSyncMonoUs;
         m_currentFrameId = item->m_renderFrame.frameId;
         m_frameFromTracking = item->m_renderFrame.fromTracking;
@@ -676,14 +682,19 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 #endif
 
         qDebug().noquote()
-            << QString("[Timing/Render] tracking_id=%1 | path=%2 | post_to_gui=%3 ms | "
-                       "gui_to_sync=%4 ms | sync_to_node_sync=%5 ms | node_sync_to_upload=%6 ms | "
-                       "sync_to_render=%7 ms | queue_wait=%8 ms | fence_wait=%9 ms | import=%10 ms | "
-                       "upload=%11 ms | draw=%12 ms | upload+draw=%13 ms | wall(OnFrame->render)=%14 ms | "
-                       "total(Decode->render)=%15 ms | cache=%16 | create=%17 ms | evict=%18 | slot=%19 | "
-                       "cache_entries=%20/%21 | cache_totals(hit/create/fail/evict/slot_miss)=%22/%23/%24/%25/%26")
+            << QString("[Timing/Render] tracking_id=%1 | path=%2 | mailbox_age=%3 ms | "
+                       "pacer_wait=%4 ms | dropped_mailbox_frames=%5/%6 | post_to_gui=%7 ms | "
+                       "gui_to_sync=%8 ms | sync_to_node_sync=%9 ms | node_sync_to_upload=%10 ms | "
+                       "sync_to_render=%11 ms | queue_wait=%12 ms | fence_wait=%13 ms | import=%14 ms | "
+                       "upload=%15 ms | draw=%16 ms | upload+draw=%17 ms | wall(OnFrame->render)=%18 ms | "
+                       "total(Decode->render)=%19 ms | cache=%20 | create=%21 ms | evict=%22 | slot=%23 | "
+                       "cache_entries=%24/%25 | cache_totals(hit/create/fail/evict/slot_miss)=%26/%27/%28/%29/%30")
                    .arg(m_drawFrameTrace.frameId)
                    .arg(UploadPathKindName(m_frameFormat))
+                   .arg(fmtStageMs(m_drawFrameTrace.mailboxAgeUs))
+                   .arg(fmtStageMs(m_drawFrameTrace.pacerWaitUs))
+                   .arg(static_cast<qulonglong>(m_drawFrameTrace.droppedMailboxFrames))
+                   .arg(static_cast<qulonglong>(m_drawFrameTrace.droppedMailboxFramesTotal))
                    .arg(fmtStageMs(postToGuiUs))
                    .arg(fmtStageMs(guiToSyncUs))
                    .arg(fmtStageMs(syncToNodeSyncUs))
@@ -732,6 +743,10 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
     int frameId = -1;
     bool fromTracking = false;
     int64_t nodeSyncMonoUs = 0;
+    int64_t mailboxAgeUs = 0;
+    int64_t pacerWaitUs = 0;
+    uint64_t droppedMailboxFrames = 0;
+    uint64_t droppedMailboxFramesTotal = 0;
   };
 
   bool EnsureInitialized() {
@@ -1361,9 +1376,16 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         m_hasData = true;
         m_readyFrameTrace = {};
         m_haveReadyFrameTrace = false;
-        m_drawFrameTrace = {m_queueTraceStartMonoUs, m_guiUpdateDispatchMonoUs,
-                            m_syncTraceStartMonoUs, m_currentFrameId, m_frameFromTracking,
-                            m_nodeSyncTraceMonoUs};
+        m_drawFrameTrace = {m_queueTraceStartMonoUs,
+                            m_guiUpdateDispatchMonoUs,
+                            m_syncTraceStartMonoUs,
+                            m_currentFrameId,
+                            m_frameFromTracking,
+                            m_nodeSyncTraceMonoUs,
+                            m_mailboxAgeUs,
+                            m_pacerWaitUs,
+                            m_droppedMailboxFrames,
+                            m_droppedMailboxFramesTotal};
         m_haveDrawFrameTrace = m_haveFrameTrace;
       } else {
         m_uploadStatsValidForLastFrame = false;
@@ -1402,18 +1424,32 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
         m_drawFrameTrace = m_readyFrameTrace;
         m_haveDrawFrameTrace = true;
       } else {
-        m_drawFrameTrace = {m_queueTraceStartMonoUs, m_guiUpdateDispatchMonoUs,
-                            m_syncTraceStartMonoUs, m_currentFrameId, m_frameFromTracking,
-                            m_nodeSyncTraceMonoUs};
+        m_drawFrameTrace = {m_queueTraceStartMonoUs,
+                            m_guiUpdateDispatchMonoUs,
+                            m_syncTraceStartMonoUs,
+                            m_currentFrameId,
+                            m_frameFromTracking,
+                            m_nodeSyncTraceMonoUs,
+                            m_mailboxAgeUs,
+                            m_pacerWaitUs,
+                            m_droppedMailboxFrames,
+                            m_droppedMailboxFramesTotal};
         m_haveDrawFrameTrace = m_haveFrameTrace;
       }
     } else {
       m_haveDrawFrameTrace = false;
     }
     if (upload.staged) {
-      m_readyFrameTrace = {m_queueTraceStartMonoUs, m_guiUpdateDispatchMonoUs,
-                           m_syncTraceStartMonoUs, m_currentFrameId, m_frameFromTracking,
-                           m_nodeSyncTraceMonoUs};
+      m_readyFrameTrace = {m_queueTraceStartMonoUs,
+                           m_guiUpdateDispatchMonoUs,
+                           m_syncTraceStartMonoUs,
+                           m_currentFrameId,
+                           m_frameFromTracking,
+                           m_nodeSyncTraceMonoUs,
+                           m_mailboxAgeUs,
+                           m_pacerWaitUs,
+                           m_droppedMailboxFrames,
+                           m_droppedMailboxFramesTotal};
       m_haveReadyFrameTrace = m_haveFrameTrace;
     }
     ClearHeldFrame();
@@ -1472,6 +1508,10 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
   int64_t m_queueTraceStartMonoUs = 0;
   int64_t m_guiUpdateDispatchMonoUs = 0;
   int64_t m_syncTraceStartMonoUs = 0;
+  int64_t m_mailboxAgeUs = 0;
+  int64_t m_pacerWaitUs = 0;
+  uint64_t m_droppedMailboxFrames = 0;
+  uint64_t m_droppedMailboxFramesTotal = 0;
   int64_t m_nodeSyncTraceMonoUs = 0;
   int m_currentFrameId = -1;
   bool m_frameFromTracking = false;
@@ -1674,7 +1714,18 @@ void WebRTCVideoRenderer::PublishMailboxFrameLocked(
 bool WebRTCVideoRenderer::TakeMailboxFrameForRender(int64_t syncStartMonoUs) {
   QMutexLocker locker(&m_frameMutex);
   if (!m_mailboxFrame.buffer || m_mailboxFrame.generation == 0 ||
-      m_mailboxFrame.generation == m_renderFrame.generation) {
+      m_mailboxFrame.generation == m_lastResolvedMailboxGeneration) {
+    m_renderUpdateDispatchMonoUs = 0;
+    return false;
+  }
+
+  const int64_t mailboxAgeUs =
+      std::max<int64_t>(0, syncStartMonoUs - m_mailboxFrame.queueStartMonoUs);
+  if (mailboxAgeUs > kStaleMailboxFrameDropUs) {
+    ++m_droppedMailboxFrameCount;
+    m_lastResolvedMailboxGeneration = m_mailboxFrame.generation;
+    m_mailboxFrame.buffer = nullptr;
+    m_mailboxFrame.guiUpdateDispatchMonoUs = 0;
     m_renderUpdateDispatchMonoUs = 0;
     return false;
   }
@@ -1683,14 +1734,25 @@ bool WebRTCVideoRenderer::TakeMailboxFrameForRender(int64_t syncStartMonoUs) {
       m_mailboxFrame.guiUpdateDispatchMonoUs != 0
           ? m_mailboxFrame.guiUpdateDispatchMonoUs
           : (m_renderUpdateDispatchMonoUs != 0 ? m_renderUpdateDispatchMonoUs : syncStartMonoUs);
+  const int64_t pacerWaitUs =
+      guiUpdateDispatchMonoUs > 0 ? std::max<int64_t>(0, syncStartMonoUs - guiUpdateDispatchMonoUs)
+                                  : 0;
+  const uint64_t droppedMailboxFrames =
+      m_droppedMailboxFrameCount - m_lastRenderDroppedMailboxFrameCount;
 
   m_renderFrame.buffer = m_mailboxFrame.buffer;
   m_renderFrame.queueStartMonoUs = m_mailboxFrame.queueStartMonoUs;
   m_renderFrame.guiUpdateDispatchMonoUs = guiUpdateDispatchMonoUs;
   m_renderFrame.syncStartMonoUs = syncStartMonoUs;
+  m_renderFrame.mailboxAgeUs = mailboxAgeUs;
+  m_renderFrame.pacerWaitUs = pacerWaitUs;
+  m_renderFrame.droppedMailboxFrames = droppedMailboxFrames;
+  m_renderFrame.droppedMailboxFramesTotal = m_droppedMailboxFrameCount;
   m_renderFrame.frameId = m_mailboxFrame.frameId;
   m_renderFrame.fromTracking = m_mailboxFrame.fromTracking;
   m_renderFrame.generation = m_mailboxFrame.generation;
+  m_lastResolvedMailboxGeneration = m_mailboxFrame.generation;
+  m_lastRenderDroppedMailboxFrameCount = m_droppedMailboxFrameCount;
   m_renderUpdateDispatchMonoUs = 0;
   return true;
 }
@@ -1729,7 +1791,7 @@ void WebRTCVideoRenderer::RequestMailboxRenderUpdate() {
     QMutexLocker locker(&m_frameMutex);
     m_renderUpdateDispatchMonoUs = dispatchMonoUs;
     if (m_mailboxFrame.buffer && m_mailboxFrame.generation != 0 &&
-        m_mailboxFrame.generation != m_renderFrame.generation &&
+        m_mailboxFrame.generation != m_lastResolvedMailboxGeneration &&
         m_mailboxFrame.guiUpdateDispatchMonoUs == 0) {
       m_mailboxFrame.guiUpdateDispatchMonoUs = dispatchMonoUs;
     }
@@ -1819,7 +1881,7 @@ void WebRTCVideoRenderer::OnBeforeSynchronizing() {
 bool WebRTCVideoRenderer::HasPendingMailboxFrame() const {
   QMutexLocker locker(&m_frameMutex);
   return m_mailboxFrame.buffer && m_mailboxFrame.generation != 0 &&
-         m_mailboxFrame.generation != m_renderFrame.generation;
+         m_mailboxFrame.generation != m_lastResolvedMailboxGeneration;
 }
 
 void WebRTCVideoRenderer::OnFrameSwapped() {
@@ -1923,6 +1985,9 @@ void WebRTCVideoRenderer::clearVideoTrack() {
     QMutexLocker locker(&m_frameMutex);
     m_mailboxFrame = {};
     m_renderFrame = {};
+    m_lastResolvedMailboxGeneration = 0;
+    m_droppedMailboxFrameCount = 0;
+    m_lastRenderDroppedMailboxFrameCount = 0;
     m_highlightFrameId = -1;
     m_frameIdFromTracking = false;
     m_lastHighlightSignalMonoUs = 0;

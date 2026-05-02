@@ -96,6 +96,10 @@ class WebRTCVideoRenderer : public QQuickItem,
     int64_t queueStartMonoUs = 0;
     int64_t guiUpdateDispatchMonoUs = 0;
     int64_t syncStartMonoUs = 0;
+    int64_t mailboxAgeUs = 0;
+    int64_t pacerWaitUs = 0;
+    uint64_t droppedMailboxFrames = 0;
+    uint64_t droppedMailboxFramesTotal = 0;
     int frameId = -1;
     bool fromTracking = false;
     uint64_t generation = 0;
@@ -125,6 +129,9 @@ class WebRTCVideoRenderer : public QQuickItem,
   mutable QMutex m_frameMutex;
   MailboxFrameSlot m_mailboxFrame;
   RenderFrameSlot m_renderFrame;
+  uint64_t m_lastResolvedMailboxGeneration = 0;
+  uint64_t m_droppedMailboxFrameCount = 0;
+  uint64_t m_lastRenderDroppedMailboxFrameCount = 0;
   int64_t m_renderUpdateDispatchMonoUs = 0;
 
   int m_highlightFrameId = -1;
