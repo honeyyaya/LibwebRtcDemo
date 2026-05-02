@@ -1760,7 +1760,6 @@ bool WebRTCVideoRenderer::TakeMailboxFrameForRender(int64_t syncStartMonoUs) {
 void WebRTCVideoRenderer::ResetRenderSchedulingState() {
   m_renderUpdateInvokePending.store(false, std::memory_order_release);
   m_renderUpdatePending.store(false, std::memory_order_release);
-  m_renderFrameInFlight.store(false, std::memory_order_release);
   QMutexLocker locker(&m_frameMutex);
   m_renderUpdateDispatchMonoUs = 0;
 }
@@ -1775,14 +1774,7 @@ void WebRTCVideoRenderer::RequestMailboxRenderUpdate() {
   if (!HasPendingMailboxFrame()) {
     return;
   }
-  if (m_renderFrameInFlight.load(std::memory_order_acquire)) {
-    return;
-  }
   if (m_renderUpdatePending.exchange(true, std::memory_order_acq_rel)) {
-    return;
-  }
-  if (m_renderFrameInFlight.load(std::memory_order_acquire)) {
-    m_renderUpdatePending.store(false, std::memory_order_release);
     return;
   }
 
@@ -1800,8 +1792,7 @@ void WebRTCVideoRenderer::RequestMailboxRenderUpdate() {
 }
 
 void WebRTCVideoRenderer::QueueMailboxRenderUpdate() {
-  if (m_renderUpdatePending.load(std::memory_order_acquire) ||
-      m_renderFrameInFlight.load(std::memory_order_acquire)) {
+  if (m_renderUpdatePending.load(std::memory_order_acquire)) {
     return;
   }
   if (QThread::currentThread() == thread()) {
@@ -1838,8 +1829,6 @@ void WebRTCVideoRenderer::StopRenderScheduling() {
 void WebRTCVideoRenderer::OnWindowChanged(QQuickWindow* currentWindow) {
   QObject::disconnect(m_beforeSynchronizingConnection);
   m_beforeSynchronizingConnection = {};
-  QObject::disconnect(m_frameSwappedConnection);
-  m_frameSwappedConnection = {};
 
   ResetRenderSchedulingState();
 
@@ -1853,9 +1842,6 @@ void WebRTCVideoRenderer::OnWindowChanged(QQuickWindow* currentWindow) {
   m_beforeSynchronizingConnection = connect(currentWindow, &QQuickWindow::beforeSynchronizing, this,
                                             &WebRTCVideoRenderer::OnBeforeSynchronizing,
                                             Qt::DirectConnection);
-  m_frameSwappedConnection =
-      connect(currentWindow, &QQuickWindow::frameSwapped, this, &WebRTCVideoRenderer::OnFrameSwapped,
-              Qt::DirectConnection);
   if (m_renderSchedulingActive.load(std::memory_order_acquire)) {
     QueueMailboxRenderUpdate();
   }
@@ -1874,7 +1860,6 @@ void WebRTCVideoRenderer::OnBeforeSynchronizing() {
     m_renderUpdatePending.store(false, std::memory_order_release);
     return;
   }
-  m_renderFrameInFlight.store(true, std::memory_order_release);
   m_renderUpdatePending.store(false, std::memory_order_release);
 }
 
@@ -1882,17 +1867,6 @@ bool WebRTCVideoRenderer::HasPendingMailboxFrame() const {
   QMutexLocker locker(&m_frameMutex);
   return m_mailboxFrame.buffer && m_mailboxFrame.generation != 0 &&
          m_mailboxFrame.generation != m_lastResolvedMailboxGeneration;
-}
-
-void WebRTCVideoRenderer::OnFrameSwapped() {
-  m_renderFrameInFlight.store(false, std::memory_order_release);
-  if (!m_renderSchedulingActive.load(std::memory_order_acquire) || !hasVideo()) {
-    return;
-  }
-  if (!HasPendingMailboxFrame()) {
-    return;
-  }
-  QueueMailboxRenderUpdate();
 }
 
 void WebRTCVideoRenderer::setTraceTargetFrameId(int id) {

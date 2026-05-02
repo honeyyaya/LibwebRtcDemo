@@ -115,7 +115,6 @@ class WebRTCVideoRenderer : public QQuickItem,
   void StopRenderScheduling();
   void OnWindowChanged(QQuickWindow* window);
   void OnBeforeSynchronizing();
-  void OnFrameSwapped();
   bool HasPendingMailboxFrame() const;
 
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> m_track;
@@ -124,7 +123,6 @@ class WebRTCVideoRenderer : public QQuickItem,
   std::atomic<bool> m_renderSchedulingStartPending{false};
   std::atomic<bool> m_renderUpdateInvokePending{false};
   std::atomic<bool> m_renderUpdatePending{false};
-  std::atomic<bool> m_renderFrameInFlight{false};
 
   mutable QMutex m_frameMutex;
   MailboxFrameSlot m_mailboxFrame;
@@ -146,7 +144,6 @@ class WebRTCVideoRenderer : public QQuickItem,
 
   int64_t m_lastHighlightSignalMonoUs = 0;
   QMetaObject::Connection m_beforeSynchronizingConnection;
-  QMetaObject::Connection m_frameSwappedConnection;
 
   int m_sampledHighlightFrameId = -1;
   double m_sampledDecodeToRenderMs = -1.0;
