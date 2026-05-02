@@ -113,7 +113,7 @@ const char* UploadPathKindName(UploadPathKind kind) {
 constexpr int kEncodedIngressPollIntervalMs = 250;
 constexpr int64_t kHighlightSignalThrottleUs = 200000;
 constexpr int64_t kNominalVsyncIntervalUs = 16666;
-constexpr int64_t kStaleMailboxFrameDropUs = kNominalVsyncIntervalUs + 4000;
+constexpr int64_t kStaleMailboxFrameDropUs = kNominalVsyncIntervalUs;
 
 #if defined(WEBRTC_ANDROID)
 constexpr int kNativeTextureSlotCount = 6;
@@ -1855,12 +1855,20 @@ void WebRTCVideoRenderer::OnBeforeSynchronizing() {
     return;
   }
 
+  const auto finishRenderUpdate = [this]() {
+    m_renderUpdatePending.store(false, std::memory_order_release);
+    if (m_renderSchedulingActive.load(std::memory_order_acquire) && hasVideo() &&
+        HasPendingMailboxFrame()) {
+      QueueMailboxRenderUpdate();
+    }
+  };
+
   const int64_t syncStartMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
   if (!TakeMailboxFrameForRender(syncStartMonoUs)) {
-    m_renderUpdatePending.store(false, std::memory_order_release);
+    finishRenderUpdate();
     return;
   }
-  m_renderUpdatePending.store(false, std::memory_order_release);
+  finishRenderUpdate();
 }
 
 bool WebRTCVideoRenderer::HasPendingMailboxFrame() const {
