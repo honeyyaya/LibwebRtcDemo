@@ -112,11 +112,14 @@ class WebRTCVideoRenderer : public QQuickItem,
   std::atomic<bool> m_hasVideo{false};
   std::atomic<bool> m_renderPumpRunning{false};
   std::atomic<bool> m_renderPumpStartPending{false};
+  std::atomic<bool> m_renderUpdateInvokePending{false};
   std::atomic<bool> m_renderUpdatePending{false};
+  std::atomic<bool> m_renderFrameInFlight{false};
 
   mutable QMutex m_frameMutex;
   LatestFrameSlot m_latestFrame;
   SyncFrameSlot m_syncFrame;
+  int64_t m_renderUpdateDispatchMonoUs = 0;
 
   int m_highlightFrameId = -1;
   bool m_frameIdFromTracking = false;
