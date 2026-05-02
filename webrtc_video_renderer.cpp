@@ -464,18 +464,18 @@ class WebRTCVideoRenderNode : public QSGRenderNode, protected QOpenGLExtraFuncti
 
     {
       QMutexLocker locker(&item->m_frameMutex);
-      if (item->m_syncFrame.buffer && item->m_syncFrame.generation != 0 &&
-          item->m_syncFrame.generation != m_lastConsumedFrameGeneration) {
+      if (item->m_renderFrame.buffer && item->m_renderFrame.generation != 0 &&
+          item->m_renderFrame.generation != m_lastConsumedFrameGeneration) {
         ClearHeldFrame();
-        m_heldBuffer = item->m_syncFrame.buffer;
-        m_queueTraceStartMonoUs = item->m_syncFrame.queueStartMonoUs;
-        m_guiUpdateDispatchMonoUs = item->m_syncFrame.guiUpdateDispatchMonoUs;
-        m_syncTraceStartMonoUs = item->m_syncFrame.syncStartMonoUs;
+        m_heldBuffer = item->m_renderFrame.buffer;
+        m_queueTraceStartMonoUs = item->m_renderFrame.queueStartMonoUs;
+        m_guiUpdateDispatchMonoUs = item->m_renderFrame.guiUpdateDispatchMonoUs;
+        m_syncTraceStartMonoUs = item->m_renderFrame.syncStartMonoUs;
         m_nodeSyncTraceMonoUs = nodeSyncMonoUs;
-        m_currentFrameId = item->m_syncFrame.frameId;
-        m_frameFromTracking = item->m_syncFrame.fromTracking;
+        m_currentFrameId = item->m_renderFrame.frameId;
+        m_frameFromTracking = item->m_renderFrame.fromTracking;
         m_haveFrameTrace = true;
-        m_lastConsumedFrameGeneration = item->m_syncFrame.generation;
+        m_lastConsumedFrameGeneration = item->m_renderFrame.generation;
       }
     }
 
@@ -1566,8 +1566,8 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
 
   const uint16_t rawId = frame.id();
   bool idChanged = false;
-  bool shouldEnsureRenderPump = false;
-  bool shouldQueueRenderUpdate = false;
+  bool shouldEnsureRenderScheduling = false;
+  bool shouldQueueMailboxRenderUpdate = false;
   bool fromTrackingForLog = false;
   int displayIdForLog = -1;
   qint64 handoffUs = 0;
@@ -1584,12 +1584,7 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
     fromTrackingForLog = fromTracking;
     displayIdForLog = displayId;
 
-    m_latestFrame.buffer = std::move(buffer);
-    m_latestFrame.queueStartMonoUs = onFrameMonoUs;
-    m_latestFrame.guiUpdateDispatchMonoUs = 0;
-    m_latestFrame.frameId = displayId;
-    m_latestFrame.fromTracking = fromTracking;
-    ++m_latestFrame.generation;
+    PublishMailboxFrameLocked(std::move(buffer), onFrameMonoUs, displayId, fromTracking);
     if (m_highlightFrameId != displayId || m_frameIdFromTracking != fromTracking) {
       m_highlightFrameId = displayId;
       m_frameIdFromTracking = fromTracking;
@@ -1602,12 +1597,12 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
     handoffUs = handoffTimer.nsecsElapsed() / 1000;
   }
 
-  const bool renderPumpRunning = m_renderPumpRunning.load(std::memory_order_acquire);
-  if (!renderPumpRunning &&
-      !m_renderPumpStartPending.exchange(true, std::memory_order_acq_rel)) {
-    shouldEnsureRenderPump = true;
+  const bool renderSchedulingActive = m_renderSchedulingActive.load(std::memory_order_acquire);
+  if (!renderSchedulingActive &&
+      !m_renderSchedulingStartPending.exchange(true, std::memory_order_acq_rel)) {
+    shouldEnsureRenderScheduling = true;
   }
-  shouldQueueRenderUpdate = renderPumpRunning;
+  shouldQueueMailboxRenderUpdate = renderSchedulingActive;
 
   if (idChanged) {
     QMetaObject::invokeMethod(this, [this]() { Q_EMIT highlightFrameIdChanged(); },
@@ -1618,12 +1613,12 @@ void WebRTCVideoRenderer::OnFrame(const webrtc::VideoFrame& frame) {
     QMetaObject::invokeMethod(this, [this]() { Q_EMIT hasVideoChanged(); }, Qt::QueuedConnection);
   }
 
-  if (shouldEnsureRenderPump) {
-    QMetaObject::invokeMethod(this, [this]() { EnsureRenderPumpRunning(); },
+  if (shouldEnsureRenderScheduling) {
+    QMetaObject::invokeMethod(this, [this]() { EnsureRenderSchedulingActive(); },
                               Qt::QueuedConnection);
   }
-  if (shouldQueueRenderUpdate) {
-    QueueRenderPumpUpdate();
+  if (shouldQueueMailboxRenderUpdate) {
+    QueueMailboxRenderUpdate();
   }
 
   ++m_frameCount;
@@ -1665,11 +1660,57 @@ bool WebRTCVideoRenderer::hasEncodedIngressTracking() const {
   return webrtc_demo::GetLastEncodedFrameTrackingIdForUi() >= 0;
 }
 
-void WebRTCVideoRenderer::RequestRenderPumpUpdate() {
-  if (!m_renderPumpRunning.load(std::memory_order_acquire) || !hasVideo()) {
+void WebRTCVideoRenderer::PublishMailboxFrameLocked(
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer, int64_t queueStartMonoUs, int frameId,
+    bool fromTracking) {
+  m_mailboxFrame.buffer = std::move(buffer);
+  m_mailboxFrame.queueStartMonoUs = queueStartMonoUs;
+  m_mailboxFrame.guiUpdateDispatchMonoUs = 0;
+  m_mailboxFrame.frameId = frameId;
+  m_mailboxFrame.fromTracking = fromTracking;
+  ++m_mailboxFrame.generation;
+}
+
+bool WebRTCVideoRenderer::TakeMailboxFrameForRender(int64_t syncStartMonoUs) {
+  QMutexLocker locker(&m_frameMutex);
+  if (!m_mailboxFrame.buffer || m_mailboxFrame.generation == 0 ||
+      m_mailboxFrame.generation == m_renderFrame.generation) {
+    m_renderUpdateDispatchMonoUs = 0;
+    return false;
+  }
+
+  const int64_t guiUpdateDispatchMonoUs =
+      m_mailboxFrame.guiUpdateDispatchMonoUs != 0
+          ? m_mailboxFrame.guiUpdateDispatchMonoUs
+          : (m_renderUpdateDispatchMonoUs != 0 ? m_renderUpdateDispatchMonoUs : syncStartMonoUs);
+
+  m_renderFrame.buffer = m_mailboxFrame.buffer;
+  m_renderFrame.queueStartMonoUs = m_mailboxFrame.queueStartMonoUs;
+  m_renderFrame.guiUpdateDispatchMonoUs = guiUpdateDispatchMonoUs;
+  m_renderFrame.syncStartMonoUs = syncStartMonoUs;
+  m_renderFrame.frameId = m_mailboxFrame.frameId;
+  m_renderFrame.fromTracking = m_mailboxFrame.fromTracking;
+  m_renderFrame.generation = m_mailboxFrame.generation;
+  m_renderUpdateDispatchMonoUs = 0;
+  return true;
+}
+
+void WebRTCVideoRenderer::ResetRenderSchedulingState() {
+  m_renderUpdateInvokePending.store(false, std::memory_order_release);
+  m_renderUpdatePending.store(false, std::memory_order_release);
+  m_renderFrameInFlight.store(false, std::memory_order_release);
+  QMutexLocker locker(&m_frameMutex);
+  m_renderUpdateDispatchMonoUs = 0;
+}
+
+void WebRTCVideoRenderer::RequestMailboxRenderUpdate() {
+  if (!m_renderSchedulingActive.load(std::memory_order_acquire) || !hasVideo()) {
     return;
   }
   if (!window()) {
+    return;
+  }
+  if (!HasPendingMailboxFrame()) {
     return;
   }
   if (m_renderFrameInFlight.load(std::memory_order_acquire)) {
@@ -1687,22 +1728,22 @@ void WebRTCVideoRenderer::RequestRenderPumpUpdate() {
   {
     QMutexLocker locker(&m_frameMutex);
     m_renderUpdateDispatchMonoUs = dispatchMonoUs;
-    if (m_latestFrame.buffer && m_latestFrame.generation != 0 &&
-        m_latestFrame.generation != m_syncFrame.generation &&
-        m_latestFrame.guiUpdateDispatchMonoUs == 0) {
-      m_latestFrame.guiUpdateDispatchMonoUs = dispatchMonoUs;
+    if (m_mailboxFrame.buffer && m_mailboxFrame.generation != 0 &&
+        m_mailboxFrame.generation != m_renderFrame.generation &&
+        m_mailboxFrame.guiUpdateDispatchMonoUs == 0) {
+      m_mailboxFrame.guiUpdateDispatchMonoUs = dispatchMonoUs;
     }
   }
   update();
 }
 
-void WebRTCVideoRenderer::QueueRenderPumpUpdate() {
+void WebRTCVideoRenderer::QueueMailboxRenderUpdate() {
   if (m_renderUpdatePending.load(std::memory_order_acquire) ||
       m_renderFrameInFlight.load(std::memory_order_acquire)) {
     return;
   }
   if (QThread::currentThread() == thread()) {
-    RequestRenderPumpUpdate();
+    RequestMailboxRenderUpdate();
     return;
   }
   if (m_renderUpdateInvokePending.exchange(true, std::memory_order_acq_rel)) {
@@ -1712,28 +1753,24 @@ void WebRTCVideoRenderer::QueueRenderPumpUpdate() {
       this,
       [this]() {
         m_renderUpdateInvokePending.store(false, std::memory_order_release);
-        RequestRenderPumpUpdate();
+        RequestMailboxRenderUpdate();
       },
       Qt::QueuedConnection);
 }
 
-void WebRTCVideoRenderer::EnsureRenderPumpRunning() {
-  m_renderPumpStartPending.store(false, std::memory_order_release);
+void WebRTCVideoRenderer::EnsureRenderSchedulingActive() {
+  m_renderSchedulingStartPending.store(false, std::memory_order_release);
   if (!hasVideo()) {
     return;
   }
-  m_renderPumpRunning.store(true, std::memory_order_release);
-  QueueRenderPumpUpdate();
+  m_renderSchedulingActive.store(true, std::memory_order_release);
+  QueueMailboxRenderUpdate();
 }
 
-void WebRTCVideoRenderer::StopRenderPump() {
-  m_renderPumpRunning.store(false, std::memory_order_release);
-  m_renderPumpStartPending.store(false, std::memory_order_release);
-  m_renderUpdateInvokePending.store(false, std::memory_order_release);
-  m_renderUpdatePending.store(false, std::memory_order_release);
-  m_renderFrameInFlight.store(false, std::memory_order_release);
-  QMutexLocker locker(&m_frameMutex);
-  m_renderUpdateDispatchMonoUs = 0;
+void WebRTCVideoRenderer::StopRenderScheduling() {
+  m_renderSchedulingActive.store(false, std::memory_order_release);
+  m_renderSchedulingStartPending.store(false, std::memory_order_release);
+  ResetRenderSchedulingState();
 }
 
 void WebRTCVideoRenderer::OnWindowChanged(QQuickWindow* currentWindow) {
@@ -1742,13 +1779,7 @@ void WebRTCVideoRenderer::OnWindowChanged(QQuickWindow* currentWindow) {
   QObject::disconnect(m_frameSwappedConnection);
   m_frameSwappedConnection = {};
 
-  m_renderUpdateInvokePending.store(false, std::memory_order_release);
-  m_renderUpdatePending.store(false, std::memory_order_release);
-  m_renderFrameInFlight.store(false, std::memory_order_release);
-  {
-    QMutexLocker locker(&m_frameMutex);
-    m_renderUpdateDispatchMonoUs = 0;
-  }
+  ResetRenderSchedulingState();
 
   if (!currentWindow) {
     return;
@@ -1763,60 +1794,43 @@ void WebRTCVideoRenderer::OnWindowChanged(QQuickWindow* currentWindow) {
   m_frameSwappedConnection =
       connect(currentWindow, &QQuickWindow::frameSwapped, this, &WebRTCVideoRenderer::OnFrameSwapped,
               Qt::DirectConnection);
-  if (m_renderPumpRunning.load(std::memory_order_acquire)) {
-    QueueRenderPumpUpdate();
+  if (m_renderSchedulingActive.load(std::memory_order_acquire)) {
+    QueueMailboxRenderUpdate();
   }
 }
 
 void WebRTCVideoRenderer::OnBeforeSynchronizing() {
   if (!hasVideo()) {
+    m_renderUpdatePending.store(false, std::memory_order_release);
     QMutexLocker locker(&m_frameMutex);
     m_renderUpdateDispatchMonoUs = 0;
-    m_renderUpdatePending.store(false, std::memory_order_release);
     return;
   }
 
   const int64_t syncStartMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
-  QMutexLocker locker(&m_frameMutex);
-  if (!m_latestFrame.buffer || m_latestFrame.generation == 0 ||
-      m_latestFrame.generation == m_syncFrame.generation) {
-    m_renderUpdateDispatchMonoUs = 0;
+  if (!TakeMailboxFrameForRender(syncStartMonoUs)) {
     m_renderUpdatePending.store(false, std::memory_order_release);
     return;
   }
-
-  const int64_t guiUpdateDispatchMonoUs =
-      m_latestFrame.guiUpdateDispatchMonoUs != 0
-          ? m_latestFrame.guiUpdateDispatchMonoUs
-          : (m_renderUpdateDispatchMonoUs != 0 ? m_renderUpdateDispatchMonoUs : syncStartMonoUs);
-
-  m_syncFrame.buffer = m_latestFrame.buffer;
-  m_syncFrame.queueStartMonoUs = m_latestFrame.queueStartMonoUs;
-  m_syncFrame.guiUpdateDispatchMonoUs = guiUpdateDispatchMonoUs;
-  m_syncFrame.syncStartMonoUs = syncStartMonoUs;
-  m_syncFrame.frameId = m_latestFrame.frameId;
-  m_syncFrame.fromTracking = m_latestFrame.fromTracking;
-  m_syncFrame.generation = m_latestFrame.generation;
-  m_renderUpdateDispatchMonoUs = 0;
   m_renderFrameInFlight.store(true, std::memory_order_release);
   m_renderUpdatePending.store(false, std::memory_order_release);
 }
 
-bool WebRTCVideoRenderer::HasUndeliveredFrame() const {
+bool WebRTCVideoRenderer::HasPendingMailboxFrame() const {
   QMutexLocker locker(&m_frameMutex);
-  return m_latestFrame.buffer && m_latestFrame.generation != 0 &&
-         m_latestFrame.generation != m_syncFrame.generation;
+  return m_mailboxFrame.buffer && m_mailboxFrame.generation != 0 &&
+         m_mailboxFrame.generation != m_renderFrame.generation;
 }
 
 void WebRTCVideoRenderer::OnFrameSwapped() {
   m_renderFrameInFlight.store(false, std::memory_order_release);
-  if (!m_renderPumpRunning.load(std::memory_order_acquire) || !hasVideo()) {
+  if (!m_renderSchedulingActive.load(std::memory_order_acquire) || !hasVideo()) {
     return;
   }
-  if (!HasUndeliveredFrame()) {
+  if (!HasPendingMailboxFrame()) {
     return;
   }
-  QueueRenderPumpUpdate();
+  QueueMailboxRenderUpdate();
 }
 
 void WebRTCVideoRenderer::setTraceTargetFrameId(int id) {
@@ -1900,15 +1914,15 @@ void WebRTCVideoRenderer::clearVideoTrack() {
     m_track = nullptr;
   }
 
-  StopRenderPump();
+  StopRenderScheduling();
 
   webrtc_demo::ResetEncodedFrameTrackingForUi();
   m_lastPolledEncodedIngressId = -1;
 
   {
     QMutexLocker locker(&m_frameMutex);
-    m_latestFrame = {};
-    m_syncFrame = {};
+    m_mailboxFrame = {};
+    m_renderFrame = {};
     m_highlightFrameId = -1;
     m_frameIdFromTracking = false;
     m_lastHighlightSignalMonoUs = 0;

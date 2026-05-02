@@ -80,7 +80,8 @@ class WebRTCVideoRenderer : public QQuickItem,
   void geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) override;
 
  private:
-  struct LatestFrameSlot {
+  // Producer mailbox: OnFrame overwrites this with the newest decoded frame.
+  struct MailboxFrameSlot {
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
     int64_t queueStartMonoUs = 0;
     int64_t guiUpdateDispatchMonoUs = 0;
@@ -89,7 +90,8 @@ class WebRTCVideoRenderer : public QQuickItem,
     uint64_t generation = 0;
   };
 
-  struct SyncFrameSlot {
+  // Render-owned snapshot: beforeSynchronizing promotes one mailbox frame here.
+  struct RenderFrameSlot {
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
     int64_t queueStartMonoUs = 0;
     int64_t guiUpdateDispatchMonoUs = 0;
@@ -99,26 +101,30 @@ class WebRTCVideoRenderer : public QQuickItem,
     uint64_t generation = 0;
   };
 
-  void RequestRenderPumpUpdate();
-  void QueueRenderPumpUpdate();
-  void EnsureRenderPumpRunning();
-  void StopRenderPump();
+  void PublishMailboxFrameLocked(webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer,
+                                 int64_t queueStartMonoUs, int frameId, bool fromTracking);
+  bool TakeMailboxFrameForRender(int64_t syncStartMonoUs);
+  void ResetRenderSchedulingState();
+  void RequestMailboxRenderUpdate();
+  void QueueMailboxRenderUpdate();
+  void EnsureRenderSchedulingActive();
+  void StopRenderScheduling();
   void OnWindowChanged(QQuickWindow* window);
   void OnBeforeSynchronizing();
   void OnFrameSwapped();
-  bool HasUndeliveredFrame() const;
+  bool HasPendingMailboxFrame() const;
 
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> m_track;
   std::atomic<bool> m_hasVideo{false};
-  std::atomic<bool> m_renderPumpRunning{false};
-  std::atomic<bool> m_renderPumpStartPending{false};
+  std::atomic<bool> m_renderSchedulingActive{false};
+  std::atomic<bool> m_renderSchedulingStartPending{false};
   std::atomic<bool> m_renderUpdateInvokePending{false};
   std::atomic<bool> m_renderUpdatePending{false};
   std::atomic<bool> m_renderFrameInFlight{false};
 
   mutable QMutex m_frameMutex;
-  LatestFrameSlot m_latestFrame;
-  SyncFrameSlot m_syncFrame;
+  MailboxFrameSlot m_mailboxFrame;
+  RenderFrameSlot m_renderFrame;
   int64_t m_renderUpdateDispatchMonoUs = 0;
 
   int m_highlightFrameId = -1;
