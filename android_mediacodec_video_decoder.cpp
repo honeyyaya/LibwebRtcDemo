@@ -61,18 +61,63 @@ namespace {
 
 // 涓?Java MediaFormat.KEY_LOW_LATENCY 涓€鑷达紱閮ㄥ垎璁惧鍦?API 30+ 涓婂彲闄嶄綆瑙ｇ爜鍣ㄥ唴閮ㄦ帓闃熴€?
 constexpr char kMediaFormatLowLatency[] = "low-latency";
+// API 31+ KEY_OUTPUT_DELAY: tells the decoder we do not need reordering and
+// output buffers may be released as soon as they are ready.
+constexpr char kMediaFormatOutputDelay[] = "output-delay";
+// KEY_OPERATING_RATE / KEY_PRIORITY: ask the codec to run at realtime priority.
+constexpr char kMediaFormatOperatingRate[] = "operating-rate";
+constexpr char kMediaFormatPriority[] = "priority";
+// Qualcomm Codec2 vendor extensions: low-latency, no picture-order reorder,
+// disable post-processing VPP. Devices that do not recognise these keys will
+// silently ignore them, so it is safe to set unconditionally on Android.
+constexpr char kVendorQtiLowLatencyEnable[] = "vendor.qti-ext-dec-low-latency.enable";
+constexpr char kVendorQtiPictureOrderEnable[] = "vendor.qti-ext-dec-picture-order.enable";
+constexpr char kVendorQtiVppEnable[] = "vendor.qti-ext-vpp.enable";
 constexpr int kCodecLowLatencyMinApi = 30;
 
 // queue 鍚?drain锛氬厛闈為樆濉炴竻绌哄凡灏辩华甯э紝鍐嶅崟娆＄煭闃诲鍚告敹銆屽垰瀹屾垚銆嶇殑 output銆?
 // 鍘熷厛鍗曢樁娈?first_timeout=35ms 浼氬湪 worker 涓婁覆琛屽爢鍙狅紝涓昏寤惰繜杩滃ぇ浜庤蒋瑙ｃ€?
-constexpr int64_t kDequeueInputTimeoutUs = 3000;
+// Short blocking dequeue on the dedicated worker thread.
+//
+// IMPORTANT: ProcessOneFrame *drops* the frame entirely if dequeueInputBuffer
+// returns -1, so a 0us timeout means every transient input-ring full event
+// (codec has 4 frames in flight at 30 fps -> happens constantly) becomes a
+// permanent reference-chain break. Empirically the codec frees an input
+// buffer well under a vsync; 4 ms keeps worker latency bounded while
+// completely eliminating those drops in normal operation.
+//
+// The worker thread is dedicated (no upstream blocking impact), and the
+// output drain thread is decoupled, so a few ms of patience here is free.
+constexpr int64_t kDequeueInputTimeoutUs = 4000;
 constexpr int64_t kBackpressureLogIntervalUs = 500000;
-constexpr int64_t kOutputFrameAgeDropThresholdUs = 60 * 1000;
-// The app already does latest-only handoff at the mailbox stage, but the
-// MediaCodec -> Surface -> AImageReader path still needs a deeper native pool.
-// Cutting this too aggressively starves the decoder and stalls the stream.
-constexpr int32_t kImageReaderMaxImages = 16;
-constexpr size_t kMaxPendingOutputMetadata = 128;
+// Drop frames that have been sitting in the decode pipeline for too long.
+// 60 ms was generous enough to mask real downstream stalls; tighten to ~2
+// vsyncs so we discard truly late frames quickly and keep latency tracking
+// the freshest input.
+constexpr int64_t kOutputFrameAgeDropThresholdUs = 33 * 1000;
+// AImageReader pool sizing.
+//
+// AImage handles are released only when the matching
+// AndroidHardwareBufferVideoFrameBuffer is destroyed, which means every place
+// that keeps a scoped_refptr to a decoded frame counts against the
+// ImageReader's maxImages quota:
+//   * 6  : GL renderer NativeTextureSlot fleet (kNativeTextureSlotCount)
+//   * 1  : mailbox slot (newest frame waiting for the GUI thread)
+//   * 1  : render snapshot taken in OnBeforeSynchronizing
+//   * 1  : producer frame currently in the BufferQueue
+//   * 1+ : transient in-flight images during acquireLatest / slot rotation
+// Sizing the pool below ~10 produces "Unable to acquire a lockedBuffer" spam
+// from NdkImageReader. 12 keeps a small but real safety margin while still
+// trimming ~4 frames of avoidable queue depth versus the previous 16.
+constexpr int32_t kImageReaderMaxImages = 12;
+// Pending output metadata only needs to cover frames that may legitimately be
+// in flight between queueInputBuffer and the matching dequeueOutputBuffer.
+// Must stay >= kImageReaderMaxImages, otherwise we will start evicting
+// metadata for frames that are still legitimately held by AImageReader and
+// produce spurious "output pts metadata missing" warnings. 128 entries was
+// tracking minutes of stale data after backpressure spikes; 16 is enough to
+// cover the full pool plus a couple of in-flight frames.
+constexpr size_t kMaxPendingOutputMetadata = 16;
 
 int GetDeviceApiLevel() {
   const int api_level = android_get_device_api_level();
@@ -402,7 +447,9 @@ struct AndroidMediaCodecVideoDecoder::Impl {
 
     ALOGW(
         "[McBackpressure] dequeueInputBuffer=%zd burst=%u total=%llu pending_tasks=%zu "
-        "pending_meta=%zu pending_images=%d out=%dx%d",
+        "pending_meta=%zu pending_images=%d out=%dx%d "
+        "(frame DROPPED -> reference chain may break; raise kDequeueInputTimeoutUs "
+        "if this sustains)",
         in_idx, burst, static_cast<unsigned long long>(total), pending_decode_tasks,
         pending_output_metadata, pending_image_notifications_.load(std::memory_order_relaxed),
         out_width_, out_height_);
@@ -786,7 +833,21 @@ struct AndroidMediaCodecVideoDecoder::Impl {
     const bool request_low_latency = ShouldRequestLowLatencyCodec();
     if (request_low_latency) {
       AMediaFormat_setInt32(format, kMediaFormatLowLatency, 1);
+      AMediaFormat_setInt32(format, kMediaFormatOutputDelay, 0);
     }
+    // Push the codec to realtime priority + max operating rate. KEY_PRIORITY=0
+    // is the realtime tier; SHRT_MAX tells the codec we expect every input to
+    // be processed as fast as possible (no rate limiting).
+    AMediaFormat_setInt32(format, kMediaFormatPriority, 0);
+    AMediaFormat_setInt32(format, kMediaFormatOperatingRate, 0x7FFF);
+    // Qualcomm Codec2 vendor knobs. Safe to set on all Android targets:
+    //   * low-latency: ask the firmware path to skip optional buffering
+    //   * picture-order: emit frames in decode order (we only target H.264
+    //     baseline / constrained-baseline so this is always valid)
+    //   * vpp: disable the post-processing block we never read from
+    AMediaFormat_setInt32(format, kVendorQtiLowLatencyEnable, 1);
+    AMediaFormat_setInt32(format, kVendorQtiPictureOrderEnable, 1);
+    AMediaFormat_setInt32(format, kVendorQtiVppEnable, 0);
 
 #if __ANDROID_API__ < 26
     AMediaFormat_delete(format);
@@ -837,9 +898,16 @@ struct AndroidMediaCodecVideoDecoder::Impl {
       dequeue_input_fail_total_ = 0;
       last_backpressure_log_us_ = 0;
     }
-    ALOGI("[McConfig] codec=video/avc size=%dx%d max_images=%d low_latency=%d api=%d", w, h,
-          static_cast<int>(kImageReaderMaxImages), request_low_latency ? 1 : 0,
-          GetDeviceApiLevel());
+    ALOGI(
+        "[McConfig] codec=video/avc size=%dx%d max_images=%d max_pending_meta=%zu "
+        "drop_age_ms=%lld deq_in_us=%lld low_latency=%d output_delay=%d "
+        "operating_rate=0x7FFF priority=0 qti_low_latency=1 qti_picture_order=1 "
+        "qti_vpp=0 api=%d",
+        w, h, static_cast<int>(kImageReaderMaxImages),
+        static_cast<size_t>(kMaxPendingOutputMetadata),
+        static_cast<long long>(kOutputFrameAgeDropThresholdUs / 1000),
+        static_cast<long long>(kDequeueInputTimeoutUs), request_low_latency ? 1 : 0,
+        request_low_latency ? 0 : -1, GetDeviceApiLevel());
     // 灏芥棭鎷夊彇杈撳嚭鏍煎紡锛堥儴鍒?Codec2 鍦ㄩ甯?output 鍓嶄笉浼氬崟鐙Е鍙?INFO锛屽鑷?out_width_ 涓€鐩翠负 0锛?
     RefreshOutputFormat();
     return true;

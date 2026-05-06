@@ -113,7 +113,11 @@ const char* UploadPathKindName(UploadPathKind kind) {
 constexpr int kEncodedIngressPollIntervalMs = 250;
 constexpr int64_t kHighlightSignalThrottleUs = 200000;
 constexpr int64_t kNominalVsyncIntervalUs = 16666;
-constexpr int64_t kStaleMailboxFrameDropUs = kNominalVsyncIntervalUs;
+// Allow a mailbox frame to ride through up to two vsyncs before we treat it
+// as stale. The previous one-vsync limit was too aggressive on mid-range
+// devices: a 1-2 ms vsync miss caused us to drop the freshest frame, which
+// then forced the pipeline to keep an extra frame buffered downstream.
+constexpr int64_t kStaleMailboxFrameDropUs = 2 * kNominalVsyncIntervalUs;
 
 #if defined(WEBRTC_ANDROID)
 constexpr int kNativeTextureSlotCount = 6;
@@ -1768,7 +1772,8 @@ void WebRTCVideoRenderer::RequestMailboxRenderUpdate() {
   if (!m_renderSchedulingActive.load(std::memory_order_acquire) || !hasVideo()) {
     return;
   }
-  if (!window()) {
+  QQuickWindow* const win = window();
+  if (!win) {
     return;
   }
   if (!HasPendingMailboxFrame()) {
@@ -1788,13 +1793,22 @@ void WebRTCVideoRenderer::RequestMailboxRenderUpdate() {
       m_mailboxFrame.guiUpdateDispatchMonoUs = dispatchMonoUs;
     }
   }
+  // QQuickItem::update() only marks this node dirty; on the threaded render
+  // loop the render thread still waits for the next vsync. Calling
+  // QQuickWindow::update() in addition wakes up the window so the render
+  // thread can begin its sync immediately, shaving a vsync off
+  // node_sync_to_upload when the GPU was already idle.
   update();
+  win->update();
 }
 
 void WebRTCVideoRenderer::QueueMailboxRenderUpdate() {
   if (m_renderUpdatePending.load(std::memory_order_acquire)) {
     return;
   }
+  // Fast path: when the publisher is already on the GUI thread, hop straight
+  // into RequestMailboxRenderUpdate() instead of round-tripping through the
+  // event loop. Removes one Qt::QueuedConnection hop from the pacer wait.
   if (QThread::currentThread() == thread()) {
     RequestMailboxRenderUpdate();
     return;
@@ -1855,20 +1869,21 @@ void WebRTCVideoRenderer::OnBeforeSynchronizing() {
     return;
   }
 
-  const auto finishRenderUpdate = [this]() {
-    m_renderUpdatePending.store(false, std::memory_order_release);
-    if (m_renderSchedulingActive.load(std::memory_order_acquire) && hasVideo() &&
-        HasPendingMailboxFrame()) {
-      QueueMailboxRenderUpdate();
-    }
-  };
+  // Clear the pending bit before taking the frame so a concurrent OnFrame
+  // that arrives while we are still in this sync pass can schedule a fresh
+  // update (instead of being suppressed by the old "already pending" bit).
+  m_renderUpdatePending.store(false, std::memory_order_release);
 
   const int64_t syncStartMonoUs = webrtc_demo::DecodeSinkMonotonicUs();
-  if (!TakeMailboxFrameForRender(syncStartMonoUs)) {
-    finishRenderUpdate();
-    return;
+  TakeMailboxFrameForRender(syncStartMonoUs);
+
+  // If a newer mailbox frame already arrived (or arrives between this sync
+  // and the next), re-arm the render update so we do not idle for an extra
+  // vsync.
+  if (m_renderSchedulingActive.load(std::memory_order_acquire) && hasVideo() &&
+      HasPendingMailboxFrame()) {
+    QueueMailboxRenderUpdate();
   }
-  finishRenderUpdate();
 }
 
 bool WebRTCVideoRenderer::HasPendingMailboxFrame() const {

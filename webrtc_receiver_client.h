@@ -3,6 +3,7 @@
 
 #include <QObject>
 #include <QTimer>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -98,6 +99,14 @@ private:
     uint32_t m_prevFramesDropped = 0;
     double m_prevJitterBufferDelay = 0.0;
     uint64_t m_prevJitterBufferEmitted = 0;
+
+    // Keyframe-recovery watchdog state. Tracks the wall-clock timestamp of
+    // the last observed framesDecoded increment plus the matching stats
+    // baseline so we can detect "still receiving packets but no new decoded
+    // frames" stalls without false-positives during bring-up.
+    qint64 m_lastDecodeProgressMonoMs = 0;
+    uint64_t m_lastKeyframeKickPacketsReceived = 0;
+    qint64 m_lastKeyframeKickMonoMs = 0;
 };
 
 #endif

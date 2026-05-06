@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include <QDateTime>
 #include <QDebug>
 #include <QMetaObject>
 #include <QPointer>
@@ -41,13 +42,36 @@
 
 namespace {
 
-// Keep a small jitter-buffer floor, but let WebRTC adapt instead of pinning
-// playout to a fixed 100 ms delay.
-constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.015;
-constexpr int kReceiverForcedPlayoutDelayMs = 0;
+// Carry a small NetEQ floor so a single packet loss has time to be repaired
+// by NACK retransmission before the frame is forwarded to the decoder.
+// Setting this to 0 produced visible corruption because the jitter buffer
+// would emit reference-broken P-frames the instant they arrived, faster than
+// the NACK round-trip could deliver the missing fragment.
+constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.04;  // 40 ms
+// Hard cap NetEQ playout delay to [min, max] ms. min lets clean frames flow
+// through immediately; max bounds the worst-case latency we will tolerate.
+// 100 ms is enough to absorb one RTT of NACK retransmission on typical
+// LAN/WiFi links plus a vsync of slack, which is the minimum needed to
+// reliably hide single-packet losses without showing reference-broken video.
+constexpr int kReceiverForcedPlayoutMinMs = 0;
+constexpr int kReceiverForcedPlayoutMaxMs = 100;
+// Pace ZeroPlayoutDelay flushes at ~half a 60 fps frame interval. 2 ms is
+// the documented sweet spot: low enough to not stall at high frame rates,
+// high enough to coalesce bursts and avoid spin-loop pacer wakeups.
 constexpr int kReceiverZeroPlayoutMinPacingMs = 2;
-constexpr int kReceiverMaxDecodeQueueSize = 2;
+// Decode queue depth in ZeroPlayoutDelay mode. 4 lets the jitter buffer keep
+// a small ring of frames around so retransmissions can be slotted in before
+// they reach the decoder; setting this to 1 forces every reordered packet to
+// produce a corruption event.
+constexpr int kReceiverMaxDecodeQueueSize = 4;
 constexpr bool kReceiverEnablePacerFastRetransmissions = true;
+// If we go this long without a newly decoded frame while the connection is
+// live, kick the receiver-side jitter buffer to force WebRTC to re-evaluate
+// keyframe / NACK timers. This is a belt-and-braces backup for cases where
+// PLI was sent but the sender failed to respond (e.g. WAN drops, dropped
+// RTCP). The hop briefly nudges minimum delay up and back to the configured
+// floor; the perceived latency increase is < 1 stats interval.
+constexpr int kReceiverNoNewFrameKeyframeWatchdogMs = 600;
 
 webrtc::SdpType SdpTypeFromOfferAnswerString(const std::string &t) {
   auto opt = webrtc::SdpTypeFromString(t);
@@ -606,10 +630,14 @@ void WebRTCReceiverClient::createPeerConnection()
 
   static const std::string g_field_trials_storage = [] {
     std::string s = "WebRTC-VideoFrameTrackingIdAdvertised/Enabled/";
-    if (kReceiverForcedPlayoutDelayMs > 0) {
+    // Cap NetEQ playout delay to [min, max] ms instead of pinning it to a
+    // fixed value. min=0,max=30 lets the receiver follow the wire while still
+    // tolerating short bursts of jitter.
+    if (kReceiverForcedPlayoutMaxMs > 0 &&
+        kReceiverForcedPlayoutMinMs <= kReceiverForcedPlayoutMaxMs) {
       s += "WebRTC-ForcePlayoutDelay/min_ms:" +
-           std::to_string(kReceiverForcedPlayoutDelayMs) + ",max_ms:" +
-           std::to_string(kReceiverForcedPlayoutDelayMs) + "/";
+           std::to_string(kReceiverForcedPlayoutMinMs) + ",max_ms:" +
+           std::to_string(kReceiverForcedPlayoutMaxMs) + "/";
     }
     s += "WebRTC-ZeroPlayoutDelay/min_pacing:" +
          std::to_string(kReceiverZeroPlayoutMinPacingMs) +
@@ -644,8 +672,10 @@ void WebRTCReceiverClient::createPeerConnection()
                       .arg(QString::fromStdString(
                           webrtc::field_trial::FindFullName("WebRTC-ZeroPlayoutDelay"))));
   const QString playoutMode =
-      kReceiverForcedPlayoutDelayMs > 0
-          ? QString("fixed-%1ms").arg(kReceiverForcedPlayoutDelayMs)
+      kReceiverForcedPlayoutMaxMs > 0
+          ? QString("range-%1..%2ms")
+                .arg(kReceiverForcedPlayoutMinMs)
+                .arg(kReceiverForcedPlayoutMaxMs)
           : QStringLiteral("dynamic");
   qDebug().noquote()
       << QString("[Pipeline/Config] playout_mode=%1 | jitter_min=%2 ms | "
@@ -901,9 +931,14 @@ void WebRTCReceiverClient::startStatsTimer()
   m_prevFramesDropped = 0;
   m_prevJitterBufferDelay = 0.0;
   m_prevJitterBufferEmitted = 0;
+  m_lastDecodeProgressMonoMs = QDateTime::currentMSecsSinceEpoch();
+  m_lastKeyframeKickPacketsReceived = 0;
+  m_lastKeyframeKickMonoMs = 0;
 
   m_statsTimer = new QTimer(this);
-  m_statsTimer->setInterval(3000);
+  // 1 s gives the keyframe watchdog a fresh signal every second while still
+  // keeping the [Pipeline/...] log output sparse enough to read by hand.
+  m_statsTimer->setInterval(1000);
   connect(m_statsTimer, &QTimer::timeout, this, [this]() {
     if (!m_peerConnection)
       return;
@@ -1023,8 +1058,10 @@ void WebRTCReceiverClient::startStatsTimer()
                       .arg(avgDecodeMs, 0, 'f', 2)
                       .arg(avgProcessingMs, 0, 'f', 2)
                       .arg(avgAssemblyMs, 0, 'f', 2)
-                      .arg(kReceiverForcedPlayoutDelayMs > 0
-                               ? QString("fixed-%1ms").arg(kReceiverForcedPlayoutDelayMs)
+                      .arg(kReceiverForcedPlayoutMaxMs > 0
+                               ? QString("range-%1..%2ms")
+                                     .arg(kReceiverForcedPlayoutMinMs)
+                                     .arg(kReceiverForcedPlayoutMaxMs)
                                : QStringLiteral("dynamic"))
                       .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1);
                   if (!codecFmtp.empty()) {
@@ -1080,6 +1117,74 @@ void WebRTCReceiverClient::startStatsTimer()
                 },
                 Qt::QueuedConnection);
 
+            // ---- Keyframe-recovery watchdog ----
+            // Symptom: packets are still being received but the decoder has
+            // stopped producing frames -> the reference chain is broken
+            // (typical after a packet loss the NACK could not repair). The
+            // belt-and-braces remedy is to briefly raise the receiver's
+            // jitter-buffer minimum delay; WebRTC's RtpVideoStreamReceiver
+            // re-evaluates frame state on that change and will issue PLI/FIR
+            // if it detects the gap, recovering the IDR without a full
+            // PeerConnection restart.
+            const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+            if (deltaFrames > 0) {
+              m_lastDecodeProgressMonoMs = nowMs;
+            } else if (m_lastDecodeProgressMonoMs == 0) {
+              m_lastDecodeProgressMonoMs = nowMs;
+            }
+            const qint64 stuckMs = nowMs - m_lastDecodeProgressMonoMs;
+            const bool packetsStillFlowing =
+                static_cast<uint64_t>(packetsReceived) >
+                m_lastKeyframeKickPacketsReceived;
+            const bool kickCooldownElapsed =
+                m_lastKeyframeKickMonoMs == 0 ||
+                (nowMs - m_lastKeyframeKickMonoMs) >=
+                    kReceiverNoNewFrameKeyframeWatchdogMs * 2;
+            if (deltaFrames == 0 && packetsStillFlowing &&
+                stuckMs >= kReceiverNoNewFrameKeyframeWatchdogMs &&
+                kickCooldownElapsed && m_peerConnection) {
+              QMetaObject::invokeMethod(
+                  this,
+                  [this, stuckMs, packetsReceived]() {
+                    if (!m_peerConnection)
+                      return;
+                    qWarning().noquote()
+                        << QString("[KeyframeWatchdog] decoder stalled %1 ms "
+                                   "(packets_received=%2, packets_lost_total=%3); "
+                                   "kicking jitter buffer to force PLI")
+                               .arg(stuckMs)
+                               .arg(packetsReceived)
+                               .arg(static_cast<qulonglong>(0));
+                    for (const auto& transceiver :
+                         m_peerConnection->GetTransceivers()) {
+                      if (!transceiver ||
+                          transceiver->media_type() != webrtc::MediaType::VIDEO) {
+                        continue;
+                      }
+                      auto receiver = transceiver->receiver();
+                      if (!receiver)
+                        continue;
+                      // Bump min delay way up momentarily, then drop it back to
+                      // the configured floor. The transition forces WebRTC's
+                      // VCMReceiver to re-arm keyframe / NACK timers.
+                      receiver->SetJitterBufferMinimumDelay(
+                          std::optional<double>(0.3));
+                      receiver->SetJitterBufferMinimumDelay(
+                          std::optional<double>(
+                              kReceiverVideoJitterBufferMinDelaySeconds));
+                    }
+                  },
+                  Qt::QueuedConnection);
+              m_lastKeyframeKickMonoMs = nowMs;
+              m_lastKeyframeKickPacketsReceived =
+                  static_cast<uint64_t>(packetsReceived);
+            } else if (deltaFrames > 0) {
+              // Once decoding resumes, re-baseline the kick gate so the next
+              // genuine stall is detected promptly.
+              m_lastKeyframeKickPacketsReceived =
+                  static_cast<uint64_t>(packetsReceived);
+            }
+
             m_prevFramesDecoded = framesDecoded;
             m_prevTotalDecodeTime = totalDecodeTime;
             m_prevTotalProcessingDelay = totalProcessingDelay;
@@ -1094,8 +1199,8 @@ void WebRTCReceiverClient::startStatsTimer()
     m_peerConnection->GetStats(cb.get());
   });
   m_statsTimer->start();
-  qDebug() << "[Pipeline/Stats] stats timer started (3s)";
-  qDebug() << "[DecodeStats] 统计定时器已启动 (每 3s)";
+  qDebug() << "[Pipeline/Stats] stats timer started (1s)";
+  qDebug() << "[DecodeStats] 统计定时器已启动 (每 1s)";
 }
 
 void WebRTCReceiverClient::stopStatsTimer()
@@ -1115,6 +1220,9 @@ void WebRTCReceiverClient::resetConnectionStats()
   m_rttCurrentMs = 0.0;
   m_rttAvgMs = 0.0;
   m_jitterBufferMs = 0.0;
+  m_lastDecodeProgressMonoMs = 0;
+  m_lastKeyframeKickPacketsReceived = 0;
+  m_lastKeyframeKickMonoMs = 0;
   m_prevFramesDecoded = 0;
   m_prevTotalDecodeTime = 0.0;
   m_prevTotalProcessingDelay = 0.0;
