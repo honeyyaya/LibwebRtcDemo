@@ -44,26 +44,26 @@ namespace {
 
 // Carry a small NetEQ floor so a single packet loss has time to be repaired
 // by NACK retransmission before the frame is forwarded to the decoder.
-// Setting this to 0 produced visible corruption because the jitter buffer
-// would emit reference-broken P-frames the instant they arrived, faster than
-// the NACK round-trip could deliver the missing fragment.
-constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.04;  // 40 ms
+// Targeting steady-state jb_avg ~25-35 ms: 20 ms floor lets clean frames
+// glide through quickly while still surviving one short retransmission on
+// a typical LAN / WiFi RTT. Setting this to 0 produced visible corruption.
+constexpr double kReceiverVideoJitterBufferMinDelaySeconds = 0.02;  // 20 ms
 // Hard cap NetEQ playout delay to [min, max] ms. min lets clean frames flow
 // through immediately; max bounds the worst-case latency we will tolerate.
-// 100 ms is enough to absorb one RTT of NACK retransmission on typical
-// LAN/WiFi links plus a vsync of slack, which is the minimum needed to
-// reliably hide single-packet losses without showing reference-broken video.
+// 60 ms is roughly one LAN RTT plus a vsync of slack -- enough headroom for
+// a single NACK retransmission to land before the frame is emitted, while
+// keeping the steady-state target at the low end of the [20, 60] window.
 constexpr int kReceiverForcedPlayoutMinMs = 0;
-constexpr int kReceiverForcedPlayoutMaxMs = 100;
+constexpr int kReceiverForcedPlayoutMaxMs = 60;
 // Pace ZeroPlayoutDelay flushes at ~half a 60 fps frame interval. 2 ms is
 // the documented sweet spot: low enough to not stall at high frame rates,
 // high enough to coalesce bursts and avoid spin-loop pacer wakeups.
 constexpr int kReceiverZeroPlayoutMinPacingMs = 2;
-// Decode queue depth in ZeroPlayoutDelay mode. 4 lets the jitter buffer keep
-// a small ring of frames around so retransmissions can be slotted in before
-// they reach the decoder; setting this to 1 forces every reordered packet to
-// produce a corruption event.
-constexpr int kReceiverMaxDecodeQueueSize = 4;
+// Decode queue depth in ZeroPlayoutDelay mode. 3 keeps the smallest ring
+// that still tolerates a normal amount of out-of-order delivery: 2 frames
+// for the jitter buffer to slot retransmissions into plus 1 for the decoder
+// in flight. Going to 2 here makes any reordered packet a frame drop.
+constexpr int kReceiverMaxDecodeQueueSize = 3;
 constexpr bool kReceiverEnablePacerFastRetransmissions = true;
 // If we go this long without a newly decoded frame while the connection is
 // live, kick the receiver-side jitter buffer to force WebRTC to re-evaluate
@@ -71,7 +71,12 @@ constexpr bool kReceiverEnablePacerFastRetransmissions = true;
 // PLI was sent but the sender failed to respond (e.g. WAN drops, dropped
 // RTCP). The hop briefly nudges minimum delay up and back to the configured
 // floor; the perceived latency increase is < 1 stats interval.
-constexpr int kReceiverNoNewFrameKeyframeWatchdogMs = 600;
+//
+// 300 ms pairs with the 30-35 ms steady-state target: tight enough that the
+// user does not perceive a hard freeze, loose enough that a single jittered
+// frame on a clean network does not trip the watchdog. The cooldown stays
+// at 2x this value (~600 ms) to let the regenerated IDR cross the network.
+constexpr int kReceiverNoNewFrameKeyframeWatchdogMs = 300;
 
 webrtc::SdpType SdpTypeFromOfferAnswerString(const std::string &t) {
   auto opt = webrtc::SdpTypeFromString(t);
