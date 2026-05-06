@@ -65,6 +65,13 @@ constexpr int kReceiverZeroPlayoutMinPacingMs = 2;
 // in flight. Going to 2 here makes any reordered packet a frame drop.
 constexpr int kReceiverMaxDecodeQueueSize = 3;
 constexpr bool kReceiverEnablePacerFastRetransmissions = true;
+// Enable FlexFEC-03 reception. Advertise the codec in our Answer SDP so the
+// sender can opt in, and turn on the receive-side FEC depacketizer. FlexFEC
+// is per-packet redundancy, so it complements (not replaces) NACK and lets
+// us recover single-packet drops without spending an RTT on retransmission.
+// Receiver-side has no downside if the sender does not send FEC; advertise
+// is essentially free.
+constexpr bool kReceiverEnableFlexFec = true;
 // If we go this long without a newly decoded frame while the connection is
 // live, kick the receiver-side jitter buffer to force WebRTC to re-evaluate
 // keyframe / NACK timers. This is a belt-and-braces backup for cases where
@@ -652,6 +659,15 @@ void WebRTCReceiverClient::createPeerConnection()
     if (kReceiverEnablePacerFastRetransmissions) {
       s += "WebRTC-Pacer-FastRetransmissions/Enabled/";
     }
+    if (kReceiverEnableFlexFec) {
+      // -Advertised: include flexfec-03 in the Answer SDP capability list.
+      // Without this trial WebRTC strips FEC codecs from the offer side, so
+      // the sender never sees that we can consume them.
+      s += "WebRTC-FlexFEC-03-Advertised/Enabled/";
+      // (no -Advertised suffix): turn on receive-side FlexFEC depacketization
+      // and recovery. Pairs with the codec advertised above.
+      s += "WebRTC-FlexFEC-03/Enabled/";
+    }
     return s;
   }();
   static bool field_trials_inited = false;
@@ -684,12 +700,13 @@ void WebRTCReceiverClient::createPeerConnection()
           : QStringLiteral("dynamic");
   qDebug().noquote()
       << QString("[Pipeline/Config] playout_mode=%1 | jitter_min=%2 ms | "
-                 "min_pacing=%3 ms | max_decode_queue=%4 | fast_retx=%5")
+                 "min_pacing=%3 ms | max_decode_queue=%4 | fast_retx=%5 | fec=%6")
              .arg(playoutMode)
              .arg(kReceiverVideoJitterBufferMinDelaySeconds * 1000.0, 0, 'f', 1)
              .arg(kReceiverZeroPlayoutMinPacingMs)
              .arg(kReceiverMaxDecodeQueueSize)
-             .arg(kReceiverEnablePacerFastRetransmissions ? "on" : "off");
+             .arg(kReceiverEnablePacerFastRetransmissions ? "on" : "off")
+             .arg(kReceiverEnableFlexFec ? "flexfec-03" : "off");
 
   initWebRTC();
   if (!m_factory) {
