@@ -437,6 +437,7 @@ public:
                 clearHeldFrame();
             }
             m_haveFrameId = false;
+            m_haveGlFrameTrace = false;
             return;
         }
 
@@ -444,6 +445,10 @@ public:
         m_heldFrame = frame;
         m_currentFrameId = frameId;
         m_haveFrameId = true;
+        m_glQueueTraceStartMonoUs = item->lastTakenGlQueueTraceStartMonoUs();
+        m_glQueueTraceFrameId = item->lastTakenGlQueueTraceFrameId();
+        m_glQueueTraceFromTracking = item->lastTakenGlQueueTraceFrameFromTracking();
+        m_haveGlFrameTrace = true;
         demo::latency_trace::recordSync(frameId);
     }
 
@@ -550,21 +555,37 @@ public:
         ++m_renderedFrames;
         if (m_uploadStatsValidForLastFrame &&
             (m_renderedFrames <= 3 || (m_renderedFrames % 600) == 0)) {
-            qInfo().noquote()
-                << QStringLiteral("[RenderPerf] frame=%1 upload=%2 ms draw=%3 ms total=%4 ms path=%5")
-                       .arg(m_currentFrameId)
-                       .arg(m_lastUploadUs / 1000.0, 0, 'f', 3)
-                       .arg(drawUs / 1000.0, 0, 'f', 3)
-                       .arg((m_lastUploadUs + drawUs) / 1000.0, 0, 'f', 3)
-                       .arg(m_nativePath == NativeFramePath::ExternalOes
-                                ? QStringLiteral("OES")
-                                : (m_nativePath == NativeFramePath::HardwareBufferEglImage
-                                       ? QStringLiteral("AHB")
-                                       : (m_frameFormat == RFLOW_CODEC_NV12 ? QStringLiteral("NV12")
-                                                                            : QStringLiteral("I420"))));
         }
 
         releaseSamplingAfterDraw();
+
+        /// 端到端渲染采样：与新 Demo 的 tracking_id mod 120 路径同源——按本帧 frame_id 采样，
+        /// 计算 wall(presentFrame→render结束) 与 总(SDK 回调→render结束)，并把样本投到 GUI 线程
+        /// 驱动 sampledPipelineLine。日志使用 latency_trace 的同源单调钟，渲染线程不阻塞 UI。
+        if (m_uploadStatsValidForLastFrame && m_haveGlFrameTrace && m_glQueueTraceFromTracking) {
+            const quint32 fid = static_cast<quint32>(std::max(0, m_glQueueTraceFrameId));
+            if (m_renderedFrames <= 5 || (fid % 120) == 0) {
+                const qint64 nowUs = demo::latency_trace::monotonicUs();
+                const qint64 wallFromQueueUs = nowUs - m_glQueueTraceStartMonoUs;
+                const qint64 sumUploadDrawUs = m_lastUploadUs + drawUs;
+                qint64 sdkCallbackUs = 0;
+                double decodeToRenderMs = -1.0;
+                if (demo::latency_trace::peekSdkCallbackUs(fid, &sdkCallbackUs) &&
+                    sdkCallbackUs > 0) {
+                    decodeToRenderMs = (nowUs - sdkCallbackUs) / 1000.0;
+                }
+                const QString decodeToRenderStr = decodeToRenderMs >= 0.0
+                                                      ? QString::number(decodeToRenderMs, 'f', 3)
+                                                      : QStringLiteral("—");
+                if (m_videoItem) {
+                    QMetaObject::invokeMethod(
+                        m_videoItem, "applySampledPipelineUi", Qt::QueuedConnection,
+                        Q_ARG(int, m_glQueueTraceFrameId), Q_ARG(double, decodeToRenderMs),
+                        Q_ARG(double, wallFromQueueUs / 1000.0));
+                }
+            }
+        }
+        m_haveGlFrameTrace = false;
 
         if (m_haveFrameId) {
             demo::latency_trace::recordRender(m_currentFrameId);
@@ -1273,6 +1294,13 @@ private:
     qint64 m_lastUploadUs = 0;
     bool m_uploadStatsValidForLastFrame = false;
     quint64 m_renderedFrames = 0;
+
+    /// QSGRenderNode 仅在 sync()/render() 同一线程读写——sync 时由 WebRTCVideoRenderer::lastTakenXxx 拷入，
+    /// render 末尾消费一次后置 m_haveGlFrameTrace=false，避免对同一帧重复采样。
+    qint64 m_glQueueTraceStartMonoUs = 0;
+    int m_glQueueTraceFrameId = -1;
+    bool m_glQueueTraceFromTracking = false;
+    bool m_haveGlFrameTrace = false;
 };
 
 }  // namespace
@@ -1294,6 +1322,8 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
         return;
     }
 
+    const qint64 presentEntryUs = demo::latency_trace::monotonicUs();
+
     const uint32_t width = librflow_video_frame_get_width(frame);
     const uint32_t height = librflow_video_frame_get_height(frame);
     const quint32 frameId = librflow_video_frame_get_seq(frame);
@@ -1301,6 +1331,13 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
         librflow_video_frame_release(frame);
         return;
     }
+
+    /// 数据量提示：原生帧（OES/AHardwareBuffer）走纹理路径，没有 CPU 平面字节数；CPU 平面则估算 1.5*width*height。
+    const rflow_native_handle_type_t handleForLog = librflow_video_frame_get_native_handle_type(frame);
+    const rflow_codec_t codecForLog = librflow_video_frame_get_codec(frame);
+    const bool isNativeFrame =
+        librflow_video_frame_get_backend(frame) == RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL ||
+        librflow_video_frame_get_backend(frame) == RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER;
 
     bool highlightChanged = false;
     bool shouldRequestUpdate = false;
@@ -1311,15 +1348,20 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
         }
         m_pendingFrame = frame;
         m_pendingValid = true;
+        m_pendingGlQueueTraceStartMonoUs = presentEntryUs;
+        m_pendingGlQueueTraceFrameId = static_cast<int>(frameId);
+        /// SDK 侧 librflow_video_frame_get_seq 永远返回有效自增序号，等价于 tracking_id 路径。
+        m_pendingGlQueueTraceFromTracking = true;
         if (!m_updatePending) {
             m_updatePending = true;
             shouldRequestUpdate = true;
         }
-        if (m_highlightFrameId != static_cast<int>(frameId) || m_frameIdFromTracking) {
+        if (m_highlightFrameId != static_cast<int>(frameId)) {
             m_highlightFrameId = static_cast<int>(frameId);
-            m_frameIdFromTracking = false;
             highlightChanged = true;
         }
+        m_lastPresentMonoUs = presentEntryUs;
+        ++m_presentCount;
     }
 
     demo::latency_trace::recordPresent(frameId, static_cast<int>(width), static_cast<int>(height));
@@ -1333,6 +1375,21 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
     }
     if (shouldRequestUpdate) {
         update();
+    }
+
+    if (m_presentCount <= 5 || (frameId % 120) == 0) {
+        QString dataHint;
+        if (isNativeFrame) {
+            dataHint = (handleForLog == RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE)
+                           ? QStringLiteral("OES/kNative 纹理")
+                           : QStringLiteral("AHardwareBuffer 纹理");
+        } else if (codecForLog == RFLOW_CODEC_NV12) {
+            dataHint = QStringLiteral("NV12 双平面 ~%1 KB")
+                           .arg(static_cast<qint64>(width) * height * 3 / 2 / 1024);
+        } else {
+            dataHint = QStringLiteral("I420 三平面 ~%1 KB")
+                           .arg(static_cast<qint64>(width) * height * 3 / 2 / 1024);
+        }
     }
 }
 
@@ -1348,7 +1405,14 @@ void WebRTCVideoRenderer::clearVideoTrack()
         m_pendingValid = false;
         m_updatePending = false;
         m_highlightFrameId = -1;
-        m_frameIdFromTracking = false;
+        m_pendingGlQueueTraceStartMonoUs = 0;
+        m_pendingGlQueueTraceFrameId = -1;
+        m_pendingGlQueueTraceFromTracking = false;
+        m_lastTakenGlQueueTraceStartMonoUs = 0;
+        m_lastTakenGlQueueTraceFrameId = -1;
+        m_lastTakenGlQueueTraceFromTracking = false;
+        m_lastPresentMonoUs = 0;
+        m_presentCount = 0;
     }
 
     m_hasVideo = false;
@@ -1356,8 +1420,6 @@ void WebRTCVideoRenderer::clearVideoTrack()
         Q_EMIT hasVideoChanged();
     }
     Q_EMIT highlightFrameIdChanged();
-    Q_EMIT encodedIngressTrackingChanged();
-
     if (m_hasSampledPipelineUi) {
         m_sampledHighlightFrameId = -1;
         m_sampledDecodeToRenderMs = -1.0;
@@ -1373,21 +1435,6 @@ int WebRTCVideoRenderer::highlightFrameId() const
 {
     QMutexLocker locker(&m_frameMutex);
     return m_highlightFrameId;
-}
-
-bool WebRTCVideoRenderer::frameIdFromTracking() const
-{
-    QMutexLocker locker(&m_frameMutex);
-    return m_frameIdFromTracking;
-}
-
-void WebRTCVideoRenderer::setTraceTargetFrameId(int id)
-{
-    if (m_traceTargetFrameId == id) {
-        return;
-    }
-    m_traceTargetFrameId = id;
-    Q_EMIT traceTargetFrameIdChanged();
 }
 
 QString WebRTCVideoRenderer::sampledPipelineLine() const
@@ -1462,5 +1509,9 @@ bool WebRTCVideoRenderer::takeFrame(librflow_video_frame_t &outFrame, quint32 &o
     m_pendingFrame = nullptr;
     outFrameId = static_cast<quint32>(m_highlightFrameId >= 0 ? m_highlightFrameId : 0);
     m_pendingValid = false;
+    /// 把 presentFrame 投入时记下的 trace 三元组拷给 QSGRenderNode（仅 sync 之后立刻读）。
+    m_lastTakenGlQueueTraceStartMonoUs = m_pendingGlQueueTraceStartMonoUs;
+    m_lastTakenGlQueueTraceFrameId = m_pendingGlQueueTraceFrameId;
+    m_lastTakenGlQueueTraceFromTracking = m_pendingGlQueueTraceFromTracking;
     return true;
 }

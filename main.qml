@@ -125,105 +125,73 @@ Window {
                     }
                 }
 
+                Timer {
+                    id: statsHudTimer
+                    interval: 1000
+                    repeat: true
+                    triggeredOnStart: true
+                    running: receiverClient.hasConnectionStats
+                             || receiverClient.hasDecodeJitterBuffer
+                             || videoRenderer.hasVideo
+                             || videoRenderer.hasSampledPipelineUi
+                    onTriggered: {
+                        let block = receiverClient.overlayTelemetryText()
+                        if (videoRenderer.hasSampledPipelineUi)
+                            block += "\n" + videoRenderer.sampledPipelineLine
+                        videoHud.statsText = block
+                    }
+                }
+
+                Rectangle {
+                    id: videoHud
+                    property string statsText: ""
+
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.margins: 8
+                    width: Math.min(parent.width - 16, 360)
+                    height: Math.max(hudLabel.contentHeight + 12, 40)
+                    radius: 6
+                    color: "#CC0B1220"
+                    border.width: 1
+                    border.color: "#334155"
+                    visible: statsHudTimer.running
+                             && (receiverClient.hasConnectionStats
+                                 || receiverClient.hasDecodeJitterBuffer
+                                 || videoRenderer.hasVideo
+                                 || videoRenderer.hasSampledPipelineUi)
+
+                    Text {
+                        id: hudLabel
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 6
+                        text: videoHud.statsText
+                        font.pixelSize: 11
+                        font.family: "monospace"
+                        color: "#E2E8F0"
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
                 // 帧 ID：青色=仅编码入站（与 log 一致，解码失败时仍有）；绿/橙=解码后 VideoFrame::id()
                 Rectangle {
                     anchors.fill: parent
                     anchors.margins: 1
                     radius: 10
                     color: "transparent"
-                    border.width: (videoRenderer.hasEncodedIngressTracking
-                                   || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)) ? 2 : 0
+                    border.width: (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0) ? 2 : 0
                     border.color: (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
-                                  ? (videoRenderer.frameIdFromTracking ? "#22C55E" : "#F59E0B")
-                                  : (videoRenderer.hasEncodedIngressTracking ? "#06B6D4" : "#00000000")
-                    visible: videoRenderer.hasEncodedIngressTracking || videoRenderer.hasVideo
-                }
-
-                Rectangle {
-                    anchors.bottom: parent.bottom
-                    anchors.left: parent.left
-                    anchors.margins: 10
-                    implicitWidth:Math.max(bufferline.implicitWidth,rttline.implicitWidth,idPipeline.implicitWidth) + 16
-                    implicitHeight: idColumn.implicitHeight + 16
-                    radius: 4
-                    color: "#B3000000"
-                    visible: videoRenderer.hasEncodedIngressTracking
-                             || (videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0)
-                             || videoRenderer.hasSampledPipelineUi
-                    Row {
-                        id: idColumn
-                        anchors.centerIn: parent
-                        spacing: 4
-                        // Text {
-                        //     id: idIngress
-                        //     width: Math.min(280, root.width - 64)
-                        //     visible: videoRenderer.hasEncodedIngressTracking
-                        //     wrapMode: Text.WordWrap
-                        //     text: "编码入站 ID: " + videoRenderer.encodedIngressTrackingId
-                        //           + "（Decode 路径，与 logcat EncodedFrame 一致）"
-                        //     font.pixelSize: 11
-                        //     font.bold: true
-                        //     color: "#A5F3FC"
-                        // }
-                        // Text {
-                        //     id: idDecoded
-                        //     width: Math.min(280, root.width - 64)
-                        //     visible: videoRenderer.hasVideo && videoRenderer.highlightFrameId >= 0
-                        //     wrapMode: Text.WordWrap
-                        //     text: !videoRenderer.hasVideo || videoRenderer.highlightFrameId < 0
-                        //           ? ""
-                        //           : (videoRenderer.frameIdFromTracking
-                        //              ? ("解码帧 ID: " + videoRenderer.highlightFrameId)
-                        //              : ("解码预览 #" + videoRenderer.highlightFrameId))
-                        //     font.pixelSize: 11
-                        //     font.bold: videoRenderer.frameIdFromTracking
-                        //     color: videoRenderer.frameIdFromTracking ? "#BBF7D0" : "#FDE68A"
-                        // }
-                        Text {
-                            id: idPipeline
-                            width: Math.min(280, root.width - 64)
-                            visible: videoRenderer.hasSampledPipelineUi
-                            wrapMode: Text.WordWrap
-                            text: videoRenderer.sampledPipelineLine
-                            font.pixelSize: 11
-                            font.bold: true
-                            color: "#93C5FD"
-                        }
-
-                        Text {
-                            id:bufferline
-                            Layout.fillWidth: true
-                            font.pixelSize: 11
-                            font.family: "monospace"
-                            color: "#9CA3AF"
-                            wrapMode: Text.WordWrap
-                            text: receiverClient.hasConnectionStats
-                                  ? ("抖动缓冲(帧平均): "
-                                     + receiverClient.jitterBufferMs.toFixed(1) + " ms")
-                                  : "抖动缓冲(帧平均): —"
-                        }
-                        Text {
-                            id:rttline
-                            Layout.fillWidth: true
-                            font.pixelSize: 11
-                            font.family: "monospace"
-                            color: "#9CA3AF"
-                            wrapMode: Text.WordWrap
-                            text: receiverClient.hasConnectionStats
-                                  ? ("RTT 当前: " + receiverClient.rttCurrentMs.toFixed(1) + " ms"
-                                     + "  |  平均: " + receiverClient.rttAvgMs.toFixed(1) + " ms")
-                                  : "RTT 当前 / 平均: —"
-                        }
-                    }
-
-
+                                  ? "#F59E0B" : "#00000000"
+                    visible: videoRenderer.hasVideo
                 }
 
                 Column {
                     anchors.centerIn: parent
                     width: parent.width - 24
                     spacing: 6
-                    visible: !videoRenderer.hasVideo && !videoRenderer.hasEncodedIngressTracking
+                    visible: !videoRenderer.hasVideo
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: "视频将在此显示"

@@ -8,6 +8,9 @@
 #include <QPointer>
 #include <QMutexLocker>
 
+#include <cstdio>
+#include <cmath>
+
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
 #endif
@@ -15,6 +18,111 @@
 #ifndef DEFAULT_SIGNALING_ADDR
 #define DEFAULT_SIGNALING_ADDR "192.168.3.20:8765"
 #endif
+
+static const char *rflowLogLevelTag(rflow_log_level_t level)
+{
+    switch (level) {
+    case RFLOW_LOG_TRACE:
+        return "TRACE";
+    case RFLOW_LOG_DEBUG:
+        return "DEBUG";
+    case RFLOW_LOG_INFO:
+        return "INFO";
+    case RFLOW_LOG_WARN:
+        return "WARN";
+    case RFLOW_LOG_ERROR:
+        return "ERROR";
+    case RFLOW_LOG_FATAL:
+        return "FATAL";
+    default:
+        return "?";
+    }
+}
+
+/** 解析 SDK DEBUG [DecodeStats] 行内的「抖动缓冲: X.Y ms」（UTF-8 文本） */
+static bool decodeStatsExtractJitterBufferMs(const QString &line, double *outMs)
+{
+    if (!outMs || !line.contains(QLatin1String("[DecodeStats]"))) {
+        return false;
+    }
+    const QString marker = QStringLiteral("抖动缓冲:");
+    const qsizetype idx = line.indexOf(marker);
+    if (idx < 0) {
+        return false;
+    }
+    QStringView rest = QStringView{line}.mid(idx + marker.size()).trimmed();
+    QString num;
+    for (const QChar ch : rest) {
+        if ((ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) || ch == QLatin1Char('.')) {
+            num.append(ch);
+        } else if (!num.isEmpty()) {
+            break;
+        }
+    }
+    if (num.isEmpty()) {
+        return false;
+    }
+    bool ok = false;
+    const double v = num.toDouble(&ok);
+    if (!ok || !std::isfinite(v) || v < 0.0) {
+        return false;
+    }
+    *outMs = v;
+    return true;
+}
+
+static void tryDispatchDecodeJitterBuffer(WebRTCReceiverClient *rcv, const char *utf8Msg)
+{
+    if (!rcv || !utf8Msg) {
+        return;
+    }
+    double ms = 0.0;
+    if (!decodeStatsExtractJitterBufferMs(QString::fromUtf8(utf8Msg), &ms)) {
+        return;
+    }
+    /* log 可能在非 Qt 线程，投递到 Receiver 线程更新属性 */
+    (void) QMetaObject::invokeMethod(
+        rcv,
+        "applyDecodePipelineJitterBufferMs",
+        Qt::QueuedConnection,
+        Q_ARG(double, ms));
+}
+
+extern "C" {
+
+static void rflowConsoleLogCallback(rflow_log_level_t level, const char *msg, void *userdata)
+{
+    /* 必须使用完整指针 msg：*msg 只是首字符 char，若以 '[' 开头会永远只打印 "[" */
+    const char *text = msg ? msg : "";
+    auto *rcv = static_cast<WebRTCReceiverClient *>(userdata);
+    tryDispatchDecodeJitterBuffer(rcv, text);
+#if defined(Q_OS_ANDROID)
+    const QString payload = QString::fromUtf8(text);
+    const QString prefix =
+        QStringLiteral("[RoboFlow/%1]").arg(QString::fromLatin1(rflowLogLevelTag(level)));
+    switch (level) {
+    case RFLOW_LOG_WARN:
+        qWarning().noquote() << prefix << payload;
+        break;
+    case RFLOW_LOG_ERROR:
+    case RFLOW_LOG_FATAL:
+        qCritical().noquote() << prefix << payload;
+        break;
+    case RFLOW_LOG_TRACE:
+    case RFLOW_LOG_DEBUG:
+        qDebug().noquote() << prefix << payload;
+        break;
+    default:
+        qInfo().noquote() << prefix << payload;
+        break;
+    }
+#else
+    std::fprintf(stderr, "[RFlow/%s] %s\n", rflowLogLevelTag(level), text);
+    std::fflush(stderr);
+#endif
+}
+
+} // extern "C"
 
 namespace {
 
@@ -143,7 +251,7 @@ QString errorToString(rflow_err_t err)
 WebRTCReceiverClient::WebRTCReceiverClient(QObject *parent)
     : QObject(parent)
 {
-    m_statsPollTimer.setInterval(3000);
+    m_statsPollTimer.setInterval(1000);
     connect(&m_statsPollTimer, &QTimer::timeout, this, &WebRTCReceiverClient::pollStreamStats);
 }
 
@@ -224,6 +332,68 @@ void WebRTCReceiverClient::connectToSignaling(const QString &addr)
     Q_EMIT statusChanged(QStringLiteral("SDK 已连接，等待视频流..."));
 }
 
+void WebRTCReceiverClient::applyDecodePipelineJitterBufferMs(double ms)
+{
+    if (!std::isfinite(ms) || ms < 0.0) {
+        return;
+    }
+    if (m_hasDecodeJitterBuffer && qFuzzyCompare(m_decodeJitterBufferMs, ms)) {
+        return;
+    }
+    m_decodeJitterBufferMs = ms;
+    m_hasDecodeJitterBuffer = true;
+    Q_EMIT connectionStatsChanged();
+}
+
+QString WebRTCReceiverClient::overlayTelemetryText() const
+{
+    QString t;
+    const uint32_t w = m_lastFrameWidth.load(std::memory_order_relaxed);
+    const uint32_t h = m_lastFrameHeight.load(std::memory_order_relaxed);
+    if (w > 0 && h > 0) {
+        t += QStringLiteral("分辨率：%1×%2\n").arg(w).arg(h);
+    } else {
+        t += QStringLiteral("分辨率：—\n");
+    }
+
+    if (m_hasConnectionStats) {
+        t += QStringLiteral("帧率：%1 fps\n").arg(m_statsFps, 0, 'f', 1);
+        if (m_statsBitrateKbps >= 1000.0) {
+            t += QStringLiteral("码率：%1 Mbps\n").arg(m_statsBitrateKbps / 1000.0, 0, 'f', 2);
+        } else {
+            t += QStringLiteral("码率：%1 Kbps\n").arg(m_statsBitrateKbps, 0, 'f', 0);
+        }
+    } else {
+        t += QStringLiteral("帧率：—\n码率：—\n");
+    }
+
+    if (m_hasDecodeJitterBuffer) {
+        t += QStringLiteral("抖动缓存：%1 ms\n").arg(m_decodeJitterBufferMs, 0, 'f', 1);
+    } else {
+        t += QStringLiteral("抖动缓存：—\n");
+    }
+
+    if (m_hasConnectionStats) {
+        t += QStringLiteral("RTT：%1 ms\n").arg(m_rttCurrentMs, 0, 'f', 1);
+        t += QStringLiteral("网络抖动(RTCP)：%1 ms\n").arg(m_statsNetworkJitterMs, 0, 'f', 1);
+        const quint64 denom = static_cast<quint64>(m_statsInboundPkts) + static_cast<quint64>(m_statsLostPkts);
+        double lossPct = 0.0;
+        if (denom > 0) {
+            lossPct = (100.0 * static_cast<double>(m_statsLostPkts)) / static_cast<double>(denom);
+        }
+        t += QStringLiteral("丢包率：%1%  （丢失 %2 / 收包 %3）\n")
+                 .arg(lossPct, 0, 'f', 2)
+                 .arg(m_statsLostPkts)
+                 .arg(m_statsInboundPkts);
+        t += QStringLiteral("卡顿帧：%1  解码失败：%2\n").arg(m_statsFreezeCount).arg(m_statsDecodeFailCount);
+        t += QStringLiteral("统计时长：%1 s\n").arg(QString::number(m_statsDurationMs / 1000.0, 'f', 1));
+    } else {
+        t += QStringLiteral("RTT：—\n网络抖动(RTCP)：—\n丢包率：—\n卡顿／解码失败：—\n统计时长：—\n");
+    }
+
+    return t.trimmed();
+}
+
 void WebRTCReceiverClient::disconnect()
 {
     m_statsPollTimer.stop();
@@ -236,8 +406,8 @@ void WebRTCReceiverClient::disconnect()
     m_hasReceivedVideoFrame = false;
     m_hasReceivedVideoCallback = false;
     m_hasReportedRendererMissing = false;
-    m_lastFrameWidth = 0;
-    m_lastFrameHeight = 0;
+    m_lastFrameWidth.store(0, std::memory_order_relaxed);
+    m_lastFrameHeight.store(0, std::memory_order_relaxed);
     demo::latency_trace::reset();
 
     if (m_videoSink) {
@@ -334,13 +504,15 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
     }
 
     const quint32 frameId = librflow_video_frame_get_seq(frame);
-    self->m_lastFrameWidth = librflow_video_frame_get_width(frame);
-    self->m_lastFrameHeight = librflow_video_frame_get_height(frame);
+    const uint32_t fw = librflow_video_frame_get_width(frame);
+    const uint32_t fh = librflow_video_frame_get_height(frame);
+    self->m_lastFrameWidth.store(fw, std::memory_order_relaxed);
+    self->m_lastFrameHeight.store(fh, std::memory_order_relaxed);
     demo::latency_trace::recordSdkCallback(frameId,
                                            librflow_video_frame_get_pts_ms(frame),
                                            librflow_video_frame_get_utc_ms(frame),
-                                           self->m_lastFrameWidth,
-                                           self->m_lastFrameHeight,
+                                           fw,
+                                           fh,
                                            librflow_video_frame_get_data_size(frame));
 
     if (!self->m_hasReceivedVideoCallback) {
@@ -380,30 +552,6 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
     self->schedulePendingFrameDelivery();
 }
 
-void WebRTCReceiverClient::onStreamStatsThunk(librflow_stream_stats_t stats, void *userdata)
-{
-    auto *self = static_cast<WebRTCReceiverClient *>(userdata);
-    if (!self || !stats) {
-        return;
-    }
-
-    librflow_stream_stats_t retained = librflow_stream_stats_retain(stats);
-    if (!retained) {
-        return;
-    }
-
-    QPointer<WebRTCReceiverClient> guard(self);
-    QMetaObject::invokeMethod(
-        self,
-        [guard, retained]() {
-            if (guard) {
-                guard->handleStreamStats(retained);
-            }
-            librflow_stream_stats_release(retained);
-        },
-        Qt::QueuedConnection);
-}
-
 rflow_err_t WebRTCReceiverClient::configureAndInitSdk(const QString &addr)
 {
     qInfo().noquote() << QStringLiteral("[RFlowInit] configure signal=%1").arg(effectiveSignalAddr(addr));
@@ -441,6 +589,8 @@ rflow_err_t WebRTCReceiverClient::configureAndInitSdk(const QString &addr)
     err = librflow_init();
     if (err == RFLOW_OK) {
         m_sdkInitialized = true;
+        (void) librflow_log_set_level(RFLOW_LOG_DEBUG);
+        (void) librflow_log_set_callback(rflowConsoleLogCallback, this);
         qInfo() << "[RFlowInit] librflow_init ok";
     } else {
         qWarning().noquote() << QStringLiteral("[RFlowInit] librflow_init failed err=%1").arg(err);
@@ -564,6 +714,7 @@ void WebRTCReceiverClient::cleanupSdk()
     }
     if (m_sdkInitialized) {
         qInfo() << "[RFlowInit] uninit sdk";
+        (void) librflow_log_set_callback(nullptr, nullptr);
         librflow_uninit();
         m_sdkInitialized = false;
     }
@@ -642,37 +793,28 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
     }
 
     const uint32_t durationMs = librflow_stream_stats_get_duration_ms(stats);
-    const uint64_t inboundBytes = librflow_stream_stats_get_in_bound_bytes(stats);
     const uint64_t inboundPkts = librflow_stream_stats_get_in_bound_pkts(stats);
     const uint32_t lostPkts = librflow_stream_stats_get_lost_pkts(stats);
     const uint32_t bitrateKbps = librflow_stream_stats_get_bitrate_kbps(stats);
     const uint32_t rttMs = librflow_stream_stats_get_rtt_ms(stats);
     const uint32_t fps = librflow_stream_stats_get_fps(stats);
     const uint32_t jitterMs = librflow_stream_stats_get_jitter_ms(stats);
+    /* 解码管线「抖动缓存」由 SDK [DecodeStats] 日志投递至 applyDecodePipelineJitterBufferMs，不设 stream_stats。 */
     const uint32_t freezeCount = librflow_stream_stats_get_freeze_count(stats);
     const uint32_t decodeFailCount = librflow_stream_stats_get_decode_fail_count(stats);
 
+    m_statsDurationMs = durationMs;
+    m_statsInboundPkts = inboundPkts;
+    m_statsLostPkts = lostPkts;
+    m_statsFps = static_cast<double>(fps);
+    m_statsBitrateKbps = static_cast<double>(bitrateKbps);
+    m_statsNetworkJitterMs = static_cast<double>(jitterMs);
+    m_statsFreezeCount = freezeCount;
+    m_statsDecodeFailCount = decodeFailCount;
+
     m_rttCurrentMs = static_cast<double>(rttMs);
-    m_rttAvgMs = m_rttCurrentMs;
-    m_jitterBufferMs = static_cast<double>(jitterMs);
     m_hasConnectionStats = true;
 
-    qInfo().noquote()
-        << QStringLiteral("[RFlowStats] resolution=%1x%2 fps=%3 bitrate_kbps=%4 webrtc_buffer_ms=%5 "
-                          "rtt_ms=%6 lost_pkts=%7 inbound_bytes=%8 inbound_pkts=%9 freeze_count=%10 "
-                          "decode_fail_count=%11 duration_ms=%12")
-               .arg(m_lastFrameWidth)
-               .arg(m_lastFrameHeight)
-               .arg(fps)
-               .arg(bitrateKbps)
-               .arg(jitterMs)
-               .arg(rttMs)
-               .arg(lostPkts)
-               .arg(inboundBytes)
-               .arg(inboundPkts)
-               .arg(freezeCount)
-               .arg(decodeFailCount)
-               .arg(durationMs);
 
     Q_EMIT connectionStatsChanged();
 }
@@ -833,18 +975,21 @@ void WebRTCReceiverClient::clearPendingFrame()
 void WebRTCReceiverClient::resetConnectionStats()
 {
     m_rttCurrentMs = 0.0;
-    m_rttAvgMs = 0.0;
-    m_jitterBufferMs = 0.0;
-    if (m_hasConnectionStats) {
-        m_hasConnectionStats = false;
+    m_decodeJitterBufferMs = 0.0;
+    m_statsFps = 0.0;
+    m_statsBitrateKbps = 0.0;
+    m_statsNetworkJitterMs = 0.0;
+    m_statsDurationMs = 0;
+    m_statsInboundPkts = 0;
+    m_statsLostPkts = 0;
+    m_statsFreezeCount = 0;
+    m_statsDecodeFailCount = 0;
+    const bool had = m_hasConnectionStats || m_hasDecodeJitterBuffer;
+    m_hasConnectionStats = false;
+    m_hasDecodeJitterBuffer = false;
+    if (had) {
         Q_EMIT connectionStatsChanged();
     }
-}
-
-void WebRTCReceiverClient::emitStatus(const QString &status)
-{
-    qInfo().noquote() << QStringLiteral("[RFlowStatus] %1").arg(status);
-    Q_EMIT statusChanged(status);
 }
 
 QString WebRTCReceiverClient::formatSdkError(const QString &prefix, rflow_err_t err) const

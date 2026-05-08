@@ -1,6 +1,8 @@
 #ifndef WEBRTC_RECEIVER_CLIENT_H
 #define WEBRTC_RECEIVER_CLIENT_H
 
+#include <atomic>
+
 #include <QObject>
 #include <QMutex>
 #include <QString>
@@ -18,8 +20,8 @@ class WebRTCReceiverClient : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(double rttCurrentMs READ rttCurrentMs NOTIFY connectionStatsChanged)
-    Q_PROPERTY(double rttAvgMs READ rttAvgMs NOTIFY connectionStatsChanged)
-    Q_PROPERTY(double jitterBufferMs READ jitterBufferMs NOTIFY connectionStatsChanged)
+    Q_PROPERTY(double decodeJitterBufferMs READ decodeJitterBufferMs NOTIFY connectionStatsChanged)
+    Q_PROPERTY(bool hasDecodeJitterBuffer READ hasDecodeJitterBuffer NOTIFY connectionStatsChanged)
     Q_PROPERTY(bool hasConnectionStats READ hasConnectionStats NOTIFY connectionStatsChanged)
     Q_PROPERTY(QString deviceId READ deviceId WRITE setDeviceId NOTIFY deviceIdChanged)
     Q_PROPERTY(QString deviceSecret READ deviceSecret WRITE setDeviceSecret NOTIFY deviceSecretChanged)
@@ -29,8 +31,8 @@ public:
     ~WebRTCReceiverClient() override;
 
     double rttCurrentMs() const { return m_rttCurrentMs; }
-    double rttAvgMs() const { return m_rttAvgMs; }
-    double jitterBufferMs() const { return m_jitterBufferMs; }
+    double decodeJitterBufferMs() const { return m_decodeJitterBufferMs; }
+    bool hasDecodeJitterBuffer() const { return m_hasDecodeJitterBuffer; }
     bool hasConnectionStats() const { return m_hasConnectionStats; }
 
     QString deviceId() const { return m_deviceId; }
@@ -49,6 +51,12 @@ public:
     Q_INVOKABLE void setVideoRenderer(QObject *renderer);
     Q_INVOKABLE void setVideoSink(QObject *sink);
 
+    /** 仅供 SDK log 线程通过 QMetaObject 投递解码「抖动缓冲」数值（Parse [DecodeStats]） */
+    Q_INVOKABLE void applyDecodePipelineJitterBufferMs(double ms);
+
+    /** 左上角 HUD 文本（建议在 QML 中约 1s 刷新读取） */
+    Q_INVOKABLE QString overlayTelemetryText() const;
+
 Q_SIGNALS:
     void statusChanged(const QString &status);
     void connectionStatsChanged();
@@ -65,8 +73,6 @@ private:
     static void onVideoFrameThunk(librflow_stream_handle_t handle,
                                   librflow_video_frame_t frame,
                                   void *userdata);
-    static void onStreamStatsThunk(librflow_stream_stats_t stats, void *userdata);
-
     rflow_err_t configureAndInitSdk(const QString &addr);
     rflow_err_t connectSdk();
     rflow_err_t openStream();
@@ -81,7 +87,6 @@ private:
     void pollStreamStats();
     void clearPendingFrame();
     void resetConnectionStats();
-    void emitStatus(const QString &status);
     QString formatSdkError(const QString &prefix, rflow_err_t err) const;
 
     QObject *m_videoRenderer = nullptr;
@@ -103,12 +108,22 @@ private:
     bool m_hasReceivedVideoFrame = false;
     bool m_hasReceivedVideoCallback = false;
     bool m_hasReportedRendererMissing = false;
-    uint32_t m_lastFrameWidth = 0;
-    uint32_t m_lastFrameHeight = 0;
+    std::atomic<uint32_t> m_lastFrameWidth{0};
+    std::atomic<uint32_t> m_lastFrameHeight{0};
+
+    double m_statsFps = 0.0;
+    double m_statsBitrateKbps = 0.0;
+    double m_statsNetworkJitterMs = 0.0;
+    uint32_t m_statsDurationMs = 0;
+    uint64_t m_statsInboundPkts = 0;
+    uint32_t m_statsLostPkts = 0;
+    uint32_t m_statsFreezeCount = 0;
+    uint32_t m_statsDecodeFailCount = 0;
 
     double m_rttCurrentMs = 0.0;
-    double m_rttAvgMs = 0.0;
-    double m_jitterBufferMs = 0.0;
+    /** DecodeStats「抖动缓冲」ms，取自 SDK 日志文本（非 stream_stats） */
+    double m_decodeJitterBufferMs = 0.0;
+    bool m_hasDecodeJitterBuffer = false;
     bool m_hasConnectionStats = false;
     QTimer m_statsPollTimer;
 };
