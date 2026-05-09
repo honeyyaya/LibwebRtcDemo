@@ -158,10 +158,7 @@ Window {
                     anchors.margins: 8
                     width: Math.min(parent.width - 16, 420)
                     height: Math.max(hudLabel.contentHeight + 12, 40)
-                    radius: 6
-                    color: "#CC0B1220"
-                    border.width: 1
-                    border.color: "#334155"
+                    color: "transparent"
                     visible: statsHudTimer.running
                              && (receiverClient.hasConnectionStats
                                  || videoRenderer.hasVideo

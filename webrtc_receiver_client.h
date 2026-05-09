@@ -103,8 +103,12 @@ private:
 
     double m_statsFps = 0.0;
     double m_statsBitrateKbps = 0.0;
-    /** 来自 librflow_stream_stats_get_jitter_ms（HUD 上的「抖动缓存」即此字段） */
+    /** RTP jitter（librflow_stream_stats_get_jitter_ms），仅用于诊断 log */
     double m_statsJitterMs = 0.0;
+    /** 抖动缓存平均延迟 jb_avg（librflow_stream_stats_get_jitter_buffer_delay_ms） */
+    double m_statsJitterBufferDelayMs = 0.0;
+    /** playout 最小延迟（librflow_stream_stats_get_jitter_min_delay_ms） */
+    double m_statsJitterMinDelayMs = 0.0;
     uint32_t m_statsDurationMs = 0;
     uint64_t m_statsInboundPkts = 0;
     uint32_t m_statsLostPkts = 0;

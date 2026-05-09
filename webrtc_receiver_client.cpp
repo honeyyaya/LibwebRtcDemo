@@ -285,7 +285,10 @@ QString WebRTCReceiverClient::overlayTelemetryText() const
         } else {
             t += QStringLiteral("码率：%1 Kbps\n").arg(m_statsBitrateKbps, 0, 'f', 0);
         }
-        t += QStringLiteral("抖动缓存：%1 ms\n").arg(m_statsJitterMs, 0, 'f', 1);
+        /* 抖动缓存：jb_avg；下限：jitter_min（RTP jitter 太小，仅在诊断 log 里看） */
+        t += QStringLiteral("抖动缓存：%1 ms（下限 %2 ms）\n")
+                 .arg(m_statsJitterBufferDelayMs, 0, 'f', 1)
+                 .arg(m_statsJitterMinDelayMs, 0, 'f', 1);
         t += QStringLiteral("RTT：%1 ms\n").arg(m_rttCurrentMs, 0, 'f', 1);
 
         const quint64 denom = static_cast<quint64>(m_statsInboundPkts) + static_cast<quint64>(m_statsLostPkts);
@@ -798,6 +801,10 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
     const uint32_t rttMs = librflow_stream_stats_get_rtt_ms(stats);
     const uint32_t fps = librflow_stream_stats_get_fps(stats);
     const uint32_t jitterMs = librflow_stream_stats_get_jitter_ms(stats);
+    /* jb_avg = 抖动缓存平均延迟（HUD 上的「抖动缓存」就用这个，对应原日志 [DecodeStats] 抖动缓冲） */
+    const uint32_t jbAvgMs = librflow_stream_stats_get_jitter_buffer_delay_ms(stats);
+    /* jitter_min = playout 时序下限（jitter min-delay） */
+    const uint32_t jbMinMs = librflow_stream_stats_get_jitter_min_delay_ms(stats);
     const uint32_t freezeCount = librflow_stream_stats_get_freeze_count(stats);
     const uint32_t decodeFailCount = librflow_stream_stats_get_decode_fail_count(stats);
 
@@ -807,6 +814,8 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
     m_statsFps = static_cast<double>(fps);
     m_statsBitrateKbps = static_cast<double>(bitrateKbps);
     m_statsJitterMs = static_cast<double>(jitterMs);
+    m_statsJitterBufferDelayMs = static_cast<double>(jbAvgMs);
+    m_statsJitterMinDelayMs = static_cast<double>(jbMinMs);
     m_statsFreezeCount = freezeCount;
     m_statsDecodeFailCount = decodeFailCount;
 
@@ -819,8 +828,9 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
     if (sStatsLogCount <= 3 || (sStatsLogCount % 10) == 0) {
         qInfo().noquote()
             << QStringLiteral("[StreamStatsRaw] #%1 dur=%2ms in_pkts=%3 lost=%4 "
-                              "bitrate=%5kbps rtt=%6ms fps=%7 jitter(rtcp)=%8ms "
-                              "freeze=%9 decodeFail=%10")
+                              "bitrate=%5kbps rtt=%6ms fps=%7 "
+                              "jb_avg=%8ms jb_min=%9ms jitter(rtp)=%10ms "
+                              "freeze=%11 decodeFail=%12")
                    .arg(sStatsLogCount)
                    .arg(durationMs)
                    .arg(inboundPkts)
@@ -828,6 +838,8 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
                    .arg(bitrateKbps)
                    .arg(rttMs)
                    .arg(fps)
+                   .arg(jbAvgMs)
+                   .arg(jbMinMs)
                    .arg(jitterMs)
                    .arg(freezeCount)
                    .arg(decodeFailCount);
@@ -863,6 +875,8 @@ void WebRTCReceiverClient::resetConnectionStats()
     m_statsFps = 0.0;
     m_statsBitrateKbps = 0.0;
     m_statsJitterMs = 0.0;
+    m_statsJitterBufferDelayMs = 0.0;
+    m_statsJitterMinDelayMs = 0.0;
     m_statsDurationMs = 0;
     m_statsInboundPkts = 0;
     m_statsLostPkts = 0;
