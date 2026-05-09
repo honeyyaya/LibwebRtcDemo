@@ -822,55 +822,94 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
     m_rttCurrentMs = static_cast<double>(rttMs);
     m_hasConnectionStats = true;
 
-    /* 诊断：让 SDK 给的原始值一目了然，方便核对码率/帧率/RTT/抖动是不是 0 */
+    /* 诊断：每次都打——1s 一条不算密，能完整看到 SDK 给的原始值是否漂移到 0 */
     static quint64 sStatsLogCount = 0;
     ++sStatsLogCount;
-    if (sStatsLogCount <= 3 || (sStatsLogCount % 10) == 0) {
-        qInfo().noquote()
-            << QStringLiteral("[StreamStatsRaw] #%1 dur=%2ms in_pkts=%3 lost=%4 "
-                              "bitrate=%5kbps rtt=%6ms fps=%7 "
-                              "jb_avg=%8ms jb_min=%9ms jitter(rtp)=%10ms "
-                              "freeze=%11 decodeFail=%12")
-                   .arg(sStatsLogCount)
-                   .arg(durationMs)
-                   .arg(inboundPkts)
-                   .arg(lostPkts)
-                   .arg(bitrateKbps)
-                   .arg(rttMs)
-                   .arg(fps)
-                   .arg(jbAvgMs)
-                   .arg(jbMinMs)
-                   .arg(jitterMs)
-                   .arg(freezeCount)
-                   .arg(decodeFailCount);
-    }
+    qInfo().noquote()
+        << QStringLiteral("[StreamStatsRaw] #%1 dur=%2ms in_pkts=%3 lost=%4 "
+                          "bitrate=%5kbps rtt=%6ms fps=%7 "
+                          "jb_avg=%8ms jb_min=%9ms jitter(rtp)=%10ms "
+                          "freeze=%11 decodeFail=%12")
+               .arg(sStatsLogCount)
+               .arg(durationMs)
+               .arg(inboundPkts)
+               .arg(lostPkts)
+               .arg(bitrateKbps)
+               .arg(rttMs)
+               .arg(fps)
+               .arg(jbAvgMs)
+               .arg(jbMinMs)
+               .arg(jitterMs)
+               .arg(freezeCount)
+               .arg(decodeFailCount);
 
     Q_EMIT connectionStatsChanged();
 }
 
 void WebRTCReceiverClient::pollStreamStats()
 {
-    if (!m_streamHandle) {
+    /* 诊断：定位"HUD 数据没出来"——每次 poll 都打一行入口状态 */
+    static quint64 sPollSeq = 0;
+    ++sPollSeq;
+    const bool hasHandle = (m_streamHandle != nullptr);
+
+    if (!hasHandle) {
+        if (sPollSeq <= 5 || (sPollSeq % 5) == 0) {
+            qWarning().noquote()
+                << QStringLiteral("[StreamStatsPoll] #%1 SKIP no_stream_handle "
+                                  "(sdkInit=%2 connected=%3 hasConnStats=%4)")
+                       .arg(sPollSeq)
+                       .arg(m_sdkInitialized ? QStringLiteral("true") : QStringLiteral("false"))
+                       .arg(m_connected ? QStringLiteral("true") : QStringLiteral("false"))
+                       .arg(m_hasConnectionStats ? QStringLiteral("true") : QStringLiteral("false"));
+        }
         return;
     }
 
     librflow_stream_stats_t stats = nullptr;
     const rflow_err_t err = librflow_stream_get_stats(m_streamHandle, &stats);
     if (err != RFLOW_OK) {
-        qWarning().noquote() << QStringLiteral("[RFlowStats] get_stats failed err=%1(%2)")
-                                    .arg(errorToString(err))
-                                    .arg(err);
+        qWarning().noquote()
+            << QStringLiteral("[StreamStatsPoll] #%1 get_stats FAILED err=%2(%3) "
+                              "handle=%4 last_error=\"%5\"")
+                   .arg(sPollSeq)
+                   .arg(errorToString(err))
+                   .arg(err)
+                   .arg(reinterpret_cast<quintptr>(m_streamHandle))
+                   .arg(QString::fromUtf8(librflow_get_last_error() ? librflow_get_last_error() : ""));
         return;
     }
 
-    handleStreamStats(stats);
-    if (stats) {
-        librflow_stream_stats_release(stats);
+    if (!stats) {
+        qWarning().noquote()
+            << QStringLiteral("[StreamStatsPoll] #%1 get_stats OK but stats==NULL handle=%2")
+                   .arg(sPollSeq)
+                   .arg(reinterpret_cast<quintptr>(m_streamHandle));
+        return;
     }
+
+    if (sPollSeq <= 5 || (sPollSeq % 30) == 0) {
+        qInfo().noquote()
+            << QStringLiteral("[StreamStatsPoll] #%1 OK handle=%2")
+                   .arg(sPollSeq)
+                   .arg(reinterpret_cast<quintptr>(m_streamHandle));
+    }
+
+    handleStreamStats(stats);
+    librflow_stream_stats_release(stats);
 }
 
 void WebRTCReceiverClient::resetConnectionStats()
 {
+    /* 诊断：记录"统计被清空"事件——HUD 突然变 — 通常都是这里触发的 */
+    if (m_hasConnectionStats) {
+        qInfo().noquote()
+            << QStringLiteral("[StreamStatsReset] clearing stats (was: bitrate=%1kbps fps=%2 jb_avg=%3ms)")
+                   .arg(m_statsBitrateKbps, 0, 'f', 0)
+                   .arg(m_statsFps, 0, 'f', 1)
+                   .arg(m_statsJitterBufferDelayMs, 0, 'f', 1);
+    }
+
     m_rttCurrentMs = 0.0;
     m_statsFps = 0.0;
     m_statsBitrateKbps = 0.0;

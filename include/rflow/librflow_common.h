@@ -429,6 +429,22 @@ LIBRFLOW_API_EXPORT rflow_err_t librflow_global_config_set_region     (librflow_
  */
 typedef void (*librflow_gl_prepare_fn)(void *userdata);
 
+/*
+ * 线程安全（Video Frame Getter）
+ * ------------------------------
+ *   - 所有 librflow_video_frame_get_* 在同一帧上**允许多线程并发只读调用**：
+ *       * 帧的元数据字段（width/height/codec/type/seq/pts_ms/utc_ms/index/
+ *         plane_count/plane_data/plane_strides/plane_widths/plane_heights/
+ *         backend/native_handle_type/oes_texture_id/android_hardware_buffer/
+ *         sync_fence_fd/gl_prepare_callback）在帧构造完成后即不可变，纯只读。
+ *       * librflow_video_frame_get_data / get_data_size 内部使用互斥锁懒生成
+ *         连续 payload，多线程同时首次访问也安全（最多串行化一次 memcpy）。
+ *   - 前提：调用方已通过 retain 获得对应引用，并且未被对应的 release 释放。
+ *     SDK 不会针对“已 release 的悬空指针 + 并发 getter”做防御。
+ *   - librflow_video_frame_acquire_for_sampling /
+ *     librflow_video_frame_release_after_sampling 的并发性由具体 backend 实现
+ *     约定；CPU planar 帧为 no-op，安全。
+ */
 LIBRFLOW_API_EXPORT rflow_video_frame_backend_t librflow_video_frame_get_backend(librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT rflow_native_handle_type_t  librflow_video_frame_get_native_handle_type(librflow_video_frame_t f);
 /* Returns 0 when this frame is not backed by Android OES texture. */
@@ -463,6 +479,21 @@ LIBRFLOW_API_EXPORT uint64_t           librflow_video_frame_get_utc_ms   (librfl
 LIBRFLOW_API_EXPORT uint32_t           librflow_video_frame_get_seq      (librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT int32_t            librflow_video_frame_get_index    (librflow_video_frame_t f);
 
+/*
+ * 线程安全（retain / release）
+ * ----------------------------
+ *   - librflow_video_frame_retain / librflow_video_frame_release **允许在任意
+ *     线程调用**。引用计数为原子操作（retain 使用 relaxed，release 使用
+ *     acq_rel），与标准 shared_ptr 引用计数模式一致。
+ *   - 每个调用方各自管理“自己持有的那一份引用”：retain 后必须由“持有者”
+ *     在使用完毕时调用一次 release，可以是不同线程（例如 SDK 回调线程
+ *     retain 并转交，渲染/GUI 线程在 mailbox 被覆盖时 release）。
+ *   - 当最后一次 release（fetch_sub 后引用计数变为 0）时，**同步**释放底层
+ *     资源（包括 webrtc 帧 buffer 引用、Android AHardwareBuffer 引用、
+ *     sync fence fd 等）；执行 release 的线程承担释放成本。
+ *   - 不要将“同一份引用”跨线程裸传共享后又分别 release——这等于双重
+ *     释放，是错误用法（与 shared_ptr 的复制规则一致）。
+ */
 LIBRFLOW_API_EXPORT librflow_video_frame_t librflow_video_frame_retain (librflow_video_frame_t f);
 LIBRFLOW_API_EXPORT void                   librflow_video_frame_release(librflow_video_frame_t f);
 
@@ -490,6 +521,19 @@ LIBRFLOW_API_EXPORT uint32_t librflow_stream_stats_get_fps            (librflow_
 LIBRFLOW_API_EXPORT uint32_t librflow_stream_stats_get_jitter_ms          (librflow_stream_stats_t s);
 LIBRFLOW_API_EXPORT uint32_t librflow_stream_stats_get_freeze_count       (librflow_stream_stats_t s);
 LIBRFLOW_API_EXPORT uint32_t librflow_stream_stats_get_decode_fail_count  (librflow_stream_stats_t s);
+
+/*
+ * 抖动缓存平均延迟（jb_avg）：来自 RTCInboundRtpStreamStats::jitter_buffer_delay
+ * 与 jitter_buffer_emitted_count 的比值，单位 ms。代表"帧从入抖动缓存到出缓存"
+ * 的平均等待时间，是判断网络抖动 + jitter buffer 适配情况的核心指标。
+ */
+LIBRFLOW_API_EXPORT uint32_t librflow_stream_stats_get_jitter_buffer_delay_ms(librflow_stream_stats_t s);
+/*
+ * 当前 RtpReceiver 上的 min playout delay（playout 时序的下限），单位 ms。
+ * 由 SDK 内部 jitter min-delay 控制（关键帧 watchdog 触发后会临时上调，再回归
+ * floor）。多数场景为常量；用于上层显示"播放下限"。
+ */
+LIBRFLOW_API_EXPORT uint32_t librflow_stream_stats_get_jitter_min_delay_ms  (librflow_stream_stats_t s);
 
 #ifdef __cplusplus
 }
