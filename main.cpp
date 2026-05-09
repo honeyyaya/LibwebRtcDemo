@@ -8,6 +8,8 @@
 
 int main(int argc, char *argv[])
 {
+
+    // 我来测试SubModel
     QGuiApplication app(argc, argv);
 
     // 手动注册 WebRTCVideoRenderer，确保 QML 可正常 import LibwebRtcDemo 1.0
