@@ -9,10 +9,12 @@
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 #include <QOpenGLShaderProgram>
+#include <QPointer>
 #include <QQuickWindow>
 #include <QSGRenderNode>
 #include <QSGRendererInterface>
 #include <QSurfaceFormat>
+#include <QThread>
 #include <algorithm>
 #include <cstring>
 #include <iterator>
@@ -48,6 +50,10 @@
 #endif
 
 namespace {
+
+/// 渲染线程在 sync 入口看到的 mailbox 帧若早于此阈值则直接丢弃——避免拉一帧远过期的画面去渲染。
+/// 与 rtc_demo_new 的 GL queue stale-drop 阈值同量级。
+constexpr qint64 kStaleMailboxFrameDropUs = 100 * 1000; // 100 ms
 
 struct PlaneTextureCache {
     int width = 0;
@@ -429,27 +435,34 @@ public:
         m_rect = QRectF(0.0, 0.0, item->width(), item->height());
         updateGeometry();
 
-        librflow_video_frame_t frame = nullptr;
-        quint32 frameId = 0;
-        if (!item->takeFrame(frame, frameId) || !frame) {
-            if (!item->m_hasVideo) {
+        /// 从 m_renderFrame slot 拉走当前帧；slot 由 onBeforeSynchronizing() 在渲染线程 promote。
+        /// 同一 generation 只消费一次，避免重复 sync 同一帧。
+        WebRTCVideoRenderer::RenderFrameSnapshot snap;
+        if (!item->consumeRenderFrame(m_lastConsumedGeneration, snap)) {
+            if (!item->hasVideo()) {
                 m_hasData = false;
                 clearHeldFrame();
             }
             m_haveFrameId = false;
-            m_haveGlFrameTrace = false;
+            m_haveFrameTrace = false;
             return;
         }
+        m_lastConsumedGeneration = snap.generation;
 
         clearHeldFrame();
-        m_heldFrame = frame;
-        m_currentFrameId = frameId;
+        m_heldFrame = snap.frame;
+        m_currentFrameId = static_cast<quint32>(std::max(0, snap.frameId));
         m_haveFrameId = true;
-        m_glQueueTraceStartMonoUs = item->lastTakenGlQueueTraceStartMonoUs();
-        m_glQueueTraceFrameId = item->lastTakenGlQueueTraceFrameId();
-        m_glQueueTraceFromTracking = item->lastTakenGlQueueTraceFrameFromTracking();
-        m_haveGlFrameTrace = true;
-        demo::latency_trace::recordSync(frameId);
+
+        m_traceFrameId = snap.frameId;
+        m_traceQueueStartUs = snap.queueStartMonoUs;
+        m_traceGuiUpdateUs = snap.guiUpdateDispatchMonoUs;
+        m_traceSyncStartUs = snap.syncStartMonoUs;
+        m_traceMailboxAgeUs = snap.mailboxAgeUs;
+        m_tracePacerWaitUs = snap.pacerWaitUs;
+        m_haveFrameTrace = true;
+
+        demo::latency_trace::recordSync(m_currentFrameId);
     }
 
     StateFlags changedStates() const override
@@ -472,6 +485,8 @@ public:
         if (!ensureInitialized()) {
             return;
         }
+
+        const qint64 uploadStartUs = demo::latency_trace::monotonicUs();
 
         if (m_heldFrame) {
             uploadHeldFrame();
@@ -553,39 +568,57 @@ public:
 
         const qint64 drawUs = drawTimer.nsecsElapsed() / 1000;
         ++m_renderedFrames;
-        if (m_uploadStatsValidForLastFrame &&
-            (m_renderedFrames <= 3 || (m_renderedFrames % 600) == 0)) {
-        }
 
         releaseSamplingAfterDraw();
 
-        /// 端到端渲染采样：与新 Demo 的 tracking_id mod 120 路径同源——按本帧 frame_id 采样，
-        /// 计算 wall(presentFrame→render结束) 与 总(SDK 回调→render结束)，并把样本投到 GUI 线程
-        /// 驱动 sampledPipelineLine。日志使用 latency_trace 的同源单调钟，渲染线程不阻塞 UI。
-        if (m_uploadStatsValidForLastFrame && m_haveGlFrameTrace && m_glQueueTraceFromTracking) {
-            const quint32 fid = static_cast<quint32>(std::max(0, m_glQueueTraceFrameId));
+        /// 端到端渲染采样：与 rtc_demo_new 的 tracking_id mod 120 路径同源。
+        /// 采样指标（落本地日志 + 投到 GUI 驱动 HUD）：
+        ///   pacer_wait      = sync_start - GUI dispatch（== Qt threaded RL 排队 + vsync 等待）
+        ///   sync_to_render  = upload_start - sync_start
+        ///   upload+draw     = uploadHeldFrame 上传耗时 + glDraw 耗时
+        ///   wall(present->render) = nowUs - presentFrame 入队时刻
+        ///   total(SDK->render)    = nowUs - SDK 回调入口（peekSdkCallbackUs）
+        if (m_uploadStatsValidForLastFrame && m_haveFrameTrace && m_traceFrameId >= 0) {
+            const quint32 fid = static_cast<quint32>(m_traceFrameId);
+            const qint64 nowUs = demo::latency_trace::monotonicUs();
+            const qint64 wallFromPresentUs = nowUs - m_traceQueueStartUs;
+            const qint64 syncToRenderUs = std::max<qint64>(0, uploadStartUs - m_traceSyncStartUs);
+            const qint64 uploadDrawUs = m_lastUploadUs + drawUs;
+
+            qint64 sdkCallbackUs = 0;
+            double decodeToRenderMs = -1.0;
+            if (demo::latency_trace::peekSdkCallbackUs(fid, &sdkCallbackUs) && sdkCallbackUs > 0) {
+                decodeToRenderMs = (nowUs - sdkCallbackUs) / 1000.0;
+            }
+
             if (m_renderedFrames <= 5 || (fid % 120) == 0) {
-                const qint64 nowUs = demo::latency_trace::monotonicUs();
-                const qint64 wallFromQueueUs = nowUs - m_glQueueTraceStartMonoUs;
-                const qint64 sumUploadDrawUs = m_lastUploadUs + drawUs;
-                qint64 sdkCallbackUs = 0;
-                double decodeToRenderMs = -1.0;
-                if (demo::latency_trace::peekSdkCallbackUs(fid, &sdkCallbackUs) &&
-                    sdkCallbackUs > 0) {
-                    decodeToRenderMs = (nowUs - sdkCallbackUs) / 1000.0;
-                }
-                const QString decodeToRenderStr = decodeToRenderMs >= 0.0
-                                                      ? QString::number(decodeToRenderMs, 'f', 3)
-                                                      : QStringLiteral("—");
+                const QString decodeToRenderStr =
+                    decodeToRenderMs >= 0.0 ? QString::number(decodeToRenderMs, 'f', 3)
+                                            : QStringLiteral("—");
+                qInfo().noquote()
+                    << QStringLiteral("[RenderPerf] frame=%1 mailbox_age=%2ms pacer_wait=%3ms "
+                                      "sync_to_render=%4ms upload+draw=%5ms wall=%6ms total=%7ms")
+                           .arg(fid)
+                           .arg(m_traceMailboxAgeUs / 1000.0, 0, 'f', 3)
+                           .arg(m_tracePacerWaitUs / 1000.0, 0, 'f', 3)
+                           .arg(syncToRenderUs / 1000.0, 0, 'f', 3)
+                           .arg(uploadDrawUs / 1000.0, 0, 'f', 3)
+                           .arg(wallFromPresentUs / 1000.0, 0, 'f', 3)
+                           .arg(decodeToRenderStr);
+
                 if (m_videoItem) {
                     QMetaObject::invokeMethod(
                         m_videoItem, "applySampledPipelineUi", Qt::QueuedConnection,
-                        Q_ARG(int, m_glQueueTraceFrameId), Q_ARG(double, decodeToRenderMs),
-                        Q_ARG(double, wallFromQueueUs / 1000.0));
+                        Q_ARG(int, m_traceFrameId),
+                        Q_ARG(double, m_tracePacerWaitUs / 1000.0),
+                        Q_ARG(double, syncToRenderUs / 1000.0),
+                        Q_ARG(double, uploadDrawUs / 1000.0),
+                        Q_ARG(double, decodeToRenderMs),
+                        Q_ARG(double, wallFromPresentUs / 1000.0));
                 }
             }
         }
-        m_haveGlFrameTrace = false;
+        m_haveFrameTrace = false;
 
         if (m_haveFrameId) {
             demo::latency_trace::recordRender(m_currentFrameId);
@@ -1295,12 +1328,17 @@ private:
     bool m_uploadStatsValidForLastFrame = false;
     quint64 m_renderedFrames = 0;
 
-    /// QSGRenderNode 仅在 sync()/render() 同一线程读写——sync 时由 WebRTCVideoRenderer::lastTakenXxx 拷入，
-    /// render 末尾消费一次后置 m_haveGlFrameTrace=false，避免对同一帧重复采样。
-    qint64 m_glQueueTraceStartMonoUs = 0;
-    int m_glQueueTraceFrameId = -1;
-    bool m_glQueueTraceFromTracking = false;
-    bool m_haveGlFrameTrace = false;
+    /// QSGRenderNode 仅在 sync()/render() 同一线程读写——sync 时从 WebRTCVideoRenderer::m_renderFrame 拷入；
+    /// render 末尾消费一次后置 m_haveFrameTrace=false，避免对同一帧重复采样。
+    int m_traceFrameId = -1;
+    qint64 m_traceQueueStartUs = 0;
+    qint64 m_traceGuiUpdateUs = 0;
+    qint64 m_traceSyncStartUs = 0;
+    qint64 m_traceMailboxAgeUs = 0;
+    qint64 m_tracePacerWaitUs = 0;
+    bool m_haveFrameTrace = false;
+
+    quint64 m_lastConsumedGeneration = 0;
 };
 
 }  // namespace
@@ -1328,107 +1366,331 @@ void WebRTCVideoRenderer::presentFrame(librflow_video_frame_t frame)
     const uint32_t height = librflow_video_frame_get_height(frame);
     const quint32 frameId = librflow_video_frame_get_seq(frame);
     if (width == 0 || height == 0) {
-        librflow_video_frame_release(frame);
+        releaseFrame(frame);
         return;
     }
 
-    /// 数据量提示：原生帧（OES/AHardwareBuffer）走纹理路径，没有 CPU 平面字节数；CPU 平面则估算 1.5*width*height。
-    const rflow_native_handle_type_t handleForLog = librflow_video_frame_get_native_handle_type(frame);
-    const rflow_codec_t codecForLog = librflow_video_frame_get_codec(frame);
-    const bool isNativeFrame =
-        librflow_video_frame_get_backend(frame) == RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL ||
-        librflow_video_frame_get_backend(frame) == RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER;
-
+    librflow_video_frame_t oldFrame = nullptr;
     bool highlightChanged = false;
-    bool shouldRequestUpdate = false;
+    bool wasMailboxOccupied = false;
     {
         QMutexLocker locker(&m_frameMutex);
-        if (m_pendingFrame) {
-            librflow_video_frame_release(m_pendingFrame);
-        }
-        m_pendingFrame = frame;
-        m_pendingValid = true;
-        m_pendingGlQueueTraceStartMonoUs = presentEntryUs;
-        m_pendingGlQueueTraceFrameId = static_cast<int>(frameId);
-        /// SDK 侧 librflow_video_frame_get_seq 永远返回有效自增序号，等价于 tracking_id 路径。
-        m_pendingGlQueueTraceFromTracking = true;
-        if (!m_updatePending) {
-            m_updatePending = true;
-            shouldRequestUpdate = true;
-        }
+        publishMailboxFrameLocked(frame, presentEntryUs, static_cast<int>(frameId), &oldFrame);
+        wasMailboxOccupied = (oldFrame != nullptr);
         if (m_highlightFrameId != static_cast<int>(frameId)) {
             m_highlightFrameId = static_cast<int>(frameId);
             highlightChanged = true;
         }
-        m_lastPresentMonoUs = presentEntryUs;
-        ++m_presentCount;
+    }
+
+    if (oldFrame) {
+        releaseFrame(oldFrame);
+        m_mailboxDropCount.fetch_add(1, std::memory_order_relaxed);
     }
 
     demo::latency_trace::recordPresent(frameId, static_cast<int>(width), static_cast<int>(height));
 
-    if (!m_hasVideo) {
-        m_hasVideo = true;
-        Q_EMIT hasVideoChanged();
-    }
-    if (highlightChanged) {
-        Q_EMIT highlightFrameIdChanged();
-    }
-    if (shouldRequestUpdate) {
-        update();
+    const quint64 publishedTotal = m_publishedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    bool needHasVideoEmit = false;
+    if (!m_hasVideo.load(std::memory_order_acquire)) {
+        m_hasVideo.store(true, std::memory_order_release);
+        needHasVideoEmit = true;
     }
 
-    if (m_presentCount <= 5 || (frameId % 120) == 0) {
-        QString dataHint;
-        if (isNativeFrame) {
-            dataHint = (handleForLog == RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE)
-                           ? QStringLiteral("OES/kNative 纹理")
-                           : QStringLiteral("AHardwareBuffer 纹理");
-        } else if (codecForLog == RFLOW_CODEC_NV12) {
-            dataHint = QStringLiteral("NV12 双平面 ~%1 KB")
-                           .arg(static_cast<qint64>(width) * height * 3 / 2 / 1024);
+    /// hasVideoChanged / highlightFrameIdChanged 信号必须在 GUI 线程发射，
+    /// 走 QueuedConnection 委托到本对象所属线程。
+    if (needHasVideoEmit) {
+        QMetaObject::invokeMethod(this, [this]() { Q_EMIT hasVideoChanged(); }, Qt::QueuedConnection);
+    }
+    if (highlightChanged) {
+        QMetaObject::invokeMethod(
+            this, [this]() { Q_EMIT highlightFrameIdChanged(); }, Qt::QueuedConnection);
+    }
+
+    if (publishedTotal <= 5 || (frameId % 600) == 0) {
+        qInfo().noquote()
+            << QStringLiteral("[RenderQueue] mailbox publish frame=%1 %2x%3 "
+                              "drop_total=%4 mailbox_was_occupied=%5")
+                   .arg(frameId)
+                   .arg(width)
+                   .arg(height)
+                   .arg(m_mailboxDropCount.load(std::memory_order_relaxed))
+                   .arg(wasMailboxOccupied ? QStringLiteral("true") : QStringLiteral("false"));
+    }
+
+    /// 唤醒渲染线程：先确保 beforeSynchronizing 已挂上（一次性，GUI 线程），
+    /// 然后通过 QQuickWindow::update() (thread-safe) 让 RenderLoop 跑下一轮。
+    if (!m_renderSchedulingActive.load(std::memory_order_acquire)) {
+        if (!m_renderSchedulingStartPending.exchange(true, std::memory_order_acq_rel)) {
+            QMetaObject::invokeMethod(
+                this, [this]() { ensureRenderSchedulingActive(); }, Qt::QueuedConnection);
+        }
+    } else {
+        queueMailboxRenderUpdate();
+    }
+}
+
+void WebRTCVideoRenderer::publishMailboxFrameLocked(librflow_video_frame_t frame,
+                                                    qint64 queueStartMonoUs,
+                                                    int frameId,
+                                                    librflow_video_frame_t *outOldFrame)
+{
+    if (outOldFrame) {
+        *outOldFrame = m_mailboxFrame.frame;
+    }
+    m_mailboxFrame.frame = frame;
+    m_mailboxFrame.queueStartMonoUs = queueStartMonoUs;
+    m_mailboxFrame.guiUpdateDispatchMonoUs = 0;
+    m_mailboxFrame.frameId = frameId;
+    ++m_mailboxFrame.generation;
+}
+
+bool WebRTCVideoRenderer::takeMailboxFrameForRender(qint64 syncStartMonoUs)
+{
+    librflow_video_frame_t toRelease = nullptr;
+    librflow_video_frame_t prevRender = nullptr;
+    bool ready = false;
+    {
+        QMutexLocker locker(&m_frameMutex);
+        if (!m_mailboxFrame.frame ||
+            m_mailboxFrame.generation == m_lastResolvedMailboxGeneration) {
+            return false;
+        }
+
+        const qint64 mailboxAgeUs = std::max<qint64>(0, syncStartMonoUs - m_mailboxFrame.queueStartMonoUs);
+        if (mailboxAgeUs > kStaleMailboxFrameDropUs) {
+            toRelease = m_mailboxFrame.frame;
+            m_mailboxFrame.frame = nullptr;
+            m_lastResolvedMailboxGeneration = m_mailboxFrame.generation;
         } else {
-            dataHint = QStringLiteral("I420 三平面 ~%1 KB")
-                           .arg(static_cast<qint64>(width) * height * 3 / 2 / 1024);
+            const qint64 guiDispatch =
+                m_mailboxFrame.guiUpdateDispatchMonoUs > 0 ? m_mailboxFrame.guiUpdateDispatchMonoUs
+                : m_renderUpdateDispatchMonoUs > 0         ? m_renderUpdateDispatchMonoUs
+                                                           : syncStartMonoUs;
+            const qint64 pacerWaitUs = std::max<qint64>(0, syncStartMonoUs - guiDispatch);
+
+            prevRender = m_renderFrame.frame;
+            m_renderFrame.frame = m_mailboxFrame.frame;
+            m_renderFrame.queueStartMonoUs = m_mailboxFrame.queueStartMonoUs;
+            m_renderFrame.guiUpdateDispatchMonoUs = guiDispatch;
+            m_renderFrame.syncStartMonoUs = syncStartMonoUs;
+            m_renderFrame.mailboxAgeUs = mailboxAgeUs;
+            m_renderFrame.pacerWaitUs = pacerWaitUs;
+            m_renderFrame.frameId = m_mailboxFrame.frameId;
+            m_renderFrame.generation = m_mailboxFrame.generation;
+            m_renderFrame.ready = true;
+            m_lastResolvedMailboxGeneration = m_mailboxFrame.generation;
+            m_mailboxFrame.frame = nullptr;
+            ready = true;
         }
     }
+
+    if (toRelease) {
+        m_mailboxDropCount.fetch_add(1, std::memory_order_relaxed);
+        releaseFrame(toRelease);
+        return false;
+    }
+    if (prevRender) {
+        /// renderFrame 上一帧还没被 node->sync 消费就被新帧覆盖（理论上少见，做兜底）
+        m_mailboxDropCount.fetch_add(1, std::memory_order_relaxed);
+        releaseFrame(prevRender);
+    }
+    return ready;
+}
+
+void WebRTCVideoRenderer::queueMailboxRenderUpdate()
+{
+    if (m_renderUpdateInvokePending.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (QThread::currentThread() == this->thread()) {
+        m_renderUpdateInvokePending.store(false, std::memory_order_release);
+        requestMailboxRenderUpdate();
+        return;
+    }
+    QMetaObject::invokeMethod(this,
+                              [this]() {
+                                  m_renderUpdateInvokePending.store(false, std::memory_order_release);
+                                  requestMailboxRenderUpdate();
+                              },
+                              Qt::QueuedConnection);
+}
+
+void WebRTCVideoRenderer::requestMailboxRenderUpdate()
+{
+    if (!m_renderSchedulingActive.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!window()) {
+        return;
+    }
+    if (m_renderUpdatePending.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    const qint64 dispatchUs = demo::latency_trace::monotonicUs();
+    {
+        QMutexLocker locker(&m_frameMutex);
+        m_renderUpdateDispatchMonoUs = dispatchUs;
+        if (m_mailboxFrame.frame && m_mailboxFrame.guiUpdateDispatchMonoUs == 0) {
+            m_mailboxFrame.guiUpdateDispatchMonoUs = dispatchUs;
+        }
+    }
+
+    update();           // 标脏 item，触发 updatePaintNode
+    window()->update(); // 唤醒渲染线程（thread-safe）
+}
+
+void WebRTCVideoRenderer::ensureRenderSchedulingActive()
+{
+    m_renderSchedulingStartPending.store(false, std::memory_order_release);
+    if (!hasVideo()) {
+        return;
+    }
+    if (!window()) {
+        /// 还未 attach 到 window；等 itemChange(ItemSceneChange) 把 onWindowChanged 接好后会再触发。
+        return;
+    }
+    if (m_observedWindow != window()) {
+        onWindowChanged(window());
+    }
+    m_renderSchedulingActive.store(true, std::memory_order_release);
+    queueMailboxRenderUpdate();
+}
+
+void WebRTCVideoRenderer::onWindowChanged(QQuickWindow *win)
+{
+    if (m_beforeSynchronizingConnection) {
+        QObject::disconnect(m_beforeSynchronizingConnection);
+        m_beforeSynchronizingConnection = {};
+    }
+    m_observedWindow = win;
+    if (!win) {
+        return;
+    }
+    win->setPersistentGraphics(true);
+    win->setPersistentSceneGraph(true);
+    /// beforeSynchronizing 在渲染线程发射，DirectConnection 让我们就地从 mailbox 拉帧。
+    m_beforeSynchronizingConnection =
+        connect(win, &QQuickWindow::beforeSynchronizing, this,
+                &WebRTCVideoRenderer::onBeforeSynchronizing, Qt::DirectConnection);
+}
+
+void WebRTCVideoRenderer::onBeforeSynchronizing()
+{
+    /// 渲染线程：把 mailbox 提升到 m_renderFrame，供随后的 updatePaintNode->sync 消费。
+    /// 多消费一次（loop 直到没有新帧），避免渲染线程一帧只吃一格。
+    const qint64 syncStartUs = demo::latency_trace::monotonicUs();
+    bool got = false;
+    while (takeMailboxFrameForRender(syncStartUs)) {
+        got = true;
+    }
+
+    /// renderUpdatePending 在渲染线程清掉，让下一次 presentFrame 能再触发一次 update()。
+    m_renderUpdatePending.store(false, std::memory_order_release);
+
+    if (!got) {
+        /// 没拉到新帧也无所谓——可能 mailbox 还没填，或被 stale-drop 了。
+        return;
+    }
+}
+
+void WebRTCVideoRenderer::releaseFrame(librflow_video_frame_t frame)
+{
+    if (!frame) {
+        return;
+    }
+    /// 假设 librflow_video_frame_release 跨线程安全（与 rtc_demo_new 等价的前提）。
+    librflow_video_frame_release(frame);
 }
 
 void WebRTCVideoRenderer::clearVideoTrack()
 {
-    bool hadVideo = m_hasVideo;
+    const bool hadVideo = m_hasVideo.exchange(false, std::memory_order_acq_rel);
+
+    librflow_video_frame_t mailboxFrame = nullptr;
+    librflow_video_frame_t renderFrame = nullptr;
     {
         QMutexLocker locker(&m_frameMutex);
-        if (m_pendingFrame) {
-            librflow_video_frame_release(m_pendingFrame);
-            m_pendingFrame = nullptr;
-        }
-        m_pendingValid = false;
-        m_updatePending = false;
+        mailboxFrame = m_mailboxFrame.frame;
+        m_mailboxFrame.frame = nullptr;
+        m_mailboxFrame.queueStartMonoUs = 0;
+        m_mailboxFrame.guiUpdateDispatchMonoUs = 0;
+        m_mailboxFrame.frameId = -1;
+        ++m_mailboxFrame.generation;
+
+        renderFrame = m_renderFrame.frame;
+        m_renderFrame.frame = nullptr;
+        m_renderFrame.ready = false;
+        m_renderFrame.frameId = -1;
+        m_renderFrame.generation = 0;
+        m_renderFrame.queueStartMonoUs = 0;
+        m_renderFrame.guiUpdateDispatchMonoUs = 0;
+        m_renderFrame.syncStartMonoUs = 0;
+        m_renderFrame.mailboxAgeUs = 0;
+        m_renderFrame.pacerWaitUs = 0;
+
+        m_lastResolvedMailboxGeneration = 0;
+        m_renderUpdateDispatchMonoUs = 0;
         m_highlightFrameId = -1;
-        m_pendingGlQueueTraceStartMonoUs = 0;
-        m_pendingGlQueueTraceFrameId = -1;
-        m_pendingGlQueueTraceFromTracking = false;
-        m_lastTakenGlQueueTraceStartMonoUs = 0;
-        m_lastTakenGlQueueTraceFrameId = -1;
-        m_lastTakenGlQueueTraceFromTracking = false;
-        m_lastPresentMonoUs = 0;
-        m_presentCount = 0;
     }
 
-    m_hasVideo = false;
+    if (mailboxFrame) {
+        releaseFrame(mailboxFrame);
+    }
+    if (renderFrame) {
+        releaseFrame(renderFrame);
+    }
+
+    m_publishedFrames.store(0, std::memory_order_relaxed);
+    m_mailboxDropCount.store(0, std::memory_order_relaxed);
+    m_renderUpdatePending.store(false, std::memory_order_release);
+    m_renderUpdateInvokePending.store(false, std::memory_order_release);
+    m_renderSchedulingStartPending.store(false, std::memory_order_release);
+    m_renderSchedulingActive.store(false, std::memory_order_release);
+
     if (hadVideo) {
         Q_EMIT hasVideoChanged();
     }
     Q_EMIT highlightFrameIdChanged();
     if (m_hasSampledPipelineUi) {
         m_sampledHighlightFrameId = -1;
+        m_sampledPacerWaitMs = -1.0;
+        m_sampledSyncToRenderMs = -1.0;
+        m_sampledUploadDrawMs = -1.0;
         m_sampledDecodeToRenderMs = -1.0;
-        m_sampledWallOnFrameToRenderMs = -1.0;
+        m_sampledWallPresentToRenderMs = -1.0;
         m_hasSampledPipelineUi = false;
         Q_EMIT sampledPipelineStatsChanged();
     }
 
-    update();
+    if (window()) {
+        update();
+        window()->update();
+    }
+}
+
+bool WebRTCVideoRenderer::consumeRenderFrame(quint64 lastConsumedGeneration,
+                                             RenderFrameSnapshot &outSnapshot)
+{
+    QMutexLocker locker(&m_frameMutex);
+    if (!m_renderFrame.ready || !m_renderFrame.frame ||
+        m_renderFrame.generation == lastConsumedGeneration) {
+        return false;
+    }
+    outSnapshot.frame = m_renderFrame.frame;
+    outSnapshot.queueStartMonoUs = m_renderFrame.queueStartMonoUs;
+    outSnapshot.guiUpdateDispatchMonoUs = m_renderFrame.guiUpdateDispatchMonoUs;
+    outSnapshot.syncStartMonoUs = m_renderFrame.syncStartMonoUs;
+    outSnapshot.mailboxAgeUs = m_renderFrame.mailboxAgeUs;
+    outSnapshot.pacerWaitUs = m_renderFrame.pacerWaitUs;
+    outSnapshot.frameId = m_renderFrame.frameId;
+    outSnapshot.generation = m_renderFrame.generation;
+
+    m_renderFrame.frame = nullptr;
+    m_renderFrame.ready = false;
+    return true;
 }
 
 int WebRTCVideoRenderer::highlightFrameId() const
@@ -1445,19 +1707,29 @@ QString WebRTCVideoRenderer::sampledPipelineLine() const
     const QString decodeToRender =
         m_sampledDecodeToRenderMs >= 0.0 ? QString::number(m_sampledDecodeToRenderMs, 'f', 3)
                                          : QStringLiteral("N/A");
-    return QStringLiteral("sample frame=%1 | total=%2 ms | UI queue=%3 ms")
+    return QStringLiteral("帧%1 | pacer %2ms | sync→render %3ms | upload+draw %4ms | wall %5ms | total %6ms | drop %7")
         .arg(m_sampledHighlightFrameId)
+        .arg(m_sampledPacerWaitMs, 0, 'f', 2)
+        .arg(m_sampledSyncToRenderMs, 0, 'f', 2)
+        .arg(m_sampledUploadDrawMs, 0, 'f', 2)
+        .arg(m_sampledWallPresentToRenderMs, 0, 'f', 2)
         .arg(decodeToRender)
-        .arg(m_sampledWallOnFrameToRenderMs, 0, 'f', 3);
+        .arg(static_cast<qulonglong>(m_mailboxDropCount.load(std::memory_order_acquire)));
 }
 
-void WebRTCVideoRenderer::applySampledPipelineUi(int glTraceFrameId,
+void WebRTCVideoRenderer::applySampledPipelineUi(int frameId,
+                                                 double pacerWaitMs,
+                                                 double syncToRenderMs,
+                                                 double uploadDrawMs,
                                                  double decodeToRenderTotalMs,
-                                                 double wallOnFrameToRenderMs)
+                                                 double wallPresentToRenderMs)
 {
-    m_sampledHighlightFrameId = glTraceFrameId;
+    m_sampledHighlightFrameId = frameId;
+    m_sampledPacerWaitMs = pacerWaitMs;
+    m_sampledSyncToRenderMs = syncToRenderMs;
+    m_sampledUploadDrawMs = uploadDrawMs;
     m_sampledDecodeToRenderMs = decodeToRenderTotalMs;
-    m_sampledWallOnFrameToRenderMs = wallOnFrameToRenderMs;
+    m_sampledWallPresentToRenderMs = wallPresentToRenderMs;
     m_hasSampledPipelineUi = true;
     Q_EMIT sampledPipelineStatsChanged();
 }
@@ -1497,21 +1769,16 @@ void WebRTCVideoRenderer::geometryChange(const QRectF &newGeometry, const QRectF
     }
 }
 
-bool WebRTCVideoRenderer::takeFrame(librflow_video_frame_t &outFrame, quint32 &outFrameId)
+void WebRTCVideoRenderer::itemChange(ItemChange change, const ItemChangeData &value)
 {
-    QMutexLocker locker(&m_frameMutex);
-    m_updatePending = false;
-    if (!m_pendingValid || !m_pendingFrame) {
-        return false;
+    if (change == ItemSceneChange) {
+        onWindowChanged(value.window);
+        if (value.window && hasVideo()) {
+            m_renderSchedulingActive.store(true, std::memory_order_release);
+            queueMailboxRenderUpdate();
+        } else {
+            m_renderSchedulingActive.store(false, std::memory_order_release);
+        }
     }
-
-    outFrame = m_pendingFrame;
-    m_pendingFrame = nullptr;
-    outFrameId = static_cast<quint32>(m_highlightFrameId >= 0 ? m_highlightFrameId : 0);
-    m_pendingValid = false;
-    /// 把 presentFrame 投入时记下的 trace 三元组拷给 QSGRenderNode（仅 sync 之后立刻读）。
-    m_lastTakenGlQueueTraceStartMonoUs = m_pendingGlQueueTraceStartMonoUs;
-    m_lastTakenGlQueueTraceFrameId = m_pendingGlQueueTraceFrameId;
-    m_lastTakenGlQueueTraceFromTracking = m_pendingGlQueueTraceFromTracking;
-    return true;
+    QQuickItem::itemChange(change, value);
 }

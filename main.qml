@@ -131,13 +131,20 @@ Window {
                     repeat: true
                     triggeredOnStart: true
                     running: receiverClient.hasConnectionStats
-                             || receiverClient.hasDecodeJitterBuffer
                              || videoRenderer.hasVideo
                              || videoRenderer.hasSampledPipelineUi
                     onTriggered: {
                         let block = receiverClient.overlayTelemetryText()
-                        if (videoRenderer.hasSampledPipelineUi)
-                            block += "\n" + videoRenderer.sampledPipelineLine
+                        // 渲染管线阶段时延（来自 SDK 端到端采样，按 frameId%120 抽样刷新）
+                        if (videoRenderer.hasSampledPipelineUi) {
+                            block += "\n--- 渲染管线 ---"
+                            block += "\npacer 等待：" + videoRenderer.pacerWaitMs.toFixed(2) + " ms"
+                            block += "\nsync→render：" + videoRenderer.syncToRenderMs.toFixed(2) + " ms"
+                            block += "\nupload+draw：" + videoRenderer.uploadDrawMs.toFixed(2) + " ms"
+                            block += "\nwall(present→render)：" + videoRenderer.wallPresentToRenderMs.toFixed(2) + " ms"
+                            block += "\n采样：" + videoRenderer.sampledPipelineLine
+                        }
+                        block += "\nmailbox 丢弃：" + videoRenderer.mailboxDropCount + " 帧"
                         videoHud.statsText = block
                     }
                 }
@@ -149,7 +156,7 @@ Window {
                     anchors.top: parent.top
                     anchors.left: parent.left
                     anchors.margins: 8
-                    width: Math.min(parent.width - 16, 360)
+                    width: Math.min(parent.width - 16, 420)
                     height: Math.max(hudLabel.contentHeight + 12, 40)
                     radius: 6
                     color: "#CC0B1220"
@@ -157,7 +164,6 @@ Window {
                     border.color: "#334155"
                     visible: statsHudTimer.running
                              && (receiverClient.hasConnectionStats
-                                 || receiverClient.hasDecodeJitterBuffer
                                  || videoRenderer.hasVideo
                                  || videoRenderer.hasSampledPipelineUi)
 

@@ -9,7 +9,6 @@
 #include <QMutexLocker>
 
 #include <cstdio>
-#include <cmath>
 
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
@@ -39,63 +38,13 @@ static const char *rflowLogLevelTag(rflow_log_level_t level)
     }
 }
 
-/** 解析 SDK DEBUG [DecodeStats] 行内的「抖动缓冲: X.Y ms」（UTF-8 文本） */
-static bool decodeStatsExtractJitterBufferMs(const QString &line, double *outMs)
-{
-    if (!outMs || !line.contains(QLatin1String("[DecodeStats]"))) {
-        return false;
-    }
-    const QString marker = QStringLiteral("抖动缓冲:");
-    const qsizetype idx = line.indexOf(marker);
-    if (idx < 0) {
-        return false;
-    }
-    QStringView rest = QStringView{line}.mid(idx + marker.size()).trimmed();
-    QString num;
-    for (const QChar ch : rest) {
-        if ((ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) || ch == QLatin1Char('.')) {
-            num.append(ch);
-        } else if (!num.isEmpty()) {
-            break;
-        }
-    }
-    if (num.isEmpty()) {
-        return false;
-    }
-    bool ok = false;
-    const double v = num.toDouble(&ok);
-    if (!ok || !std::isfinite(v) || v < 0.0) {
-        return false;
-    }
-    *outMs = v;
-    return true;
-}
-
-static void tryDispatchDecodeJitterBuffer(WebRTCReceiverClient *rcv, const char *utf8Msg)
-{
-    if (!rcv || !utf8Msg) {
-        return;
-    }
-    double ms = 0.0;
-    if (!decodeStatsExtractJitterBufferMs(QString::fromUtf8(utf8Msg), &ms)) {
-        return;
-    }
-    /* log 可能在非 Qt 线程，投递到 Receiver 线程更新属性 */
-    (void) QMetaObject::invokeMethod(
-        rcv,
-        "applyDecodePipelineJitterBufferMs",
-        Qt::QueuedConnection,
-        Q_ARG(double, ms));
-}
-
 extern "C" {
 
 static void rflowConsoleLogCallback(rflow_log_level_t level, const char *msg, void *userdata)
 {
     /* 必须使用完整指针 msg：*msg 只是首字符 char，若以 '[' 开头会永远只打印 "[" */
     const char *text = msg ? msg : "";
-    auto *rcv = static_cast<WebRTCReceiverClient *>(userdata);
-    tryDispatchDecodeJitterBuffer(rcv, text);
+    Q_UNUSED(userdata);
 #if defined(Q_OS_ANDROID)
     const QString payload = QString::fromUtf8(text);
     const QString prefix =
@@ -144,19 +93,6 @@ QString backendToString(rflow_video_frame_backend_t backend)
     case RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN:
     default:
         return QStringLiteral("UNKNOWN");
-    }
-}
-
-QString nativeHandleToString(rflow_native_handle_type_t handleType)
-{
-    switch (handleType) {
-    case RFLOW_NATIVE_HANDLE_ANDROID_OES_TEXTURE:
-        return QStringLiteral("ANDROID_OES_TEXTURE");
-    case RFLOW_NATIVE_HANDLE_ANDROID_HARDWARE_BUFFER:
-        return QStringLiteral("ANDROID_HARDWARE_BUFFER");
-    case RFLOW_NATIVE_HANDLE_NONE:
-    default:
-        return QStringLiteral("NONE");
     }
 }
 
@@ -258,7 +194,6 @@ WebRTCReceiverClient::WebRTCReceiverClient(QObject *parent)
 WebRTCReceiverClient::~WebRTCReceiverClient()
 {
     disconnect();
-    clearPendingFrame();
 }
 
 void WebRTCReceiverClient::setDeviceId(const QString &deviceId)
@@ -332,19 +267,6 @@ void WebRTCReceiverClient::connectToSignaling(const QString &addr)
     Q_EMIT statusChanged(QStringLiteral("SDK 已连接，等待视频流..."));
 }
 
-void WebRTCReceiverClient::applyDecodePipelineJitterBufferMs(double ms)
-{
-    if (!std::isfinite(ms) || ms < 0.0) {
-        return;
-    }
-    if (m_hasDecodeJitterBuffer && qFuzzyCompare(m_decodeJitterBufferMs, ms)) {
-        return;
-    }
-    m_decodeJitterBufferMs = ms;
-    m_hasDecodeJitterBuffer = true;
-    Q_EMIT connectionStatsChanged();
-}
-
 QString WebRTCReceiverClient::overlayTelemetryText() const
 {
     QString t;
@@ -363,19 +285,9 @@ QString WebRTCReceiverClient::overlayTelemetryText() const
         } else {
             t += QStringLiteral("码率：%1 Kbps\n").arg(m_statsBitrateKbps, 0, 'f', 0);
         }
-    } else {
-        t += QStringLiteral("帧率：—\n码率：—\n");
-    }
-
-    if (m_hasDecodeJitterBuffer) {
-        t += QStringLiteral("抖动缓存：%1 ms\n").arg(m_decodeJitterBufferMs, 0, 'f', 1);
-    } else {
-        t += QStringLiteral("抖动缓存：—\n");
-    }
-
-    if (m_hasConnectionStats) {
+        t += QStringLiteral("抖动缓存：%1 ms\n").arg(m_statsJitterMs, 0, 'f', 1);
         t += QStringLiteral("RTT：%1 ms\n").arg(m_rttCurrentMs, 0, 'f', 1);
-        t += QStringLiteral("网络抖动(RTCP)：%1 ms\n").arg(m_statsNetworkJitterMs, 0, 'f', 1);
+
         const quint64 denom = static_cast<quint64>(m_statsInboundPkts) + static_cast<quint64>(m_statsLostPkts);
         double lossPct = 0.0;
         if (denom > 0) {
@@ -388,7 +300,7 @@ QString WebRTCReceiverClient::overlayTelemetryText() const
         t += QStringLiteral("卡顿帧：%1  解码失败：%2\n").arg(m_statsFreezeCount).arg(m_statsDecodeFailCount);
         t += QStringLiteral("统计时长：%1 s\n").arg(QString::number(m_statsDurationMs / 1000.0, 'f', 1));
     } else {
-        t += QStringLiteral("RTT：—\n网络抖动(RTCP)：—\n丢包率：—\n卡顿／解码失败：—\n统计时长：—\n");
+        t += QStringLiteral("帧率：—\n码率：—\n抖动缓存：—\nRTT：—\n丢包率：—\n卡顿／解码失败：—\n统计时长：—\n");
     }
 
     return t.trimmed();
@@ -399,19 +311,19 @@ void WebRTCReceiverClient::disconnect()
     m_statsPollTimer.stop();
     closeStream();
     cleanupSdk();
-    clearPendingFrame();
     resetConnectionStats();
-    m_overwrittenPendingFrames = 0;
-    m_deliveredFrames = 0;
-    m_hasReceivedVideoFrame = false;
-    m_hasReceivedVideoCallback = false;
-    m_hasReportedRendererMissing = false;
+    m_droppedUnsupportedFrames.store(0, std::memory_order_relaxed);
+    m_droppedNoSinkFrames.store(0, std::memory_order_relaxed);
+    m_deliveredFrames.store(0, std::memory_order_relaxed);
+    m_hasReceivedVideoFrame.store(false, std::memory_order_relaxed);
+    m_hasReceivedVideoCallback.store(false, std::memory_order_relaxed);
+    m_hasReportedRendererMissing.store(false, std::memory_order_relaxed);
     m_lastFrameWidth.store(0, std::memory_order_relaxed);
     m_lastFrameHeight.store(0, std::memory_order_relaxed);
     demo::latency_trace::reset();
 
-    if (m_videoSink) {
-        m_videoSink->clearVideoTrack();
+    if (auto *sink = m_videoSink.load(std::memory_order_acquire)) {
+        sink->clearVideoTrack();
     }
 
     Q_EMIT statusChanged(QStringLiteral("已断开"));
@@ -445,14 +357,17 @@ void WebRTCReceiverClient::setVideoSink(QObject *sink)
     if (m_videoRenderer == sink) {
         return;
     }
-    if (m_videoSink) {
-        m_videoSink->clearVideoTrack();
+    /// 切换 sink 必须发生在 SDK 流尚未开启 / 已停止的时段，否则 SDK 线程可能 in-flight 调用旧 sink。
+    /// 当前用法只在 QML Component.onCompleted 一次性绑定，满足该前提。
+    if (auto *oldSink = m_videoSink.load(std::memory_order_acquire)) {
+        oldSink->clearVideoTrack();
     }
     m_videoRenderer = sink;
-    m_videoSink = qobject_cast<VideoFrameSink *>(sink);
-    m_hasReportedRendererMissing = false;
+    auto *newSink = qobject_cast<VideoFrameSink *>(sink);
+    m_videoSink.store(newSink, std::memory_order_release);
+    m_hasReportedRendererMissing.store(false, std::memory_order_relaxed);
     qInfo().noquote() << QStringLiteral("[RenderQueue] video sink assigned=%1")
-                             .arg(m_videoSink ? QStringLiteral("true") : QStringLiteral("false"));
+                             .arg(newSink ? QStringLiteral("true") : QStringLiteral("false"));
 }
 
 void WebRTCReceiverClient::onConnectStateThunk(rflow_connect_state_t state,
@@ -498,6 +413,9 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
                                              librflow_video_frame_t frame,
                                              void *userdata)
 {
+    /// 在 SDK 线程内：retain → 帧格式校验 → 直接 presentFrame 到 sink。
+    /// 与 rtc_demo_new 一致，去掉 receiver 中间 mailbox + Qt::QueuedConnection hop，
+    /// 让帧最早可在「下一次 vsync 前的 sync 阶段」被渲染线程拉走。
     auto *self = static_cast<WebRTCReceiverClient *>(userdata);
     if (!self || !frame) {
         return;
@@ -515,18 +433,87 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
                                            fh,
                                            librflow_video_frame_get_data_size(frame));
 
-    if (!self->m_hasReceivedVideoCallback) {
-        self->m_hasReceivedVideoCallback = true;
+    if (!self->m_hasReceivedVideoCallback.exchange(true, std::memory_order_acq_rel)) {
         qInfo().noquote() << QStringLiteral("[RenderQueue] first video callback frame=%1").arg(frameId);
         QPointer<WebRTCReceiverClient> guard(self);
         QMetaObject::invokeMethod(
             self,
             [guard]() {
-                if (guard && !guard->m_hasReceivedVideoFrame) {
-                    guard->statusChanged(QStringLiteral("已收到视频回调，等待渲染"));
+                if (guard && !guard->m_hasReceivedVideoFrame.load(std::memory_order_acquire)) {
+                    Q_EMIT guard->statusChanged(QStringLiteral("已收到视频回调，等待渲染"));
                 }
             },
             Qt::QueuedConnection);
+    }
+
+    /// 帧格式校验：与原 deliverPendingFrame 一致，只放支持的帧给 sink。
+    const rflow_video_frame_backend_t backend = librflow_video_frame_get_backend(frame);
+    const rflow_codec_t codec = librflow_video_frame_get_codec(frame);
+    const uint32_t planeCount = librflow_video_frame_get_plane_count(frame);
+    const bool isCpuPlanarBackend =
+        backend == RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN ||
+        backend == RFLOW_VIDEO_FRAME_BACKEND_CPU_PLANAR;
+    const bool supportedCpuFrame =
+        ((codec == RFLOW_CODEC_I420 && planeCount >= 3) ||
+         (codec == RFLOW_CODEC_NV12 && planeCount >= 2)) &&
+        fw > 0 && fh > 0;
+    const bool supportedFrame = (isCpuPlanarBackend && supportedCpuFrame) ||
+                                backend == RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL ||
+                                backend == RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER;
+
+    if (!supportedFrame) {
+        const quint64 dropped =
+            self->m_droppedUnsupportedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (dropped <= 3 || (dropped % 600) == 0) {
+            qWarning().noquote()
+                << QStringLiteral("Unsupported frame from libRoboFlow: backend=%1 codec=%2 planes=%3 size=%4x%5 dropped_total=%6")
+                       .arg(backendToString(backend))
+                       .arg(codec)
+                       .arg(planeCount)
+                       .arg(fw)
+                       .arg(fh)
+                       .arg(dropped);
+        }
+        if (!self->m_hasReceivedVideoFrame.load(std::memory_order_acquire)) {
+            QPointer<WebRTCReceiverClient> guard(self);
+            QMetaObject::invokeMethod(
+                self,
+                [guard]() {
+                    if (guard) {
+                        Q_EMIT guard->statusChanged(
+                            QStringLiteral("已收到视频流，但当前帧格式不支持渲染"));
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    auto *sink = self->m_videoSink.load(std::memory_order_acquire);
+    if (!sink) {
+        const quint64 dropped =
+            self->m_droppedNoSinkFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!self->m_hasReportedRendererMissing.exchange(true, std::memory_order_acq_rel)) {
+            qWarning().noquote()
+                << QStringLiteral("[RenderQueue] video sink missing while frame=%1").arg(frameId);
+            QPointer<WebRTCReceiverClient> guard(self);
+            QMetaObject::invokeMethod(
+                self,
+                [guard]() {
+                    if (guard) {
+                        Q_EMIT guard->statusChanged(
+                            QStringLiteral("已收到视频流，但渲染器未就绪"));
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+        if (dropped <= 3 || (dropped % 300) == 0) {
+            qWarning().noquote()
+                << QStringLiteral("[RenderQueue] no sink, dropped frame=%1 total=%2")
+                       .arg(frameId)
+                       .arg(dropped);
+        }
+        return;
     }
 
     librflow_video_frame_t retained = librflow_video_frame_retain(frame);
@@ -534,22 +521,34 @@ void WebRTCReceiverClient::onVideoFrameThunk(librflow_stream_handle_t,
         return;
     }
 
-    {
-        QMutexLocker locker(&self->m_pendingFrameMutex);
-        if (self->m_pendingFrame) {
-            ++self->m_overwrittenPendingFrames;
-            if (self->m_overwrittenPendingFrames <= 3 || (self->m_overwrittenPendingFrames % 300) == 0) {
-                qInfo().noquote()
-                    << QStringLiteral("[RenderQueue] overwrite pending frame total=%1 incoming_frame=%2")
-                           .arg(self->m_overwrittenPendingFrames)
-                           .arg(frameId);
-            }
-            librflow_video_frame_release(self->m_pendingFrame);
-        }
-        self->m_pendingFrame = retained;
+    if (!self->m_hasReceivedVideoFrame.exchange(true, std::memory_order_acq_rel)) {
+        QPointer<WebRTCReceiverClient> guard(self);
+        QMetaObject::invokeMethod(
+            self,
+            [guard]() {
+                if (guard) {
+                    Q_EMIT guard->statusChanged(QStringLiteral("已收到视频流"));
+                }
+            },
+            Qt::QueuedConnection);
     }
 
-    self->schedulePendingFrameDelivery();
+    demo::latency_trace::recordUiDispatch(frameId);
+
+    const quint64 delivered = self->m_deliveredFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (delivered <= 3 || (delivered % 600) == 0) {
+        qInfo().noquote()
+            << QStringLiteral("[RenderQueue] delivered=%1 dropped_unsupported=%2 dropped_nosink=%3 frame=%4 backend=%5 codec=%6")
+                   .arg(delivered)
+                   .arg(self->m_droppedUnsupportedFrames.load(std::memory_order_relaxed))
+                   .arg(self->m_droppedNoSinkFrames.load(std::memory_order_relaxed))
+                   .arg(frameId)
+                   .arg(backendToString(backend))
+                   .arg(codec);
+    }
+
+    /// presentFrame 接管 retained 这一引用，最终由 renderer 释放。
+    sink->presentFrame(retained);
 }
 
 rflow_err_t WebRTCReceiverClient::configureAndInitSdk(const QString &addr)
@@ -759,9 +758,9 @@ void WebRTCReceiverClient::handleStreamState(rflow_stream_state_t state, rflow_e
                              .arg(QString::fromUtf8(librflow_get_last_error() ? librflow_get_last_error() : ""));
     switch (state) {
     case RFLOW_STREAM_OPENING:
-        m_hasReceivedVideoFrame = false;
-        m_hasReceivedVideoCallback = false;
-        m_hasReportedRendererMissing = false;
+        m_hasReceivedVideoFrame.store(false, std::memory_order_relaxed);
+        m_hasReceivedVideoCallback.store(false, std::memory_order_relaxed);
+        m_hasReportedRendererMissing.store(false, std::memory_order_relaxed);
         Q_EMIT statusChanged(QStringLiteral("正在拉流..."));
         break;
     case RFLOW_STREAM_OPENED:
@@ -772,12 +771,12 @@ void WebRTCReceiverClient::handleStreamState(rflow_stream_state_t state, rflow_e
         break;
     case RFLOW_STREAM_CLOSED:
         m_streamHandle = nullptr;
-        m_hasReceivedVideoFrame = false;
+        m_hasReceivedVideoFrame.store(false, std::memory_order_relaxed);
         Q_EMIT statusChanged(QStringLiteral("流已关闭"));
         break;
     case RFLOW_STREAM_FAILED:
         m_streamHandle = nullptr;
-        m_hasReceivedVideoFrame = false;
+        m_hasReceivedVideoFrame.store(false, std::memory_order_relaxed);
         Q_EMIT statusChanged(formatSdkError(QStringLiteral("流失败"), reason));
         break;
     case RFLOW_STREAM_IDLE:
@@ -799,7 +798,6 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
     const uint32_t rttMs = librflow_stream_stats_get_rtt_ms(stats);
     const uint32_t fps = librflow_stream_stats_get_fps(stats);
     const uint32_t jitterMs = librflow_stream_stats_get_jitter_ms(stats);
-    /* 解码管线「抖动缓存」由 SDK [DecodeStats] 日志投递至 applyDecodePipelineJitterBufferMs，不设 stream_stats。 */
     const uint32_t freezeCount = librflow_stream_stats_get_freeze_count(stats);
     const uint32_t decodeFailCount = librflow_stream_stats_get_decode_fail_count(stats);
 
@@ -808,13 +806,32 @@ void WebRTCReceiverClient::handleStreamStats(librflow_stream_stats_t stats)
     m_statsLostPkts = lostPkts;
     m_statsFps = static_cast<double>(fps);
     m_statsBitrateKbps = static_cast<double>(bitrateKbps);
-    m_statsNetworkJitterMs = static_cast<double>(jitterMs);
+    m_statsJitterMs = static_cast<double>(jitterMs);
     m_statsFreezeCount = freezeCount;
     m_statsDecodeFailCount = decodeFailCount;
 
     m_rttCurrentMs = static_cast<double>(rttMs);
     m_hasConnectionStats = true;
 
+    /* 诊断：让 SDK 给的原始值一目了然，方便核对码率/帧率/RTT/抖动是不是 0 */
+    static quint64 sStatsLogCount = 0;
+    ++sStatsLogCount;
+    if (sStatsLogCount <= 3 || (sStatsLogCount % 10) == 0) {
+        qInfo().noquote()
+            << QStringLiteral("[StreamStatsRaw] #%1 dur=%2ms in_pkts=%3 lost=%4 "
+                              "bitrate=%5kbps rtt=%6ms fps=%7 jitter(rtcp)=%8ms "
+                              "freeze=%9 decodeFail=%10")
+                   .arg(sStatsLogCount)
+                   .arg(durationMs)
+                   .arg(inboundPkts)
+                   .arg(lostPkts)
+                   .arg(bitrateKbps)
+                   .arg(rttMs)
+                   .arg(fps)
+                   .arg(jitterMs)
+                   .arg(freezeCount)
+                   .arg(decodeFailCount);
+    }
 
     Q_EMIT connectionStatsChanged();
 }
@@ -840,153 +857,19 @@ void WebRTCReceiverClient::pollStreamStats()
     }
 }
 
-void WebRTCReceiverClient::schedulePendingFrameDelivery()
-{
-    bool shouldPost = false;
-    {
-        QMutexLocker locker(&m_pendingFrameMutex);
-        if (!m_frameDeliveryPosted) {
-            m_frameDeliveryPosted = true;
-            shouldPost = true;
-        }
-    }
-
-    if (!shouldPost) {
-        return;
-    }
-
-    QPointer<WebRTCReceiverClient> guard(this);
-    QMetaObject::invokeMethod(
-        this,
-        [guard]() {
-            if (guard) {
-                guard->deliverPendingFrame();
-            }
-        },
-        Qt::QueuedConnection);
-}
-
-void WebRTCReceiverClient::deliverPendingFrame()
-{
-    librflow_video_frame_t frame = nullptr;
-    {
-        QMutexLocker locker(&m_pendingFrameMutex);
-        frame = m_pendingFrame;
-        m_pendingFrame = nullptr;
-        m_frameDeliveryPosted = false;
-    }
-
-    if (frame) {
-        const rflow_video_frame_backend_t backend = librflow_video_frame_get_backend(frame);
-        const rflow_native_handle_type_t nativeHandleType = librflow_video_frame_get_native_handle_type(frame);
-        const rflow_codec_t codec = librflow_video_frame_get_codec(frame);
-        const uint32_t width = librflow_video_frame_get_width(frame);
-        const uint32_t height = librflow_video_frame_get_height(frame);
-        const quint32 frameId = librflow_video_frame_get_seq(frame);
-        const uint32_t planeCount = librflow_video_frame_get_plane_count(frame);
-        demo::latency_trace::recordUiDispatch(frameId);
-
-        const bool isCpuPlanarBackend =
-            backend == RFLOW_VIDEO_FRAME_BACKEND_UNKNOWN || backend == RFLOW_VIDEO_FRAME_BACKEND_CPU_PLANAR;
-        const bool supportedCpuFrame =
-            ((codec == RFLOW_CODEC_I420 && planeCount >= 3) || (codec == RFLOW_CODEC_NV12 && planeCount >= 2)) &&
-            width > 0 && height > 0;
-        const bool supportedFrame =
-            (isCpuPlanarBackend && supportedCpuFrame) ||
-            (backend == RFLOW_VIDEO_FRAME_BACKEND_GPU_EXTERNAL) ||
-            (backend == RFLOW_VIDEO_FRAME_BACKEND_HARDWARE_BUFFER);
-
-        if (supportedFrame) {
-            if (m_videoSink) {
-                if (!m_hasReceivedVideoFrame) {
-                    m_hasReceivedVideoFrame = true;
-                    Q_EMIT statusChanged(QStringLiteral("已收到视频流"));
-                }
-                ++m_deliveredFrames;
-                if (m_deliveredFrames <= 3 || (m_deliveredFrames % 600) == 0) {
-                    qInfo().noquote()
-                        << QStringLiteral("[RenderQueue] delivered=%1 overwritten=%2 frame=%3 backend=%4 handle=%5 codec=%6")
-                               .arg(m_deliveredFrames)
-                               .arg(m_overwrittenPendingFrames)
-                               .arg(frameId)
-                               .arg(backendToString(backend))
-                               .arg(nativeHandleToString(nativeHandleType))
-                               .arg(codec);
-                }
-                m_videoSink->presentFrame(frame);
-                frame = nullptr;
-            } else if (!m_hasReportedRendererMissing) {
-                m_hasReportedRendererMissing = true;
-                qWarning().noquote() << QStringLiteral("[RenderQueue] video sink missing while frame=%1").arg(frameId);
-                Q_EMIT statusChanged(QStringLiteral("已收到视频流，但渲染器未就绪"));
-            }
-        } else {
-            qWarning().noquote()
-                << QStringLiteral("Unsupported frame from libRoboFlow: backend=%1 handle=%2 codec=%3 planes=%4 size=%5x%6")
-                       .arg(backendToString(backend))
-                       .arg(nativeHandleToString(nativeHandleType))
-                       .arg(codec)
-                       .arg(planeCount)
-                       .arg(width)
-                       .arg(height);
-            if (!m_hasReceivedVideoFrame) {
-                Q_EMIT statusChanged(QStringLiteral("已收到视频流，但当前帧格式不支持渲染"));
-            }
-        }
-
-        if (frame) {
-            librflow_video_frame_release(frame);
-        }
-    }
-    bool repost = false;
-    {
-        QMutexLocker locker(&m_pendingFrameMutex);
-        if (m_pendingFrame && !m_frameDeliveryPosted) {
-            m_frameDeliveryPosted = true;
-            repost = true;
-        }
-    }
-
-    if (!repost) {
-        return;
-    }
-
-    QPointer<WebRTCReceiverClient> guard(this);
-    QMetaObject::invokeMethod(
-        this,
-        [guard]() {
-            if (guard) {
-                guard->deliverPendingFrame();
-            }
-        },
-        Qt::QueuedConnection);
-}
-
-void WebRTCReceiverClient::clearPendingFrame()
-{
-    QMutexLocker locker(&m_pendingFrameMutex);
-    if (m_pendingFrame) {
-        librflow_video_frame_release(m_pendingFrame);
-        m_pendingFrame = nullptr;
-    }
-    m_frameDeliveryPosted = false;
-}
-
 void WebRTCReceiverClient::resetConnectionStats()
 {
     m_rttCurrentMs = 0.0;
-    m_decodeJitterBufferMs = 0.0;
     m_statsFps = 0.0;
     m_statsBitrateKbps = 0.0;
-    m_statsNetworkJitterMs = 0.0;
+    m_statsJitterMs = 0.0;
     m_statsDurationMs = 0;
     m_statsInboundPkts = 0;
     m_statsLostPkts = 0;
     m_statsFreezeCount = 0;
     m_statsDecodeFailCount = 0;
-    const bool had = m_hasConnectionStats || m_hasDecodeJitterBuffer;
+    const bool had = m_hasConnectionStats;
     m_hasConnectionStats = false;
-    m_hasDecodeJitterBuffer = false;
     if (had) {
         Q_EMIT connectionStatsChanged();
     }
